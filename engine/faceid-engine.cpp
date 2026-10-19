@@ -1083,6 +1083,7 @@ int serve() {
   if (!test && fails.count >= lockoutAt) return finish("locked-out");
 
   long seq = (long)time(nullptr) * 1000 + getpid() % 1000;
+  unlink(choicePath(uid).c_str());  // a choice only counts for the prompt it was made in
   if ((key == "sudo" || key == "polkit") && cfg.confirm) {
     std::string choice = awaitChoice(key, uid, seq, cfg.timeoutChoose);
     if (choice != "face") {
@@ -1125,6 +1126,19 @@ int serve() {
   DarkFrameFilter darkFilter;
   while (secondsSince(start) < timeout) {
     if (clientGone()) { writeStatus(key, "idle", seq); return 1; }
+    // The dialog was dismissed, or the person started typing the password:
+    // the camera turns off now, not when the scan would have timed out.
+    if (access(choicePath(uid).c_str(), F_OK) == 0) {
+      std::ifstream f(choicePath(uid));
+      std::string choice;
+      f >> choice;
+      unlink(choicePath(uid).c_str());
+      if (choice == "password") {
+        cam.close();
+        writeStatus(key, "idle", seq);
+        return finish("declined");
+      }
+    }
     if (!cam.grab(grey, 500, &bgr)) continue;
     if (unusable(cam, darkFilter, grey)) continue;
     Face face;

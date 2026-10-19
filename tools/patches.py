@@ -433,7 +433,7 @@ POLKIT = [
     var text = String(event.text || "")
     if (text.length === 0 || text.charCodeAt(0) < 32) return false
     pendingPassword += text
-    if (faceState === "choose") chooseFace("password")
+    if (faceState === "choose" || faceState === "scanning") chooseFace("password")
     return true
   }
 """,
@@ -526,7 +526,7 @@ POLKIT = [
     ),
     (
         "  function cancelRequest() {\n    var flow = polkitAgent.flow\n    passwordInput.text = \"\"\n",
-        "  function cancelRequest() {\n    var flow = polkitAgent.flow\n    passwordInput.text = \"\"\n    pendingPassword = \"\"\n",
+        "  function cancelRequest() {\n    var flow = polkitAgent.flow\n    passwordInput.text = \"\"\n    pendingPassword = \"\"\n    // Polkit's helper only learns of the cancel after PAM returns; tell the\n    // engine now so the wait (or the camera) ends at once.\n    if (faceState === \"choose\" || faceState === \"scanning\") chooseFace(\"password\")\n",
     ),
     (
         """          } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
@@ -561,6 +561,16 @@ POLKIT = [
 
     Rectangle {
       width: Math.min(justificationText.implicitWidth""",
+    ),
+    (
+        "    function onAuthenticationRequestCancelled() {\n      root.closing = true\n      closeTimer.restart()\n    }\n",
+        """    function onAuthenticationRequestCancelled() {
+      root.closing = true
+      closeTimer.restart()
+      // Cancelled by polkit (the asking program went away): end Face ID too.
+      if (root.faceState === "choose" || root.faceState === "scanning") root.chooseFace("password")
+    }
+""",
     ),
 ]
 
