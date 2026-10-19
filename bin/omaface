@@ -36,7 +36,7 @@ Usage: omaface <command>
   remove <N|all>             remove appearance N (see status) or all of them
   enable  <place...|all>     use omaFace for: lock login sudo polkit
   disable <place...|all>     stop using omaFace there (password only)
-  set <key> <value>          attention on|off, confirm on|off, threshold, match_frames,
+  set <key> <value>          attention on|off, confirm on|off, head_turns on|off, threshold, match_frames,
                              timeout_{sudo,polkit,lock,login,choose}
   settings                   open the omaFace settings window
   doctor                     check every part of the installation
@@ -129,11 +129,12 @@ cmd_status() {
   if (( json )); then
     local places="" p
     for p in "${PLACES[@]}"; do places+="${places:+,}\"$p\":$(json_bool is_on "$p")"; done
-    printf '{"installed":%s,"service":%s,"user":"%s","appearances":%s,"maxAppearances":%d,"places":{%s},"attention":%s,"confirm":%s,"cameraKind":"%s","rgbFallback":%s,"loginSupported":%s,"autologin":%s,"lockedOut":%s,"camera":"%s"}\n' \
+    printf '{"installed":%s,"service":%s,"user":"%s","appearances":%s,"maxAppearances":%d,"places":{%s},"attention":%s,"confirm":%s,"cameraKind":"%s","rgbFallback":%s,"headTurns":%s,"loginSupported":%s,"autologin":%s,"lockedOut":%s,"camera":"%s"}\n' \
       "$installed" "$(json_bool socket_active)" "$user" "$(appearances_json "$user")" "$MAX_APPEARANCES" "$places" \
       "$([[ $(conf_get attention on) == off ]] && echo false || echo true)" \
       "$([[ $(conf_get confirm on) == off ]] && echo false || echo true)" "$(camera_kind)" \
       "$([[ $(conf_get rgb_fallback on) == off ]] && echo false || echo true)" \
+      "$([[ $(conf_get head_turns off) == on ]] && echo true || echo false)" \
       "$(json_bool login_supported)" "$([[ -n $(sddm_autologin_user) ]] && echo true || echo false)" \
       "$(json_bool locked_out "$user")" "$("$LIB/omaface-engine" probe 2>/dev/null | cut -f1,2 | tr '\t' ' ' | tr -d '"\\')"
     return
@@ -143,7 +144,7 @@ cmd_status() {
   local count
   count=$(appearance_count "$user")
   echo "omaFace for $user"
-  echo "  camera       $("$LIB/omaface-engine" probe 2>/dev/null | cut -f2 || echo none)$([[ $(camera_kind) == webcam ]] && echo "  (no IR camera: regular webcam with a head-turn check)")"
+  echo "  camera       $("$LIB/omaface-engine" probe 2>/dev/null | cut -f2 || echo none)$([[ $(camera_kind) == webcam ]] && echo "  (no IR camera: regular webcam with anti-spoofing)")"
   echo "  service      $(socket_active && echo ready || echo stopped)"
   echo "  appearances  $count"
   "$LIB/omaface-engine" list "$user" 2>/dev/null | tr '{' '\n' | sed -n 's/.*"name":"\([^"]*\)","created":"\([^"]*\)".*/\1  \2/p' |
@@ -291,7 +292,7 @@ cmd_set() {
     timeout_sudo | timeout_polkit | timeout_lock | timeout_login)
       [[ $value =~ ^([1-9]|1[0-5])$ ]] || die "$key must be 1-15 seconds" ;;
     min_face_width) [[ $value =~ ^[0-9]{2,3}$ ]] || die "min_face_width must be 30-300" ;;
-    attention | confirm | rgb_fallback) [[ $value == on || $value == off ]] || die "$key must be on or off" ;;
+    attention | confirm | rgb_fallback | head_turns) [[ $value == on || $value == off ]] || die "$key must be on or off" ;;
     threshold_rgb) [[ $value =~ ^0\.[3-9][0-9]*$ ]] || die "threshold_rgb must be between 0.30 and 0.99" ;;
     timeout_choose) [[ $value =~ ^([5-9]|[1-9][0-9]|1[01][0-9]|120)$ ]] || die "timeout_choose must be 5-120 seconds" ;;
     device) [[ $value == auto || $value =~ ^/dev/(video[0-9]+|v4l/by-(id|path)/[A-Za-z0-9._:-]+)$ ]] || die "device must be auto or a /dev/video path" ;;
@@ -322,10 +323,10 @@ messages = {"fail": "Not recognized", "timeout": "No face found", "locked-out": 
             "busy": "Camera busy", "disabled": "omaFace is off",
             "attention": "Recognized, but your eyes were closed or you were not looking at the camera"}
 moves = {"turn-left": "<- turn your head LEFT", "turn-right": "turn your head RIGHT ->", "turn-back": "face the camera again"}
-liveness = {"wrong": "moved the wrong way", "slow": "did not follow in time", "early": "moved before being asked",
+liveness = {"spoof": "it did not look like a live face (a photo or a screen?)", "wrong": "moved the wrong way", "slow": "did not follow in time", "early": "moved before being asked",
             "lost": "the face left the camera or was swapped", "identity": "a different face turned back"}
-eyes = {"ok": "looking at the camera", "eyes": "eyes closed or not looking at the camera",
-        "head": "head turned or tilted away", "off": "attention off"}
+eyes = {"ok": "paying attention", "eyes": "eyes closed or not looking at the camera",
+        "away": "looking away from the screen", "head": "head turned or tilted away", "off": "attention off"}
 seen_attention = set()
 def out(obj, text):
     print(json.dumps(obj) if as_json else text, flush=True)
@@ -353,16 +354,20 @@ while True:
             score = float(parts[1])
             best = score if best is None else max(best, score)
             attention = parts[5] if len(parts) > 5 and parts[4] == "attention" else "off"
+            live = float(parts[7]) if len(parts) > 7 and parts[6] == "live" else -1.0
             seen_attention.add(attention)
             if not as_json:
-                print(f"  score {score:.3f}   {eyes.get(attention, attention)}", flush=True)
+                real = f"   real face {live:.2f}" if live >= 0 else ""
+                print(f"  score {score:.3f}   {eyes.get(attention, attention)}{real}", flush=True)
             else:
-                out({"type": "score", "score": score, "attention": attention}, "")
+                out({"type": "score", "score": score, "attention": attention, "live": live}, "")
         elif parts[0] == "RESULT":
             result = parts[1]
             detail = " ".join(parts[2:])
             message = messages.get(result, (result + " " + detail).strip())
-            if result == "fail" and detail.startswith("liveness"):
+            if result == "fail" and detail == "liveness spoof":
+                message = "Recognized, but it did not look like a live face (a photo or a screen?)"
+            elif result == "fail" and detail.startswith("liveness"):
                 message = "Recognized, but the head-turn check failed: " + liveness.get(detail.split()[-1], detail)
             elif result == "timeout" and detail in ("unsettled", "crowd"):
                 message = {"unsettled": "Recognized, but you did not face the camera long enough to be asked",
@@ -472,14 +477,15 @@ cmd_doctor() {
   local cam
   if cam=$("$LIB/omaface-engine" probe 2>/dev/null); then
     if [[ $(cut -f5 <<<"$cam") == webcam ]]; then
-      ok "regular webcam: $(cut -f1,2 <<<"$cam" | tr '\t' ' ') (no IR camera found; head-turn check on every scan)"
+      ok "regular webcam: $(cut -f1,2 <<<"$cam" | tr '\t' ' ') (no IR camera found; anti-spoofing on every scan)"
     else
       ok "IR camera: $(cut -f1,2 <<<"$cam" | tr '\t' ' ') ($(cut -f4 <<<"$cam"))"
     fi
-    # YUYV is what colour webcams send; picked automatically only when the
-    # name says IR, so this is a camera forced with device= in the config.
-    if [[ $(cut -f4 <<<"$cam") == YUYV && ! $(cut -f2 <<<"$cam") =~ [Ii][Rr]|[Ii]nfrared ]]; then
-      warn "that camera looks like a colour webcam, which a photo can fool; check device= in $CONF (omaface cameras)"
+    # A webcam chosen with device= while an IR camera is there: allowed (it is
+    # how to try webcam mode), but the IR camera is the stronger choice.
+    if [[ $(cut -f5 <<<"$cam") == webcam && $(conf_get device auto) != auto ]] &&
+      "$LIB/omaface-engine" cameras 2>/dev/null | grep -q "IR candidate"; then
+      warn "the webcam is chosen with device=, but this laptop has an IR camera (stronger): omaface set device auto"
     fi
   else
     bad "no IR camera found (omaface cameras lists what is there)"

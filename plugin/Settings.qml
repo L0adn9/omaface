@@ -49,7 +49,8 @@ Item {
 
   readonly property var appearances: Array.isArray(status.appearances) ? status.appearances : []
   readonly property int maxAppearances: status.maxAppearances || 3
-  // No IR camera found: the regular webcam, with head turns on every scan.
+  // No IR camera found: the regular webcam, which also checks every scan for
+  // a photo or a screen (and, if asked for, random head turns).
   readonly property bool webcam: status.cameraKind === "webcam"
   readonly property var places: status.places || ({})
   readonly property bool authPending: actionProc.running || (enrollProc.running && enrollPhase === "auth")
@@ -75,7 +76,7 @@ Item {
 
   function placeDetail(row) {
     if (row.key === "login" && status.autologin === true) return "Skipped: SDDM signs you in automatically"
-    return webcam ? row.webcam : row.ir
+    return webcam && status.headTurns === true ? row.webcam : row.ir
   }
 
   function refresh() {
@@ -452,11 +453,10 @@ Item {
             SettingRow {
               width: parent.width
               title: "Require attention"
-              detail: root.webcam ? "IR camera only; the webcam uses head turns"
-                : "Eyes open and looking at the camera"
-              checked: !root.webcam && root.status.attention !== false
+              detail: root.webcam ? "Eyes open and on the screen, not on a phone or elsewhere" : "Eyes open and looking at the camera"
+              checked: root.status.attention !== false
               busy: actionProc.running
-              interactive: !root.webcam && root.status.installed === true && !actionProc.running
+              interactive: root.status.installed === true && !actionProc.running
               foreground: root.foreground
               accent: root.accent
               fontFamily: root.fontFamily
@@ -483,7 +483,7 @@ Item {
               width: parent.width
               title: "Webcam fallback"
               detail: root.webcam ? "In use: this laptop has no IR camera"
-                : "Only when no IR camera is found, with head turns on every scan"
+                : "Only when no IR camera is found; checks every scan for photos and screens"
               checked: root.status.rgbFallback !== false
               busy: actionProc.running
               interactive: root.status.installed === true && !actionProc.running
@@ -492,6 +492,21 @@ Item {
               fontFamily: root.fontFamily
               onToggled: root.run(["set", "rgb_fallback", checked ? "off" : "on"],
                 "Webcam fallback " + (checked ? "off" : "on"))
+            }
+
+            SettingRow {
+              visible: root.webcam
+              width: parent.width
+              title: "Head turns"
+              detail: "Strictest: also a few random head turns on every scan"
+              checked: root.status.headTurns === true
+              busy: actionProc.running
+              interactive: root.status.installed === true && !actionProc.running
+              foreground: root.foreground
+              accent: root.accent
+              fontFamily: root.fontFamily
+              onToggled: root.run(["set", "head_turns", checked ? "off" : "on"],
+                "Head turns " + (checked ? "off" : "on"))
             }
           }
 

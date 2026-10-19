@@ -39,8 +39,9 @@ install -m0755 "$REPO/system/rebuild" "$LIB/rebuild"
 install -m0755 "$REPO/system/uninstall-root.sh" "$LIB/uninstall"
 install -m0644 "$REPO/system/pam.sh" "$LIB/pam.sh"
 install -m0755 "$REPO/bin/omaface" /usr/local/bin/omaface
-install -m0644 "$MODELS/face_detection_yunet_2023mar.onnx" "$MODELS/face_recognition_sface_2021dec.onnx" \
-  "$REPO/models/SHA256SUMS" "$SHARE/models/"
+# Every model the checksum list names (install.sh verified them already).
+while read -r _ name; do install -m0644 "$MODELS/$name" "$SHARE/models/"; done <"$REPO/models/SHA256SUMS"
+install -m0644 "$REPO/models/SHA256SUMS" "$SHARE/models/"
 (cd "$SHARE/models" && sha256sum -c --quiet SHA256SUMS)
 
 # Sources for the OpenCV rebuild hook and for `omaface sync`.

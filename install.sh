@@ -10,7 +10,6 @@ REPO=$PWD
 PLUGIN_ID=io.github.l0adn9.omaface
 PLUGINS_DIR="$HOME/.config/omarchy/plugins"
 MODEL_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/omaface/models"
-ZOO=https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models
 
 step() { printf '\n\e[1m==> %s\e[0m\n' "$*"; }
 fail() { printf '\e[31minstall: %s\e[0m\n' "$*" >&2; exit 1; }
@@ -86,6 +85,7 @@ if ! cam=$("$build/engine/omaface-engine" probe); then
 EOF
   webcam=yes
 fi
+[[ $(cut -f5 <<<"$cam") == webcam ]] && webcam=yes
 if [[ $webcam == yes ]]; then
   echo "  Webcam: $(cut -f2 <<<"$cam") ($(cut -f1 <<<"$cam"), $(cut -f4 <<<"$cam") $(cut -f3 <<<"$cam"))"
 else
@@ -110,17 +110,16 @@ EOF
   *) echo "  IR light: could not check (camera busy?); check later with: omaface emitter" ;;
 esac
 
-step "Fetching face models (OpenCV Zoo, checksum-verified)"
+step "Fetching face models (checksum-verified)"
 mkdir -p "$MODEL_CACHE"
 cp models/SHA256SUMS "$MODEL_CACHE/"
+# Each model from where models/URLS says, kept only if its hash matches.
 while read -r sum name; do
   [[ -f $MODEL_CACHE/$name ]] && [[ $(sha256sum "$MODEL_CACHE/$name" | cut -d' ' -f1) == "$sum" ]] && continue
-  case "$name" in
-    face_detection_*) dir=face_detection_yunet ;;
-    face_recognition_*) dir=face_recognition_sface ;;
-  esac
+  url=$(awk -v n="$name" '$1 == n { print $2 }' models/URLS)
+  [[ -n $url ]] || fail "no download address for $name in models/URLS"
   echo "  downloading $name"
-  curl -fsSL "$ZOO/$dir/$name" -o "$MODEL_CACHE/$name.part"
+  curl -fsSL "$url" -o "$MODEL_CACHE/$name.part"
   mv "$MODEL_CACHE/$name.part" "$MODEL_CACHE/$name"
 done <models/SHA256SUMS
 (cd "$MODEL_CACHE" && sha256sum -c --quiet SHA256SUMS) || fail "model checksum mismatch; delete $MODEL_CACHE and retry"

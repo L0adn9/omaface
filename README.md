@@ -52,7 +52,7 @@ choose **Set up omaFace**.
   </tr>
   <tr>
     <td><sub>Settings: where omaFace is used, attention, ask first, appearances.</sub></td>
-    <td><sub>Enrolling (the preview is braille, drawn here), and webcam mode asking for a head turn.</sub></td>
+    <td><sub>Enrolling (the preview is braille, drawn here), and webcam mode's optional head-turn check.</sub></td>
   </tr>
 </table>
 
@@ -100,28 +100,39 @@ enrolled, catches looking up or away.
 ## Laptops without an IR camera
 
 When no IR camera is found, omaFace uses the regular webcam, for everything:
-the lock screen, the login screen, `sudo` and system prompts. A webcam sees
-what your eyes see, so a photo or a phone screen showing your face looks like
-you; these checks are what keep it safe:
+the lock screen, the login screen, `sudo` and system prompts. It works the same
+way: glance at the screen and it unlocks. A webcam sees what your eyes see, so
+a photo or a phone screen showing your face looks like you; three checks run on
+the same frames, with nothing for you to do:
 
-* **A random head-turn sequence on every scan.** After it recognizes you it
-  asks for three moves (left, right, back to the camera), each after a random
-  pause and within a couple of seconds. A real head turning moves the nose
-  against the eyes; a photo or a screen tilted the same way does not, because
-  it is flat. A recording cannot follow a sequence it does not know, and the
-  face back at the camera has to match again.
+* **Is it a live face.** Two small anti-spoofing models (Minivision's
+  Silent-Face, trained to tell live faces from prints and screens) score every
+  frame. A photo or a screen may fool them on a lucky frame, so it takes a run
+  of about eight good frames in a row (a third of a second).
+* **Are you paying attention.** With Require attention on, a gaze model
+  checks where your eyes point, against where they pointed at the screen when
+  you enrolled, and Google's MediaPipe eye model checks the eyelids are open:
+  eyes closed, eyes on your phone or your lap, or the head turned away do not
+  unlock; anywhere on the screen does, down to its bottom edge.
+* **Is it you**, with a stricter match threshold than the IR camera.
+
+Measured on a laptop webcam: the user unlocked in about 0.4 seconds; eyes
+closed, eyes on a phone held low or at the chest, a photo of the user on a
+phone (close, far, tilted) and a video of the user on a phone never unlocked. That is one webcam in one room; lighting matters, and
+in a dark room the webcam simply falls back to the password.
+
+More, still with nothing to do:
+
 * **`sudo` and system prompts always ask first** with a webcam: nothing scans
   until you press Enter or click, even if ask first is switched off.
 * **Three failed tries and it waits for your password**, until you use it once.
-* Webcam and IR appearances are kept apart, with a stricter match threshold
-  for the webcam.
+* Webcam and IR appearances are kept apart.
 
-Tested with a photo of the user on a phone: it was recognized as the user, and
-refused by the head-turn check every time.
-
-It is still weaker than an IR camera: someone with videos of you turning each
-way, switched live in front of the camera, might get past it. The switch
-"Webcam fallback" in Settings turns this mode off; an IR camera, when there is
+It is still weaker than an IR camera: a good enough video or mask might get
+past a passive check. For the strictest setting, **Head turns** in Settings adds
+a few random head turns to every scan (a recording cannot follow a sequence it
+does not know); it is off by default because it is slower than typing. The
+switch **Webcam fallback** turns webcam mode off; an IR camera, when there is
 one, is always used instead.
 
 ## How it works
@@ -242,8 +253,15 @@ Built on [Omarchy](https://github.com/basecamp/omarchy) (MIT), the
 [YuNet](https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet)
 face detector (MIT) and
 [SFace](https://github.com/opencv/opencv_zoo/tree/main/models/face_recognition_sface)
-recognizer (Apache 2.0) from OpenCV Zoo, and [OpenCV](https://opencv.org).
-See `NOTICE`. omaFace is MIT licensed.
+recognizer (Apache 2.0) from OpenCV Zoo, and [OpenCV](https://opencv.org). For
+webcams: Minivision's
+[Silent-Face](https://github.com/minivision-ai/Silent-Face-Anti-Spoofing)
+anti-spoofing models (Apache 2.0, via
+[yakhyo/face-anti-spoofing](https://github.com/yakhyo/face-anti-spoofing)),
+Google's [MediaPipe](https://github.com/google-ai-edge/mediapipe) iris model
+(Apache 2.0) and the
+[yakhyo/gaze-estimation](https://github.com/yakhyo/gaze-estimation) gaze model
+(MIT). See `NOTICE`. omaFace is MIT licensed.
 
 Omarchy is a registered trademark of 37signals LLC. omaFace is an independent
 community project, not affiliated with or endorsed by 37signals, the Omacom

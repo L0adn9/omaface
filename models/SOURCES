@@ -1,4 +1,20 @@
-# OpenCV Zoo (github.com/opencv/opencv_zoo), fetched by install.sh and checked
-# against SHA256SUMS (the hashes recorded in the repo's Git LFS pointers).
-face_detection_yunet_2023mar.onnx    models/face_detection_yunet/      MIT
-face_recognition_sface_2021dec.onnx  models/face_recognition_sface/    Apache-2.0
+# Models fetched by install.sh from the addresses in URLS and checked against
+# SHA256SUMS before use. None are redistributed in this repository.
+#
+# Every camera:
+#   face_detection_yunet_2023mar.onnx    YuNet face detector, OpenCV Zoo          MIT
+#   face_recognition_sface_2021dec.onnx  SFace face recognizer, OpenCV Zoo        Apache-2.0
+#     (hashes: the Git LFS pointers in github.com/opencv/opencv_zoo)
+#
+# Regular webcams only (no IR camera):
+#   MiniFASNetV2.onnx, MiniFASNetV1SE.onnx
+#     Silent-Face anti-spoofing models by Minivision
+#     (github.com/minivision-ai/Silent-Face-Anti-Spoofing, Apache-2.0), in the
+#     ONNX export published at github.com/yakhyo/face-anti-spoofing (Apache-2.0);
+#     hashes as listed on that release.
+#   iris_landmark.tflite
+#     MediaPipe iris landmark model by Google (github.com/google-ai-edge/mediapipe,
+#     Apache-2.0), from Google's own model storage; read directly by OpenCV.
+#   mobileone_s0_gaze.onnx
+#     Gaze estimation (MobileOne-S0 trained on Gaze360) from
+#     github.com/yakhyo/gaze-estimation (MIT); hash as listed on that release.

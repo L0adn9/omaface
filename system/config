@@ -30,10 +30,13 @@ timeout_polkit=5
 timeout_lock=6
 timeout_login=6
 
-# Laptops without an IR camera use the regular webcam, everywhere, with a
-# random head-turn check on every scan; sudo and system prompts always ask
-# first. The IR camera is always preferred when there is one.
+# Laptops without an IR camera use the regular webcam, everywhere: every scan
+# also checks the face is live (not a photo or a screen) and, with attention
+# on, that the eyes are open and the head faces the screen; sudo and system
+# prompts always ask first. The IR camera is always preferred when there is
+# one. head_turns=on adds a few random head turns on the webcam (strictest).
 rgb_fallback=on
+head_turns=off
 threshold_rgb=0.55
 
 # IR camera: auto picks the greyscale camera named "IR".
