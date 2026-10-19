@@ -1,3 +1,0 @@
-# Face ID runtime state: live scan status for the shell, lockout counters.
-d /run/faceid 0755 root root -
-f /run/faceid/status 0644 root root - {"state":"idle"}

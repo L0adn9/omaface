@@ -9,15 +9,15 @@ OPENCV_PC := $(shell pkg-config --exists opencv5 && echo opencv5 || echo opencv4
 OPENCV_CFLAGS := $(shell pkg-config --cflags $(OPENCV_PC))
 OPENCV_LIBS = -lopencv_objdetect -lopencv_dnn -lopencv_imgcodecs -lopencv_imgproc -lopencv_core -lsystemd
 
-all: faceid-engine faceid-pam
+all: omaface-engine omaface-pam
 
-faceid-engine: faceid-engine.cpp
+omaface-engine: omaface-engine.cpp
 	$(CXX) $(CXXFLAGS) $(HARDEN) -std=c++17 $(OPENCV_CFLAGS) -o $@ $< $(LDHARDEN) $(OPENCV_LIBS)
 
-faceid-pam: faceid-pam.c
+omaface-pam: omaface-pam.c
 	$(CC) $(CFLAGS) $(HARDEN) -std=c11 -o $@ $< $(LDHARDEN)
 
 clean:
-	rm -f faceid-engine faceid-pam
+	rm -f omaface-engine omaface-pam
 
 .PHONY: all clean

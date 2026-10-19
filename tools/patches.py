@@ -1,4 +1,4 @@
-"""Face ID additions to Omarchy's lock screen and polkit dialog.
+"""omaFace additions to Omarchy's lock screen and polkit dialog.
 
 Each patch replaces one exact snippet of the upstream file. Every `old` must
 appear exactly once, otherwise the build stops and the installed plugin is
@@ -12,7 +12,7 @@ LOCK_SERVICE = [
         "  property bool strandedLockResolved: false\n",
         """  property bool strandedLockResolved: false
 
-  // Face ID (l0adn9.faceid): a third PAM flow beside password and
+  // omaFace (io.github.l0adn9.omaface): a third PAM flow beside password and
   // fingerprint. It only ever adds a way in; the password always works.
   property bool faceConfigured: false
   property string faceState: "idle"
@@ -138,7 +138,7 @@ LOCK_SERVICE = [
         "  Timer {\n    id: fingerprintRetryTimer\n",
         """  PamContext {
     id: facePam
-    config: "omarchy-lock-face"
+    config: "omaface-lock"
     user: root.userName
 
     onCompleted: function(result) {
@@ -185,7 +185,7 @@ LOCK_SERVICE = [
 
   FileView {
     id: faceStatusFile
-    path: "/run/faceid/status"
+    path: "/run/omaface/status"
     blockLoading: true
     printErrors: false
   }
@@ -193,7 +193,7 @@ LOCK_SERVICE = [
   // The webcam's head-turn check asks for moves while it scans; the lock
   // view shows them as they come.
   FileView {
-    path: "/run/faceid/status"
+    path: "/run/omaface/status"
     watchChanges: true
     printErrors: false
     onFileChanged: reload()
@@ -212,12 +212,12 @@ LOCK_SERVICE = [
   // (webcam strikes otherwise stay until then).
   Process {
     id: faceResetProc
-    command: ["bash", "-c", "[[ -x /usr/local/bin/faceid ]] && /usr/local/bin/faceid reset"]
+    command: ["bash", "-c", "[[ -x /usr/local/bin/omaface ]] && /usr/local/bin/omaface reset"]
   }
 
   Process {
     id: faceCheckProc
-    command: ["bash", "-c", "[[ -f /etc/pam.d/omarchy-lock-face ]] && [[ -x /usr/local/bin/faceid ]] && /usr/local/bin/faceid ready lock && echo yes || echo no"]
+    command: ["bash", "-c", "[[ -f /etc/pam.d/omaface-lock ]] && [[ -x /usr/local/bin/omaface ]] && /usr/local/bin/omaface ready lock && echo yes || echo no"]
     stdout: StdioCollector { id: faceCheckStdout; waitForEnd: true }
     onExited: {
       root.faceConfigured = String(faceCheckStdout.text || "").trim() === "yes"
@@ -249,7 +249,7 @@ LOCK_SERVICE = [
     id: polkitDialog
   }
 
-  // Settings exist only while open (omarchy-shell faceid settings).
+  // Settings exist only while open (omarchy-shell omaface settings).
   Loader {
     id: faceSettings
     active: false
@@ -258,11 +258,11 @@ LOCK_SERVICE = [
   }
 
   IpcHandler {
-    target: "faceid"
+    target: "omaface"
 
     function status(): string {
       return JSON.stringify({
-        plugin: "l0adn9.faceid",
+        plugin: "io.github.l0adn9.omaface",
         lock: true,
         polkitRegistered: polkitDialog.agentRegistered,
         face: root.faceConfigured,
@@ -318,7 +318,7 @@ LOCK_VIEW = [
     ),
     (
         "    BorderSurface {\n      id: inputField\n",
-        """    // Face ID: the mark sits above the field and animates while the IR
+        """    // omaFace: the mark sits above the field and animates while the IR
     // camera looks. Clicking it asks for another scan.
     Rectangle {
       id: faceTile
@@ -380,7 +380,7 @@ POLKIT = [
     (
         "  property bool laptopClosed: false\n",
         """  property bool laptopClosed: false
-  // Face ID: faceid-pam sits in the polkit stack and a face is enrolled.
+  // omaFace: omaface-pam sits in the polkit stack and a face is enrolled.
   // The engine's status file drives the animation while the camera looks.
   property bool facePamConfigured: false
   property bool faceReady: false
@@ -399,7 +399,7 @@ POLKIT = [
         "  function loadPamConfig(raw) {\n    fingerprintConfigured = PolkitModel.fingerprintConfiguredFromPamConfig(raw)\n  }\n",
         """  function loadPamConfig(raw) {
     fingerprintConfigured = PolkitModel.fingerprintConfiguredFromPamConfig(raw)
-    facePamConfigured = String(raw || "").indexOf("faceid-pam") !== -1
+    facePamConfigured = String(raw || "").indexOf("omaface-pam") !== -1
   }
 
   function refreshFace() {
@@ -415,13 +415,13 @@ POLKIT = [
     } catch (e) {}
   }
 
-  // Ask first: the camera waits until the person picks Face ID (Enter or a
+  // Ask first: the camera waits until the person picks omaFace (Enter or a
   // click). Typing picks the password instead, and what was typed is kept
   // for the password field polkit asks for next.
   function chooseFace(choice) {
     if (faceChooseProc.running) return
     faceState = choice === "face" ? "scanning" : "idle"
-    faceChooseProc.command = ["/usr/local/bin/faceid", "choose", choice]
+    faceChooseProc.command = ["/usr/local/bin/omaface", "choose", choice]
     faceChooseProc.running = true
   }
 
@@ -462,7 +462,7 @@ POLKIT = [
     (
         "  Process {\n    id: laptopClosedProc\n",
         """  FileView {
-    path: "/run/faceid/status"
+    path: "/run/omaface/status"
     watchChanges: true
     printErrors: false
     onLoaded: root.loadFaceStatus(text())
@@ -475,7 +475,7 @@ POLKIT = [
 
   Process {
     id: faceReadyProc
-    command: ["bash", "-c", "[[ -x /usr/local/bin/faceid ]] && /usr/local/bin/faceid ready polkit && echo yes || echo no"]
+    command: ["bash", "-c", "[[ -x /usr/local/bin/omaface ]] && /usr/local/bin/omaface ready polkit && echo yes || echo no"]
     stdout: StdioCollector { id: faceReadyOut; waitForEnd: true }
     onExited: root.faceReady = String(faceReadyOut.text || "").trim() === "yes"
   }
@@ -515,7 +515,7 @@ POLKIT = [
     (
         "    if (responseRequired) submitted = false\n  }\n",
         """    if (responseRequired) submitted = false
-    // Keys typed while Face ID was on offer belong to the password.
+    // Keys typed while omaFace was on offer belong to the password.
     if (responseRequired && pendingPassword.length) {
       passwordInput.text = pendingPassword
       pendingPassword = ""
@@ -552,7 +552,7 @@ POLKIT = [
       anchors.top: card.bottom
       anchors.topMargin: Style.space(10)
       visible: root.fingerprintMode && root.faceConfigured && (root.faceState === "choose" || root.faceState === "scanning")
-      text: root.faceState === "choose" ? "Enter or click for Face ID  \u00b7  type for password" : "Look at the camera"
+      text: root.faceState === "choose" ? "Enter or click for omaFace  \u00b7  type for password" : "Look at the camera"
       color: root.foreground
       opacity: 0.7
       font.family: root.fontFamily
@@ -567,7 +567,7 @@ POLKIT = [
         """    function onAuthenticationRequestCancelled() {
       root.closing = true
       closeTimer.restart()
-      // Cancelled by polkit (the asking program went away): end Face ID too.
+      // Cancelled by polkit (the asking program went away): end omaFace too.
       if (root.faceState === "choose" || root.faceState === "scanning") root.chooseFace("password")
     }
 """,

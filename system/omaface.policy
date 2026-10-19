@@ -2,14 +2,14 @@
 <!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
  "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
 <policyconfig>
-  <action id="local.faceid.manage">
-    <description>Manage Face ID</description>
-    <message>Change Face ID settings</message>
+  <action id="local.omaface.manage">
+    <description>Manage omaFace</description>
+    <message>Change omaFace settings</message>
     <defaults>
       <allow_any>auth_admin</allow_any>
       <allow_inactive>auth_admin</allow_inactive>
       <allow_active>auth_admin_keep</allow_active>
     </defaults>
-    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/faceid</annotate>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/omaface</annotate>
   </action>
 </policyconfig>

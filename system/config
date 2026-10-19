@@ -1,13 +1,13 @@
-# Face ID configuration. Change it with `faceid enable|disable|set` or the
-# Face ID settings window (faceid settings); both keep this file valid.
+# omaFace configuration. Change it with `omaface enable|disable|set` or the
+# omaFace settings window (omaface settings); both keep this file valid.
 
-# Where Face ID is offered. The password always keeps working everywhere.
+# Where omaFace is offered. The password always keeps working everywhere.
 lock=on
 login=on
 sudo=on
 polkit=on
 
-# Ask first: sudo and system prompts (polkit) wait until you choose Face ID
+# Ask first: sudo and system prompts (polkit) wait until you choose omaFace
 # (Enter in the terminal, Enter or a click in the dialog) before the camera
 # turns on; anything else uses the password. The lock and login screens scan
 # by themselves. timeout_choose: seconds before falling back to the password.

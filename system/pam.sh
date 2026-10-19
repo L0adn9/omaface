@@ -1,7 +1,7 @@
-# Where Face ID goes in each PAM stack, shared by install.sh (checks before
-# anything changes), install-root.sh (the edit) and faceid doctor.
+# Where omaFace goes in each PAM stack, shared by install.sh (checks before
+# anything changes), install-root.sh (the edit) and omaface doctor.
 #
-# The Face ID line sits directly above the line that asks for the password,
+# The omaFace line sits directly above the line that asks for the password,
 # so whatever comes before it (Omarchy's fingerprint reader and its lid gate)
 # keeps its place, and the password stays the fallback underneath.
 # Stock Arch, Omarchy, and Omarchy with fingerprint set up all match one of

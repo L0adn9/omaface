@@ -1,6 +1,6 @@
 import QtQuick
 
-// The Face ID mark, drawn in theme colours so it sits with the rest of the
+// The omaFace mark, drawn in theme colours so it sits with the rest of the
 // shell: four lightly rounded corner brackets around a face made of square
 // pixels on a 9 x 9 grid, in the terminal look of the rest of Omarchy.
 //   idle      quiet pixel face, the scanner is ready

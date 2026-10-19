@@ -5,6 +5,6 @@ Type = Package
 Target = opencv
 
 [Action]
-Description = Rebuilding the Face ID engine against the new OpenCV...
+Description = Rebuilding the omaFace engine against the new OpenCV...
 When = PostTransaction
-Exec = /usr/local/lib/faceid/rebuild
+Exec = /usr/local/lib/omaface/rebuild

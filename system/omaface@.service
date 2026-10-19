@@ -1,11 +1,11 @@
 # One short-lived instance per verification. Nothing stays resident: the
 # engine starts when PAM asks, looks for up to a few seconds, and exits.
 [Unit]
-Description=Face ID verification
+Description=omaFace verification
 CollectMode=inactive-or-failed
 
 [Service]
-ExecStart=/usr/local/lib/faceid/faceid-engine serve
+ExecStart=/usr/local/lib/omaface/omaface-engine serve
 StandardInput=socket
 StandardOutput=socket
 StandardError=journal
@@ -25,7 +25,7 @@ PrivateNetwork=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/run/faceid
+ReadWritePaths=/run/omaface
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes

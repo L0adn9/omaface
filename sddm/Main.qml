@@ -1,9 +1,9 @@
 import QtQuick 2.0
 import SddmComponents 2.0
 
-// Omarchy's SDDM theme with Face ID. The greeter starts a face scan on its
+// Omarchy's SDDM theme with omaFace. The greeter starts a face scan on its
 // own; an empty Enter scans again, a typed password signs in as before.
-// The face check runs inside PAM (faceid-pam in /etc/pam.d/sddm), which skips
+// The face check runs inside PAM (omaface-pam in /etc/pam.d/sddm), which skips
 // the camera whenever a password was typed.
 Rectangle {
   id: root

@@ -1,0 +1,3 @@
+# omaFace runtime state: live scan status for the shell, lockout counters.
+d /run/omaface 0755 root root -
+f /run/omaface/status 0644 root root - {"state":"idle"}

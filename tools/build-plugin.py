@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Build the l0adn9.faceid shell plugin from Omarchy's current lock screen
-and polkit dialog plus the Face ID patches.
+"""Build the io.github.l0adn9.omaface shell plugin from Omarchy's current lock screen
+and polkit dialog plus the omaFace patches.
 
     build-plugin.py <plugin-src-dir> <out-dir>
 
@@ -19,7 +19,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import patches  # noqa: E402
 
-UPSTREAM = os.environ.get("FACEID_UPSTREAM", "/usr/share/omarchy/shell/plugins")
+UPSTREAM = os.environ.get("OMAFACE_UPSTREAM", "/usr/share/omarchy/shell/plugins")
 OWN_FILES = ["manifest.json", "FaceGlyph.qml", "Settings.qml", "EnrollRing.qml"]
 
 
@@ -60,14 +60,14 @@ def main():
             problems.append(f"missing plugin source file {name}")
 
     if problems:
-        print("faceid: plugin build failed, nothing was changed:", file=sys.stderr)
+        print("omaface: plugin build failed, nothing was changed:", file=sys.stderr)
         for p in problems:
             print(f"  - {p}", file=sys.stderr)
         return 1
 
     parent = os.path.dirname(os.path.abspath(out)) or "."
     os.makedirs(parent, exist_ok=True)
-    stage = tempfile.mkdtemp(prefix=".faceid-build.", dir=parent)
+    stage = tempfile.mkdtemp(prefix=".omaface-build.", dir=parent)
     try:
         for target, text in built.items():
             with open(os.path.join(stage, target), "w", encoding="utf-8") as f:
@@ -84,7 +84,7 @@ def main():
     except BaseException:
         shutil.rmtree(stage, ignore_errors=True)
         raise
-    print(f"faceid: plugin built in {out}")
+    print(f"omaface: plugin built in {out}")
     return 0
 
 

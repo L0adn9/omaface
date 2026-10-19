@@ -1,9 +1,9 @@
-Face ID for Omarchy includes or builds on work by others:
+omaFace includes or builds on work by others:
 
 Omarchy (https://github.com/basecamp/omarchy), MIT License,
 Copyright (c) David Heinemeier Hansson.
   - sddm/Main.qml and the images in sddm/ are Omarchy's login screen with the
-    Face ID mark added.
+    omaFace mark added.
   - The lock screen and polkit dialog are not copied into this repository:
     install.sh builds them on your machine from Omarchy's installed files plus
     the patches in tools/patches.py.

@@ -1,10 +1,10 @@
 {
   "schemaVersion": 1,
-  "id": "l0adn9.faceid",
-  "name": "Face ID",
+  "id": "io.github.l0adn9.omaface",
+  "name": "omaFace",
   "version": "1.1.0",
   "author": "L0adn9",
-  "description": "Face unlock with the IR camera for the lock screen, login screen, sudo and system prompts, with an eyes-open, looking-at-the-camera check. Omarchy's lock screen and polkit dialog with a Face ID flow beside the password.",
+  "description": "Face unlock with the IR camera for the lock screen, login screen, sudo and system prompts, with an eyes-open, looking-at-the-camera check. Omarchy's lock screen and polkit dialog with a omaFace flow beside the password.",
   "kinds": [
     "service"
   ],
@@ -15,5 +15,5 @@
   "omarchy": {
     "clonedFrom": "omarchy.lock"
   },
-  "homepage": "https://github.com/L0adn9/omarchy-faceid"
+  "homepage": "https://github.com/L0adn9/omaface"
 }

@@ -1,8 +1,8 @@
-// faceid-pam — the pam_exec side of Face ID.
+// omaface-pam — the pam_exec side of omaFace.
 //
 // Exit status is the whole contract with PAM: 0 means the face matched, any
 // other status means "not by face" and the stack moves on to the password.
-// It only returns 0 when the root-owned faceid.socket answers "RESULT ok";
+// It only returns 0 when the root-owned omaface.socket answers "RESULT ok";
 // every error, timeout or doubt falls through to the password.
 
 #define _GNU_SOURCE
@@ -20,9 +20,9 @@
 #include <time.h>
 #include <unistd.h>
 
-#define SOCKET_PATH "/run/faceid.sock"
+#define SOCKET_PATH "/run/omaface.sock"
 #define DEADLINE_MS 20000
-// Waiting for the person to choose Face ID or the password (the engine's
+// Waiting for the person to choose omaFace or the password (the engine's
 // timeout_choose is at most 120 s).
 #define CHOOSE_DEADLINE_MS 125000
 
@@ -46,7 +46,7 @@ static void on_signal(int sig) {
 
 static void say(const char* text, int final) {
   if (tty_fd < 0) return;
-  dprintf(tty_fd, "\r\033[K\033[2mFace ID\033[0m  %s%s", text, final ? "\r\n" : "");
+  dprintf(tty_fd, "\r\033[K\033[2momaFace\033[0m  %s%s", text, final ? "\r\n" : "");
 }
 
 static long now_ms(void) {
@@ -143,7 +143,7 @@ int main(void) {
   if (len <= 0 || len >= (int)sizeof request) return 1;
   if (send(sock, request, len, MSG_NOSIGNAL) != len) return 1;
 
-  // sudo in a terminal: ask Face ID or password with a single key, show
+  // sudo in a terminal: ask omaFace or password with a single key, show
   // progress, keep typed-ahead keys from echoing in the clear while the
   // camera looks, and let any key skip to the password.
   const char* tty = getenv("PAM_TTY");

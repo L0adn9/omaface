@@ -6,9 +6,9 @@ import qs.Commons
 import qs.Commons as Commons
 import qs.Ui
 
-// Face ID settings. Created on demand by Service.qml (omarchy-shell faceid
+// omaFace settings. Created on demand by Service.qml (omarchy-shell omaface
 // settings) and destroyed again when closed, so it holds no memory at rest.
-// Every change goes through `pkexec faceid ...`: the shell itself never
+// Every change goes through `pkexec omaface ...`: the shell itself never
 // writes the root-owned configuration.
 Item {
   id: root
@@ -72,7 +72,7 @@ Item {
   function run(args, okText) {
     if (actionProc.running || enrollProc.running) return
     actionProc.okText = okText || ""
-    actionProc.command = ["pkexec", "/usr/local/bin/faceid"].concat(args)
+    actionProc.command = ["pkexec", "/usr/local/bin/omaface"].concat(args)
     actionProc.running = true
   }
 
@@ -83,7 +83,7 @@ Item {
     enrollHint = "Waiting for authorization…"
     enrollPhase = "auth"
     view = "enroll"
-    var args = ["pkexec", "/usr/local/bin/faceid", "enroll", "--ui"]
+    var args = ["pkexec", "/usr/local/bin/omaface", "enroll", "--ui"]
     if (appearances.length > 0) args = args.concat(["--name", "Appearance " + (appearances.length + 1)])
     enrollProc.command = args
     enrollProc.stdinEnabled = true
@@ -167,8 +167,8 @@ Item {
     } else if (ev.type === "done") {
       enrollPhase = "done"
       enrollHint = ev.eyes === false
-        ? "Face ID is set up. Your eyes were hard to see (glare?); if it will not unlock, turn off Require attention"
-        : "Face ID is set up"
+        ? "omaFace is set up. Your eyes were hard to see (glare?); if it will not unlock, turn off Require attention"
+        : "omaFace is set up"
       refresh()
     } else if (ev.type === "error") {
       enrollPhase = "error"
@@ -210,7 +210,7 @@ Item {
 
   Process {
     id: statusProc
-    command: ["/usr/local/bin/faceid", "status", "--json"]
+    command: ["/usr/local/bin/omaface", "status", "--json"]
     stdout: StdioCollector { id: statusOut; waitForEnd: true }
     onExited: {
       try {
@@ -218,7 +218,7 @@ Item {
         root.loaded = true
       } catch (e) {
         root.status = ({})
-        root.say("Face ID is not installed", true)
+        root.say("omaFace is not installed", true)
       }
     }
   }
@@ -265,7 +265,7 @@ Item {
 
   Process {
     id: testProc
-    command: ["/usr/local/bin/faceid", "test", "--json"]
+    command: ["/usr/local/bin/omaface", "test", "--json"]
     stdout: SplitParser { onRead: function(line) { root.handleTestLine(line) } }
     onExited: function(exitCode) {
       if (root.testState === "scanning") {
@@ -280,7 +280,7 @@ Item {
     visible: !root.closing
     anchors { top: true; bottom: true; left: true; right: true }
     color: "transparent"
-    WlrLayershell.namespace: "omarchy-faceid"
+    WlrLayershell.namespace: "omaface"
     WlrLayershell.layer: WlrLayer.Overlay
     // Hand the keyboard to the polkit dialog while it asks for a password.
     WlrLayershell.keyboardFocus: root.authPending ? WlrKeyboardFocus.None : WlrKeyboardFocus.Exclusive
@@ -351,7 +351,7 @@ Item {
               anchors.verticalCenter: parent.verticalCenter
               spacing: Style.space(3)
               Text {
-                text: "Face ID"
+                text: "omaFace"
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.heading
@@ -381,7 +381,7 @@ Item {
             spacing: Style.space(10)
 
             Text {
-              text: "USE FACE ID FOR"
+              text: "USE FACE UNLOCK FOR"
               color: root.foreground
               opacity: 0.5
               font.family: root.fontFamily
@@ -462,7 +462,7 @@ Item {
                 Text {
                   width: parent.width
                   text: root.webcam
-                    ? "In use: this laptop has no IR camera. Every unlock asks for a few random head turns; three failed tries and it waits for your password. Off turns Face ID off"
+                    ? "In use: this laptop has no IR camera. Every unlock asks for a few random head turns; three failed tries and it waits for your password. Off turns omaFace off"
                     : "Lock screen only, with a head-turn check. Not used while the IR camera works"
                   color: root.foreground
                   opacity: 0.5
@@ -687,7 +687,7 @@ Item {
 
             Button {
               visible: root.status.installed === true && root.appearances.length < root.maxAppearances
-              text: root.appearances.length === 0 ? "Set up Face ID" : "Add alternate appearance"
+              text: root.appearances.length === 0 ? "Set up omaFace" : "Add alternate appearance"
               bordered: true
               foreground: root.accent
               fontFamily: root.fontFamily

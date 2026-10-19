@@ -1,7 +1,7 @@
 import QtQuick
 
 // Enrollment ring: ticks around the edge light up as the head turns toward
-// them, the way Face ID setup fills its circle. Inside, a braille render of
+// them, the way omaFace setup fills its circle. Inside, a braille render of
 // the IR camera so you can see yourself without a video window.
 Item {
   id: root

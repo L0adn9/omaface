@@ -1,13 +1,13 @@
-// faceid-engine — IR face enrollment and verification for Face ID on Omarchy.
+// omaface-engine — IR face enrollment and verification for omaFace on Omarchy.
 //
 // Modes:
 //   serve                      one verification over the socket on stdin/stdout
-//                              (systemd faceid.socket, Accept=yes)
+//                              (systemd omaface.socket, Accept=yes)
 //   enroll <user> [--ui]       capture a new appearance (root only)
 //   test <user> [--ui]         print live match scores, never authenticates
 //   probe                      print the IR camera that would be used
 //
-// The engine never grants anything by itself. PAM only trusts faceid-pam,
+// The engine never grants anything by itself. PAM only trusts omaface-pam,
 // which exits 0 solely when this program answers "RESULT ok" on the socket.
 
 #include <opencv2/core.hpp>
@@ -48,24 +48,24 @@
 
 namespace {
 
-#ifndef FACEID_CONFIG
-#define FACEID_CONFIG "/etc/faceid/config"
+#ifndef OMAFACE_CONFIG
+#define OMAFACE_CONFIG "/etc/omaface/config"
 #endif
-const char* kConfigPath = FACEID_CONFIG;
+const char* kConfigPath = OMAFACE_CONFIG;
 // Overridable so a development build can run against scratch directories.
-#ifndef FACEID_DATA_DIR
-#define FACEID_DATA_DIR "/var/lib/faceid"
+#ifndef OMAFACE_DATA_DIR
+#define OMAFACE_DATA_DIR "/var/lib/omaface"
 #endif
-#ifndef FACEID_RUN_DIR
-#define FACEID_RUN_DIR "/run/faceid"
+#ifndef OMAFACE_RUN_DIR
+#define OMAFACE_RUN_DIR "/run/omaface"
 #endif
-const char* kDataDir = FACEID_DATA_DIR;
-const char* kRunDir = FACEID_RUN_DIR;
-#ifndef FACEID_MODEL_DIR
-#define FACEID_MODEL_DIR "/usr/local/share/faceid/models"
+const char* kDataDir = OMAFACE_DATA_DIR;
+const char* kRunDir = OMAFACE_RUN_DIR;
+#ifndef OMAFACE_MODEL_DIR
+#define OMAFACE_MODEL_DIR "/usr/local/share/omaface/models"
 #endif
-const char* kDetectorModel = FACEID_MODEL_DIR "/face_detection_yunet_2023mar.onnx";
-const char* kRecognizerModel = FACEID_MODEL_DIR "/face_recognition_sface_2021dec.onnx";
+const char* kDetectorModel = OMAFACE_MODEL_DIR "/face_detection_yunet_2023mar.onnx";
+const char* kRecognizerModel = OMAFACE_MODEL_DIR "/face_recognition_sface_2021dec.onnx";
 
 const int kMaxAppearances = 3;
 const int kLockoutFailures = 5;
@@ -95,7 +95,7 @@ struct Config {
   double timeoutLogin = 6.0;
   int minFaceWidth = 70;
   bool attention = true;
-  bool confirm = true;          // sudo and polkit wait for the person to choose Face ID
+  bool confirm = true;          // sudo and polkit wait for the person to choose omaFace
   double timeoutChoose = 30.0;
   bool rgbFallback = false;     // no IR camera: use the regular webcam, with a head-turn check
   double thresholdRgb = 0.55;  // webcam genuine scores measured 0.78-0.88
@@ -588,7 +588,7 @@ double bestScore(const std::vector<Appearance>& gallery, const cv::Mat& feat, si
 
 // ------------------------------------------------------------------ attention
 
-// Face ID should not open for a face that is asleep or looking elsewhere.
+// omaFace should not open for a face that is asleep or looking elsewhere.
 // The IR light sits right beside the lens, so an eye pointed at the camera
 // sends the light straight back off the retina: the whole pupil glows, like
 // red-eye in a flash photo. The glow only shows within a few degrees of the
@@ -722,7 +722,7 @@ std::string failPath(uid_t uid) { return std::string(kRunDir) + "/fail-" + std::
 
 // Consecutive "a face was seen and it was not you" results.
 // Rejected faces, per user. IR strikes wear off after kLockoutSeconds.
-// Webcam strikes are sticky: once paused, Face ID stays off until the
+// Webcam strikes are sticky: once paused, omaFace stays off until the
 // password is used (RESET from the lock screen) or the machine restarts,
 // so a photo or video gets three tries, not three every five minutes.
 struct Failures { int count = 0; time_t last = 0; bool sticky = false; };
@@ -878,7 +878,7 @@ std::string headTurnChallenge(Camera& cam, FaceModels& models, const std::vector
     Face f;
     while (true) {
       if (secondsSince(settleStart) > kSettle) {
-        fprintf(stderr, "faceid: head-turn check: not facing the camera (yaw %.2f, expected %.2f)\n", lastYaw, yMatched);
+        fprintf(stderr, "omaface: head-turn check: not facing the camera (yaw %.2f, expected %.2f)\n", lastYaw, yMatched);
         return "unsettled";
       }
       int r = next(f);
@@ -959,11 +959,11 @@ std::string headTurnChallenge(Camera& cam, FaceModels& models, const std::vector
 std::string choicePath(uid_t uid) { return std::string(kRunDir) + "/choice-" + std::to_string(uid); }
 
 // sudo and system prompts approve something, so looking at the screen must
-// never be enough on its own: the person first asks for Face ID (Enter in
+// never be enough on its own: the person first asks for omaFace (Enter in
 // the terminal, a click or Enter in the dialog) or picks the password. The
 // camera stays off while it waits. The terminal client answers on this
 // connection; the dialog, which polkit's sandboxed helper cannot talk to,
-// answers through CHOOSE, which leaves /run/faceid/choice-<uid>.
+// answers through CHOOSE, which leaves /run/omaface/choice-<uid>.
 std::string awaitChoice(const std::string& key, uid_t uid, long seq, double timeout) {
   unlink(choicePath(uid).c_str());  // only a choice made for this prompt counts
   writeStatus(key, "choose", seq);
@@ -1047,8 +1047,8 @@ int serve() {
   if (req.service == "sudo") { key = "sudo"; enabled = cfg.sudo; timeout = cfg.timeoutSudo; needsSession = true; }
   else if (req.service == "polkit-1") { key = "polkit"; enabled = cfg.polkit; timeout = cfg.timeoutPolkit; needsSession = true; }
   else if (req.service == "sddm") { key = "login"; enabled = cfg.login; timeout = cfg.timeoutLogin; needsSeat = true; }
-  else if (req.service == "omarchy-lock-face") { key = "lock"; enabled = cfg.lock; timeout = cfg.timeoutLock; }
-  else if (req.service == "faceid-test") { key = "test"; enabled = true; timeout = 8.0; test = true; }
+  else if (req.service == "omaface-lock") { key = "lock"; enabled = cfg.lock; timeout = cfg.timeoutLock; }
+  else if (req.service == "omaface-test") { key = "test"; enabled = true; timeout = 8.0; test = true; }
   else return finish("disabled unknown-service");
   // Only the lock screen and the self-test may be asked for by the user itself;
   // sudo, polkit and login requests must come from their root PAM stacks.
@@ -1074,7 +1074,7 @@ int serve() {
   // The self-test still runs the camera and models with nothing enrolled, so
   // a fresh install can be checked end to end before the first enrollment.
   if (gallery.empty() && !test) return finish("unavailable not-enrolled");
-  // The lock screen hides the Face ID mark while the camera cannot see you.
+  // The lock screen hides the omaFace mark while the camera cannot see you.
   if (lidClosed()) { writeStatus(key, "unavailable", 0); return finish("unavailable lid-closed"); }
   if (needsSession && !hasActiveLocalSession(uid)) return finish("unavailable no-local-session");
   if (needsSeat && !hasActiveLocalSession((uid_t)-1)) return finish("unavailable no-local-seat");
@@ -1350,11 +1350,11 @@ bool writeAllUi(const std::string& line) {
 }
 
 int enroll(const std::string& user, const std::string& name, bool ui) {
-#ifndef FACEID_DEV
-  if (geteuid() != 0) { fprintf(stderr, "faceid-engine: enroll must run as root\n"); return 2; }
+#ifndef OMAFACE_DEV
+  if (geteuid() != 0) { fprintf(stderr, "omaface-engine: enroll must run as root\n"); return 2; }
 #endif
   passwd* pw = getpwnam(user.c_str());
-  if (!pw) { fprintf(stderr, "faceid-engine: unknown user %s\n", user.c_str()); return 2; }
+  if (!pw) { fprintf(stderr, "omaface-engine: unknown user %s\n", user.c_str()); return 2; }
 
   // A closed stdout means the settings window went away: stop and save nothing.
   auto emit = [&](const std::string& json, const std::string& human) {
@@ -1366,7 +1366,7 @@ int enroll(const std::string& user, const std::string& name, bool ui) {
     if (fflush(stdout) != 0 || ferror(stdout)) gStop = 1;
   };
   auto fail = [&](const std::string& msg) {
-    emit("{\"type\":\"error\",\"message\":\"" + jsonEscape(msg) + "\"}", "Face ID: " + msg);
+    emit("{\"type\":\"error\",\"message\":\"" + jsonEscape(msg) + "\"}", "omaFace: " + msg);
     return 1;
   };
 
@@ -1421,7 +1421,7 @@ int enroll(const std::string& user, const std::string& name, bool ui) {
   DarkFrameFilter darkFilter;
 
   emit("{\"type\":\"start\",\"segments\":" + std::to_string(segments) + "}",
-       "Face ID: look at the screen, then slowly move your head in a circle.");
+       "omaFace: look at the screen, then slowly move your head in a circle.");
 
   while (!gStop && secondsSince(start) < limit) {
     if (ui && uiCallerGone()) { gStop = 1; break; }
@@ -1528,11 +1528,11 @@ int enroll(const std::string& user, const std::string& name, bool ui) {
 
   emit("{\"type\":\"done\",\"samples\":" + std::to_string(a.features.rows) + ",\"appearances\":" +
            std::to_string(gallery.size()) + ",\"eyes\":" + (a.eyeRing > 0 ? "true" : "false") + "}",
-       "Face ID: enrolled \"" + a.name + "\" (" + std::to_string(a.features.rows) + " samples).");
+       "omaFace: enrolled \"" + a.name + "\" (" + std::to_string(a.features.rows) + " samples).");
   return 0;
 }
 
-#ifdef FACEID_DEV
+#ifdef OMAFACE_DEV
 // Development only: build a throwaway gallery from the first frontal frames,
 // then print scores for the following ones. Nothing is written to disk.
 int calib(double seconds) {
@@ -1593,7 +1593,7 @@ int listAppearances(const std::string& user) {
 }
 
 int removeAppearance(const std::string& user, const std::string& which) {
-  if (geteuid() != 0) { fprintf(stderr, "faceid-engine: remove must run as root\n"); return 2; }
+  if (geteuid() != 0) { fprintf(stderr, "omaface-engine: remove must run as root\n"); return 2; }
   auto gallery = loadGallery(user);
   if (which == "all") {
     unlink(galleryPath(user).c_str());
@@ -1603,7 +1603,7 @@ int removeAppearance(const std::string& user, const std::string& which) {
   }
   int index = atoi(which.c_str());
   if (index < 1 || index > (int)gallery.size()) {
-    fprintf(stderr, "faceid: no appearance %s (have %zu)\n", which.c_str(), gallery.size());
+    fprintf(stderr, "omaface: no appearance %s (have %zu)\n", which.c_str(), gallery.size());
     return 1;
   }
   std::string name = gallery[index - 1].name;
@@ -1613,7 +1613,7 @@ int removeAppearance(const std::string& user, const std::string& which) {
     unlink(galleryPath(user).c_str());
     rmdir(userDir(user).c_str());
   } else if (!saveGallery(user, gallery, err)) {
-    fprintf(stderr, "faceid: %s\n", err.c_str());
+    fprintf(stderr, "omaface: %s\n", err.c_str());
     return 1;
   }
   printf("Removed \"%s\".\n", name.c_str());
@@ -1621,19 +1621,19 @@ int removeAppearance(const std::string& user, const std::string& which) {
 }
 
 int renameAppearance(const std::string& user, const std::string& which, const std::string& rawName) {
-  if (geteuid() != 0) { fprintf(stderr, "faceid-engine: rename must run as root\n"); return 2; }
+  if (geteuid() != 0) { fprintf(stderr, "omaface-engine: rename must run as root\n"); return 2; }
   auto gallery = loadGallery(user);
   int index = atoi(which.c_str());
   if (index < 1 || index > (int)gallery.size()) {
-    fprintf(stderr, "faceid: no appearance %s (have %zu)\n", which.c_str(), gallery.size());
+    fprintf(stderr, "omaface: no appearance %s (have %zu)\n", which.c_str(), gallery.size());
     return 1;
   }
   std::string name = cleanName(rawName);
-  if (name.empty()) { fprintf(stderr, "faceid: the name is empty\n"); return 1; }
+  if (name.empty()) { fprintf(stderr, "omaface: the name is empty\n"); return 1; }
   gallery[index - 1].name = name;
   std::string err;
   if (!saveGallery(user, gallery, err)) {
-    fprintf(stderr, "faceid: %s\n", err.c_str());
+    fprintf(stderr, "omaface: %s\n", err.c_str());
     return 1;
   }
   printf("Renamed appearance %d to \"%s\".\n", index, name.c_str());
@@ -1672,7 +1672,7 @@ int probe(bool webcam) {
   return 0;
 }
 
-// Every capture device, what it offers, and which one Face ID would use:
+// Every capture device, what it offers, and which one omaFace would use:
 // the first thing to look at on a laptop where the IR camera is not found.
 int listCameras() {
   Config cfg = loadConfig();
@@ -1697,7 +1697,7 @@ int listCameras() {
     ::close(fd);
     if (!capture) continue;
     CameraInfo info;
-    std::string verdict = have && chosen.path == path ? "used by Face ID"
+    std::string verdict = have && chosen.path == path ? "used by omaFace"
                         : inspectDevice(path, info) ? "IR candidate"
                         : "colour camera, not used";
     printf("%s\t%s\t%s\t%s\n", path.c_str(), reinterpret_cast<const char*>(cap.card), formats.c_str(), verdict.c_str());
@@ -1775,7 +1775,7 @@ int main(int argc, char** argv) {
   if (mode == "emitter") return checkEmitter();
   if (mode == "remove" && argc > 3) return removeAppearance(argv[2], argv[3]);
   if (mode == "rename" && argc > 4) return renameAppearance(argv[2], argv[3], argv[4]);
-#ifdef FACEID_DEV
+#ifdef OMAFACE_DEV
   if (mode == "calib") return calib(argc > 2 ? atof(argv[2]) : 10);
 #endif
   if (mode == "enroll" && argc > 2) {
@@ -1789,7 +1789,7 @@ int main(int argc, char** argv) {
     return enroll(argv[2], name, ui);
   }
   fprintf(stderr,
-          "usage: faceid-engine serve | probe | cameras | emitter | selftest | list <user> | remove <user> <n|all> | rename <user> <n> <name> | enroll <user> [--name N] [--ui]\n"
-          "self-test goes through the socket: faceid test\n");
+          "usage: omaface-engine serve | probe | cameras | emitter | selftest | list <user> | remove <user> <n|all> | rename <user> <n> <name> | enroll <user> [--name N] [--ui]\n"
+          "self-test goes through the socket: omaface test\n");
   return 2;
 }

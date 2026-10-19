@@ -1,8 +1,8 @@
 [Unit]
-Description=Face ID verification socket
+Description=omaFace verification socket
 
 [Socket]
-ListenStream=/run/faceid.sock
+ListenStream=/run/omaface.sock
 SocketMode=0666
 Accept=yes
 MaxConnections=8
