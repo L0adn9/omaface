@@ -107,7 +107,8 @@ locked_out() {
   if [[ ${sticky:-0} == 1 ]]; then (( count >= 3 )); else (( count >= 5 && $(date +%s) - last <= 300 )); fi
 }
 
-# "ir" or "webcam" (rgb_fallback: no IR camera, lock screen only), or nothing.
+# "ir", or "webcam" (no IR camera found, so the regular webcam with the
+# head-turn check), or nothing.
 camera_kind() { "$LIB/omaface-engine" probe 2>/dev/null | cut -f5; }
 
 appearances_json() { "$LIB/omaface-engine" list "$1" 2>/dev/null || echo "[]"; }
@@ -132,7 +133,7 @@ cmd_status() {
       "$installed" "$(json_bool socket_active)" "$user" "$(appearances_json "$user")" "$MAX_APPEARANCES" "$places" \
       "$([[ $(conf_get attention on) == off ]] && echo false || echo true)" \
       "$([[ $(conf_get confirm on) == off ]] && echo false || echo true)" "$(camera_kind)" \
-      "$([[ $(conf_get rgb_fallback off) == on ]] && echo true || echo false)" \
+      "$([[ $(conf_get rgb_fallback on) == off ]] && echo false || echo true)" \
       "$(json_bool login_supported)" "$([[ -n $(sddm_autologin_user) ]] && echo true || echo false)" \
       "$(json_bool locked_out "$user")" "$("$LIB/omaface-engine" probe 2>/dev/null | cut -f1,2 | tr '\t' ' ' | tr -d '"\\')"
     return
@@ -142,7 +143,7 @@ cmd_status() {
   local count
   count=$(appearance_count "$user")
   echo "omaFace for $user"
-  echo "  camera       $("$LIB/omaface-engine" probe 2>/dev/null | cut -f2 || echo none)$([[ $(camera_kind) == webcam ]] && echo "  (regular webcam: lock screen only, head-turn check)")"
+  echo "  camera       $("$LIB/omaface-engine" probe 2>/dev/null | cut -f2 || echo none)$([[ $(camera_kind) == webcam ]] && echo "  (no IR camera: regular webcam with a head-turn check)")"
   echo "  service      $(socket_active && echo ready || echo stopped)"
   echo "  appearances  $count"
   "$LIB/omaface-engine" list "$user" 2>/dev/null | tr '{' '\n' | sed -n 's/.*"name":"\([^"]*\)","created":"\([^"]*\)".*/\1  \2/p' |
@@ -167,15 +168,13 @@ cmd_ready() {
   [[ -r $CONF ]] || return 1
   is_on "$place" || return 1
   socket_active || return 1
-  [[ $place == lock || $(camera_kind) != webcam ]] || return 1
   [[ $(appearance_count "$user") -gt 0 ]] || return 1
   return 0
 }
 
 select_login_theme() {
   [[ -f $SDDM_THEME/Main.qml ]] || return 0
-  printf '# omaFace login theme (omaface disable login reverts to Omarchy'"'"'s theme)\n[Theme]\nCurrent=omaface\n' >"$SDDM_CONF"
-  chmod 0644 "$SDDM_CONF"
+  write_login_conf "$SDDM_CONF"
 }
 
 cmd_enroll() {
@@ -269,10 +268,6 @@ cmd_toggle() {
     if [[ $action == enable ]]; then
       if [[ $p == login ]] && ! login_supported; then
         echo "omaFace for login: not available (SDDM is not the login manager)"
-        continue
-      fi
-      if [[ $p != lock && $(camera_kind) == webcam ]]; then
-        echo "omaFace for $p: not available with a regular webcam (lock screen only; an IR camera is needed)"
         continue
       fi
       conf_set "$p" on
@@ -372,8 +367,6 @@ while True:
             elif result == "timeout" and detail in ("unsettled", "crowd"):
                 message = {"unsettled": "Recognized, but you did not face the camera long enough to be asked",
                            "crowd": "More than one face in view"}[detail]
-            elif result == "unavailable" and detail == "rgb-lock-only":
-                message = "A regular webcam is only used for the lock screen"
             if result == "unavailable" and detail.startswith("not-enrolled"):
                 message = "Camera works, but no face is enrolled yet" if "no-face-seen" not in detail \
                     else "No face enrolled yet (and none seen by the camera)"
@@ -479,7 +472,7 @@ cmd_doctor() {
   local cam
   if cam=$("$LIB/omaface-engine" probe 2>/dev/null); then
     if [[ $(cut -f5 <<<"$cam") == webcam ]]; then
-      ok "regular webcam: $(cut -f1,2 <<<"$cam" | tr '\t' ' ') (no IR camera; lock screen only, head-turn check)"
+      ok "regular webcam: $(cut -f1,2 <<<"$cam" | tr '\t' ' ') (no IR camera found; head-turn check on every scan)"
     else
       ok "IR camera: $(cut -f1,2 <<<"$cam" | tr '\t' ' ') ($(cut -f4 <<<"$cam"))"
     fi

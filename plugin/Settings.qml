@@ -1,5 +1,6 @@
 import QtQuick
 import Quickshell
+import Quickshell.Hyprland
 import Quickshell.Io
 import Quickshell.Wayland
 import qs.Commons
@@ -40,11 +41,15 @@ Item {
   property color errorColor: Commons.Color.urgent
   property var borderSpec: Border.surfaceSpec("menu", "border", Commons.Color.menu.border, Math.max(1, Style.space(2)))
   readonly property int pad: Style.spacing.panelPadding
-  readonly property int cardWidth: Math.min(Style.space(360), panel.width - Style.gapsOut * 2)
+  readonly property int cardWidth: Math.min(Style.space(380), panel.width - Style.gapsOut * 2)
+  // Opened from the keyboard or the launcher, so it belongs on the monitor
+  // Hyprland has focused (as Omarchy's own panels do); picked once, so it
+  // does not follow focus around while it is open.
+  property var targetScreen: focusedScreen()
 
   readonly property var appearances: Array.isArray(status.appearances) ? status.appearances : []
   readonly property int maxAppearances: status.maxAppearances || 3
-  // No IR camera: the regular webcam, lock screen only, with a head-turn check.
+  // No IR camera found: the regular webcam, with head turns on every scan.
   readonly property bool webcam: status.cameraKind === "webcam"
   readonly property var places: status.places || ({})
   readonly property bool authPending: actionProc.running || (enrollProc.running && enrollPhase === "auth")
@@ -52,12 +57,26 @@ Item {
   readonly property var visiblePlaceRows: placeRows.filter(function(row) {
     return row.key !== "login" || status.loginSupported !== false
   })
+  // Each place, and what using it is like with the IR camera or a webcam.
   readonly property var placeRows: [
-    { key: "lock", label: "Lock screen", detail: "Unlock when you look at the screen" },
-    { key: "login", label: "Login screen", detail: "Sign in at boot, press Enter on an empty field to rescan" },
-    { key: "sudo", label: "sudo in terminals", detail: "Enter skips to the password" },
-    { key: "polkit", label: "System prompts", detail: "Authentication dialogs (polkit)" }
+    { key: "lock", label: "Lock screen", ir: "When you wake the screen", webcam: "Wake the screen, then a few head turns" },
+    { key: "login", label: "Login screen", ir: "At boot; Enter on the empty field scans again", webcam: "At boot, with a few head turns" },
+    { key: "sudo", label: "sudo in terminals", ir: "Press Enter at the prompt to use your face", webcam: "Press Enter, then a few head turns" },
+    { key: "polkit", label: "System prompts", ir: "Click or press Enter to use your face", webcam: "Click or press Enter, then a few head turns" }
   ]
+
+  function focusedScreen() {
+    var monitor = Hyprland.focusedMonitor
+    var name = monitor ? String(monitor.name || "") : ""
+    for (var i = 0; i < Quickshell.screens.length; i++)
+      if (Quickshell.screens[i].name === name) return Quickshell.screens[i]
+    return Quickshell.screens[0]
+  }
+
+  function placeDetail(row) {
+    if (row.key === "login" && status.autologin === true) return "Skipped: SDDM signs you in automatically"
+    return webcam ? row.webcam : row.ir
+  }
 
   function refresh() {
     if (!statusProc.running) statusProc.running = true
@@ -120,7 +139,7 @@ Item {
   function startTest() {
     if (testProc.running) return
     testState = "scanning"
-    testText = "Look at the screen…"
+    testText = "Look at the camera…"
     view = "test"
     testProc.running = true
   }
@@ -198,6 +217,7 @@ Item {
   }
 
   Component.onCompleted: {
+    targetScreen = targetScreen  // keep the monitor it opened on
     refresh()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
@@ -277,6 +297,7 @@ Item {
 
   PanelWindow {
     id: panel
+    screen: root.targetScreen
     visible: !root.closing
     anchors { top: true; bottom: true; left: true; right: true }
     color: "transparent"
@@ -338,18 +359,24 @@ Item {
           width: parent.width
           spacing: Style.spacing.panelGap
 
+          // The mark, the name, and the state in one line.
           Row {
+            width: parent.width
             spacing: Style.space(14)
+
             FaceGlyph {
+              id: headerMark
               width: Style.space(40)
               height: width
-              mode: root.appearances.length > 0 ? "idle" : "idle"
               color: root.appearances.length > 0 ? root.accent : root.foreground
               opacity: root.appearances.length > 0 ? 1 : 0.5
             }
+
             Column {
+              width: parent.width - headerMark.width - parent.spacing
               anchors.verticalCenter: parent.verticalCenter
               spacing: Style.space(3)
+
               Text {
                 text: "omaFace"
                 color: root.foreground
@@ -357,20 +384,114 @@ Item {
                 font.pixelSize: Style.font.heading
                 font.bold: true
               }
+
               Text {
+                width: parent.width
+                elide: Text.ElideRight
                 textFormat: Text.PlainText
                 color: root.foreground
                 opacity: 0.6
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.bodySmall
                 text: !root.loaded ? "Checking…"
-                  : (root.status.installed !== true ? "Not installed"
-                  : (root.status.lockedOut === true ? "Paused: use your password once to resume"
+                  : root.status.installed !== true ? "Not installed"
+                  : root.status.lockedOut === true ? "Paused: use your password once to resume"
                   : (root.appearances.length === 0 ? "Not set up"
-                  : (root.appearances.length === 1 ? "1 appearance" : root.appearances.length + " appearances")
-                    + (root.webcam ? "  ·  webcam" : "")
-                    + (root.status.service === true ? "  ·  ready" : "  ·  service stopped"))))
+                    : root.appearances.length === 1 ? "1 appearance" : root.appearances.length + " appearances")
+                    + (root.webcam ? "  ·  webcam" : "  ·  IR camera")
+                    + (root.status.service === true ? "  ·  ready" : "  ·  service stopped")
               }
+            }
+          }
+
+          PanelSeparator { foreground: root.foreground }
+
+          Column {
+            width: parent.width
+            spacing: Style.space(12)
+
+            PanelSectionHeader {
+              width: parent.width
+              text: "USE FACE UNLOCK FOR"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            Repeater {
+              model: root.visiblePlaceRows
+              delegate: SettingRow {
+                required property var modelData
+                width: parent.width
+                title: modelData.label
+                detail: root.placeDetail(modelData)
+                checked: root.places[modelData.key] === true
+                busy: actionProc.running
+                interactive: root.status.installed === true && !actionProc.running
+                foreground: root.foreground
+                accent: root.accent
+                fontFamily: root.fontFamily
+                onToggled: root.run([checked ? "disable" : "enable", modelData.key],
+                  modelData.label + (checked ? " off" : " on"))
+              }
+            }
+          }
+
+          PanelSeparator { foreground: root.foreground }
+
+          Column {
+            width: parent.width
+            spacing: Style.space(12)
+
+            PanelSectionHeader {
+              width: parent.width
+              text: "SECURITY"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            SettingRow {
+              width: parent.width
+              title: "Require attention"
+              detail: root.webcam ? "IR camera only; the webcam uses head turns"
+                : "Eyes open and looking at the camera"
+              checked: !root.webcam && root.status.attention !== false
+              busy: actionProc.running
+              interactive: !root.webcam && root.status.installed === true && !actionProc.running
+              foreground: root.foreground
+              accent: root.accent
+              fontFamily: root.fontFamily
+              onToggled: root.run(["set", "attention", checked ? "off" : "on"],
+                "Require attention " + (checked ? "off" : "on"))
+            }
+
+            SettingRow {
+              width: parent.width
+              title: "Ask first"
+              detail: root.webcam ? "Always on with a webcam: sudo and prompts wait for Enter or a click"
+                : "sudo and prompts wait for Enter or a click"
+              checked: root.webcam || root.status.confirm !== false
+              busy: actionProc.running
+              interactive: !root.webcam && root.status.installed === true && !actionProc.running
+              foreground: root.foreground
+              accent: root.accent
+              fontFamily: root.fontFamily
+              onToggled: root.run(["set", "confirm", checked ? "off" : "on"],
+                "Ask first " + (checked ? "off" : "on"))
+            }
+
+            SettingRow {
+              width: parent.width
+              title: "Webcam fallback"
+              detail: root.webcam ? "In use: this laptop has no IR camera"
+                : "Only when no IR camera is found, with head turns on every scan"
+              checked: root.status.rgbFallback !== false
+              busy: actionProc.running
+              interactive: root.status.installed === true && !actionProc.running
+              foreground: root.foreground
+              accent: root.accent
+              fontFamily: root.fontFamily
+              onToggled: root.run(["set", "rgb_fallback", checked ? "off" : "on"],
+                "Webcam fallback " + (checked ? "off" : "on"))
             }
           }
 
@@ -380,212 +501,11 @@ Item {
             width: parent.width
             spacing: Style.space(10)
 
-            Text {
-              text: "USE FACE UNLOCK FOR"
-              color: root.foreground
-              opacity: 0.5
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              font.letterSpacing: 1
-            }
-
-            Repeater {
-              model: root.visiblePlaceRows
-              delegate: Item {
-                required property var modelData
-                width: parent.width
-                height: Math.max(placeText.implicitHeight, placeSwitch.implicitHeight)
-
-                Column {
-                  id: placeText
-                  anchors.left: parent.left
-                  anchors.right: placeSwitch.left
-                  anchors.rightMargin: Style.space(10)
-                  anchors.verticalCenter: parent.verticalCenter
-                  spacing: Style.space(1)
-                  Text {
-                    text: modelData.label
-                    color: root.foreground
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.body
-                  }
-                  Text {
-                    width: parent.width
-                    text: root.webcam && modelData.key === "lock"
-                      ? "Unlock with your face and a few head turns"
-                      : root.webcam
-                      ? "Needs an IR camera; a regular webcam only unlocks the lock screen"
-                      : modelData.key === "login" && root.status.autologin === true
-                      ? "SDDM signs you in automatically, so the login screen does not show"
-                      : modelData.detail
-                    color: root.foreground
-                    opacity: 0.5
-                    wrapMode: Text.WordWrap
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                  }
-                }
-
-                ToggleSwitch {
-                  id: placeSwitch
-                  anchors.right: parent.right
-                  anchors.verticalCenter: parent.verticalCenter
-                  checked: root.places[modelData.key] === true && (!root.webcam || modelData.key === "lock")
-                  busy: actionProc.running
-                  interactive: root.status.installed === true && !actionProc.running
-                    && (!root.webcam || modelData.key === "lock")
-                  foreground: root.foreground
-                  accent: root.accent
-                  onToggled: root.run([checked ? "disable" : "enable", modelData.key],
-                    modelData.label + (checked ? " off" : " on"))
-                }
-              }
-            }
-
-            Item {
+            PanelSectionHeader {
               width: parent.width
-              height: Math.max(webcamText.implicitHeight, webcamSwitch.implicitHeight)
-
-              Column {
-                id: webcamText
-                anchors.left: parent.left
-                anchors.right: webcamSwitch.left
-                anchors.rightMargin: Style.space(10)
-                anchors.verticalCenter: parent.verticalCenter
-                spacing: Style.space(1)
-                Text {
-                  text: "Use the webcam if there is no IR camera"
-                  color: root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.body
-                }
-                Text {
-                  width: parent.width
-                  text: root.webcam
-                    ? "In use: this laptop has no IR camera. Every unlock asks for a few random head turns; three failed tries and it waits for your password. Off turns omaFace off"
-                    : "Lock screen only, with a head-turn check. Not used while the IR camera works"
-                  color: root.foreground
-                  opacity: 0.5
-                  wrapMode: Text.WordWrap
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                }
-              }
-
-              ToggleSwitch {
-                id: webcamSwitch
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
-                checked: root.status.rgbFallback === true
-                busy: actionProc.running
-                interactive: root.status.installed === true && !actionProc.running
-                foreground: root.foreground
-                accent: root.accent
-                onToggled: root.run(["set", "rgb_fallback", checked ? "off" : "on"],
-                  "Webcam " + (checked ? "off" : "on"))
-              }
-            }
-
-            Item {
-              visible: !root.webcam
-              width: parent.width
-              height: Math.max(attentionText.implicitHeight, attentionSwitch.implicitHeight)
-
-              Column {
-                id: attentionText
-                anchors.left: parent.left
-                anchors.right: attentionSwitch.left
-                anchors.rightMargin: Style.space(10)
-                anchors.verticalCenter: parent.verticalCenter
-                spacing: Style.space(1)
-                Text {
-                  text: "Require attention"
-                  color: root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.body
-                }
-                Text {
-                  width: parent.width
-                  text: "Only unlock when your eyes are open and looking at the camera"
-                  color: root.foreground
-                  opacity: 0.5
-                  wrapMode: Text.WordWrap
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                }
-              }
-
-              ToggleSwitch {
-                id: attentionSwitch
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
-                checked: root.status.attention !== false
-                busy: actionProc.running
-                interactive: root.status.installed === true && !actionProc.running
-                foreground: root.foreground
-                accent: root.accent
-                onToggled: root.run(["set", "attention", checked ? "off" : "on"],
-                  "Require attention " + (checked ? "off" : "on"))
-              }
-            }
-
-            Item {
-              visible: !root.webcam
-              width: parent.width
-              height: Math.max(confirmText.implicitHeight, confirmSwitch.implicitHeight)
-
-              Column {
-                id: confirmText
-                anchors.left: parent.left
-                anchors.right: confirmSwitch.left
-                anchors.rightMargin: Style.space(10)
-                anchors.verticalCenter: parent.verticalCenter
-                spacing: Style.space(1)
-                Text {
-                  text: "Ask first for sudo and prompts"
-                  color: root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.body
-                }
-                Text {
-                  width: parent.width
-                  text: "The camera waits until you press Enter or click; typing uses the password"
-                  color: root.foreground
-                  opacity: 0.5
-                  wrapMode: Text.WordWrap
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                }
-              }
-
-              ToggleSwitch {
-                id: confirmSwitch
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
-                checked: root.status.confirm !== false
-                busy: actionProc.running
-                interactive: root.status.installed === true && !actionProc.running
-                foreground: root.foreground
-                accent: root.accent
-                onToggled: root.run(["set", "confirm", checked ? "off" : "on"],
-                  "Ask first " + (checked ? "off" : "on"))
-              }
-            }
-          }
-
-          PanelSeparator { foreground: root.foreground }
-
-          Column {
-            width: parent.width
-            spacing: Style.space(8)
-
-            Text {
               text: "APPEARANCES"
-              color: root.foreground
-              opacity: 0.5
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              font.letterSpacing: 1
+              foreground: root.foreground
+              fontFamily: root.fontFamily
             }
 
             Text {
@@ -599,95 +519,28 @@ Item {
 
             Repeater {
               model: root.appearances
-              delegate: Item {
-                id: row
+              delegate: AppearanceRow {
                 required property var modelData
                 required property int index
-                readonly property bool editing: root.renaming === index
                 width: parent.width
-                height: Math.max(removeButton.implicitHeight, editing ? nameField.implicitHeight : 0)
-
-                TextField {
-                  id: nameField
-                  visible: row.editing
-                  anchors.left: parent.left
-                  anchors.right: renameButton.left
-                  anchors.rightMargin: Style.space(8)
-                  anchors.verticalCenter: parent.verticalCenter
-                  foreground: root.foreground
-                  accent: root.accent
-                  font.family: root.fontFamily
-                  maximumLength: 40
-                  placeholderText: "Name, e.g. Glasses"
-                  onVisibleChanged: if (visible) {
-                    text = row.modelData.name || ""
-                    selectAll()
-                    forceActiveFocus()
-                  }
-                  onAccepted: root.finishRename(row.index, text)
-                  Keys.onEscapePressed: function(event) {
-                    root.cancelRename()
-                    event.accepted = true
-                  }
-                }
-
-                Column {
-                  visible: !row.editing
-                  anchors.left: parent.left
-                  anchors.right: renameButton.left
-                  anchors.verticalCenter: parent.verticalCenter
-                  Text {
-                    width: parent.width
-                    elide: Text.ElideRight
-                    // Names in right-to-left scripts would otherwise sit
-                    // against the buttons instead of under the heading.
-                    horizontalAlignment: Text.AlignLeft
-                    text: modelData.name || "Face"
-                    color: root.foreground
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.body
-                  }
-                  Text {
-                    text: String(modelData.created || "").replace("T", "  ").slice(0, 17)
-                      + (modelData.kind === "rgb" ? "  ·  webcam" : "")
-                    color: root.foreground
-                    opacity: 0.5
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                  }
-                }
-
-                Button {
-                  id: renameButton
-                  anchors.right: removeButton.left
-                  anchors.rightMargin: Style.space(6)
-                  anchors.verticalCenter: parent.verticalCenter
-                  text: row.editing ? "Save" : "Rename"
-                  bordered: true
-                  foreground: row.editing ? root.accent : root.foreground
-                  fontFamily: root.fontFamily
-                  fontSize: Style.font.bodySmall
-                  enabled: !actionProc.running
-                  onClicked: row.editing ? root.finishRename(row.index, nameField.text) : root.startRename(row.index)
-                }
-
-                Button {
-                  id: removeButton
-                  anchors.right: parent.right
-                  anchors.verticalCenter: parent.verticalCenter
-                  text: "Remove"
-                  bordered: true
-                  foreground: root.foreground
-                  fontFamily: root.fontFamily
-                  fontSize: Style.font.bodySmall
-                  onClicked: root.run(["remove", String(index + 1)], "Removed " + (modelData.name || "appearance"))
-                }
+                name: String(modelData.name || "")
+                created: String(modelData.created || "")
+                kind: String(modelData.kind || "ir")
+                editing: root.renaming === index
+                interactive: !actionProc.running
+                foreground: root.foreground
+                accent: root.accent
+                fontFamily: root.fontFamily
+                onRenameStarted: root.startRename(index)
+                onRenamed: function(newName) { root.finishRename(index, newName) }
+                onRenameCancelled: root.cancelRename()
+                onRemoveRequested: root.run(["remove", String(index + 1)], "Removed " + (modelData.name || "appearance"))
               }
             }
 
             Button {
               visible: root.status.installed === true && root.appearances.length < root.maxAppearances
-              text: root.appearances.length === 0 ? "Set up omaFace" : "Add alternate appearance"
+              text: root.appearances.length === 0 ? "Set up omaFace" : "Add another appearance"
               bordered: true
               foreground: root.accent
               fontFamily: root.fontFamily
@@ -696,6 +549,8 @@ Item {
 
             Text {
               visible: root.loaded && root.appearances.length >= root.maxAppearances
+              width: parent.width
+              wrapMode: Text.WordWrap
               text: "Up to " + root.maxAppearances + " appearances. Remove one to add another."
               color: root.foreground
               opacity: 0.5
@@ -706,13 +561,15 @@ Item {
 
           PanelSeparator { foreground: root.foreground }
 
+          // Test on the left; messages, or the Esc hint, on the right.
           Item {
             width: parent.width
-            height: testButton.implicitHeight
+            height: Math.max(testButton.implicitHeight, footerText.implicitHeight)
 
             Button {
               id: testButton
               anchors.left: parent.left
+              anchors.verticalCenter: parent.verticalCenter
               text: "Test"
               bordered: true
               visible: root.appearances.length > 0
@@ -722,9 +579,10 @@ Item {
             }
 
             Text {
-              anchors.right: parent.right
+              id: footerText
               anchors.left: testButton.visible ? testButton.right : parent.left
-              anchors.leftMargin: Style.space(12)
+              anchors.leftMargin: testButton.visible ? Style.space(14) : 0
+              anchors.right: parent.right
               anchors.verticalCenter: parent.verticalCenter
               horizontalAlignment: Text.AlignRight
               elide: Text.ElideLeft

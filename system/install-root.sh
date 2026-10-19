@@ -74,12 +74,8 @@ if [[ $LOGIN != yes ]]; then
   set_conf login off
 fi
 if [[ $WEBCAM == yes ]]; then
-  # No IR camera: the regular webcam, for the lock screen only (the engine
-  # enforces that too).
+  # No IR camera: the regular webcam, everywhere, with the head-turn check.
   set_conf rgb_fallback on
-  set_conf sudo off
-  set_conf polkit off
-  set_conf login off
 fi
 install -d -m0755 /var/lib/omaface
 
@@ -157,8 +153,7 @@ chmod 0644 /etc/pam.d/omaface-lock
 # The login theme is selected once a face exists (omaface enroll does it).
 owner=${SUDO_USER:-$(getent passwd "${PKEXEC_UID:-65534}" | cut -d: -f1)}
 if [[ $LOGIN == yes ]] && grep -qE '^login=on' /etc/omaface/config && [[ -s /var/lib/omaface/${owner:-none}/faces.yml ]]; then
-  printf '# omaFace login theme (omaface disable login reverts to Omarchy'"'"'s theme)\n[Theme]\nCurrent=omaface\n' \
-    >/etc/sddm.conf.d/20-omaface.conf
+  write_login_conf /etc/sddm.conf.d/20-omaface.conf
 fi
 
 echo "  done"

@@ -388,6 +388,7 @@ POLKIT = [
   property string faceState: "idle"
   property double flowStartedAt: 0
   property string pendingPassword: ""
+  property string faceLive: ""
   readonly property bool agentRegistered: polkitAgent.isRegistered
 """,
     ),
@@ -411,6 +412,9 @@ POLKIT = [
       var status = JSON.parse(String(raw || "{}"))
       if (status.service !== "polkit" || status.at * 1000 < flowStartedAt - 2000) return
       var state = String(status.state || "")
+      // The webcam's head-turn prompts are still a scan, with a live hint.
+      faceLive = state.indexOf("turn-") === 0 ? state : ""
+      if (faceLive !== "") state = "scanning"
       faceState = state === "choose" || state === "scanning" || state === "success" || state === "failure" ? state : "idle"
     } catch (e) {}
   }
@@ -552,7 +556,11 @@ POLKIT = [
       anchors.top: card.bottom
       anchors.topMargin: Style.space(10)
       visible: root.fingerprintMode && root.faceConfigured && (root.faceState === "choose" || root.faceState === "scanning")
-      text: root.faceState === "choose" ? "Enter or click for omaFace  \u00b7  type for password" : "Look at the camera"
+      text: root.faceState === "choose" ? "Enter or click for omaFace  \u00b7  type for password"
+        : root.faceLive === "turn-left" ? "\u2190  Turn your head left"
+        : root.faceLive === "turn-right" ? "Turn your head right  \u2192"
+        : root.faceLive === "turn-back" ? "Face the camera again"
+        : "Look at the camera"
       color: root.foreground
       opacity: 0.7
       font.family: root.fontFamily

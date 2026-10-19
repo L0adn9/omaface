@@ -27,10 +27,11 @@ choose **Set up omaFace**.
 ## What you need
 
 * **Omarchy 4** or newer (the Quickshell lock screen).
-* **A camera.** An infrared (Windows Hello) camera gets everything below. A
-  laptop without one gets the regular webcam for the lock screen only, with a
-  head-turn check (see [Laptops without an IR camera](#laptops-without-an-ir-camera)).
-  The installer works out which one you have; you do not need to know.
+* **A camera.** omaFace looks for an infrared (Windows Hello) camera first and
+  uses it when there is one. A laptop without one uses its regular webcam, for
+  everything, with a head-turn check on every scan (see
+  [Laptops without an IR camera](#laptops-without-an-ir-camera)). This is
+  automatic; you do not need to know which camera you have.
 * About 120 MB for OpenCV if it is not installed yet. The installer lets
   pacman list what it adds and asks first.
 
@@ -60,7 +61,7 @@ choose **Set up omaFace**.
 | Place  | When it scans | Notes |
 |--------|---------------|-------|
 | lock   | on activity after locking (key, pointer, a click on the mark), and right after waking from sleep | a lock you just asked for is not undone while you still sit there |
-| login  | when the login screen appears; Enter on the empty field scans again | IR camera, SDDM as the login manager, and a face enrolled |
+| login  | when the login screen appears; Enter on the empty field scans again | SDDM as the login manager, and a face enrolled |
 | sudo   | after you press Enter at the omaFace prompt | any other key goes to the password; typed keys are not echoed while it looks |
 | polkit | after you click the mark or press Enter | typing goes straight to the password field, nothing lost |
 
@@ -98,18 +99,19 @@ enrolled, catches looking up or away.
 
 ## Laptops without an IR camera
 
-A regular webcam sees what your eyes see, so a photo or a phone screen showing
-your face looks like you. omaFace still works with one, with limits that keep
-it safe:
+When no IR camera is found, omaFace uses the regular webcam, for everything:
+the lock screen, the login screen, `sudo` and system prompts. A webcam sees
+what your eyes see, so a photo or a phone screen showing your face looks like
+you; these checks are what keep it safe:
 
-* **Lock screen only.** `sudo`, system prompts and the login screen keep using
-  your password; the scanner itself refuses them with a webcam.
-* **A random head-turn sequence on every unlock.** After it recognizes you it
+* **A random head-turn sequence on every scan.** After it recognizes you it
   asks for three moves (left, right, back to the camera), each after a random
   pause and within a couple of seconds. A real head turning moves the nose
   against the eyes; a photo or a screen tilted the same way does not, because
   it is flat. A recording cannot follow a sequence it does not know, and the
   face back at the camera has to match again.
+* **`sudo` and system prompts always ask first** with a webcam: nothing scans
+  until you press Enter or click, even if ask first is switched off.
 * **Three failed tries and it waits for your password**, until you use it once.
 * Webcam and IR appearances are kept apart, with a stricter match threshold
   for the webcam.
@@ -118,9 +120,9 @@ Tested with a photo of the user on a phone: it was recognized as the user, and
 refused by the head-turn check every time.
 
 It is still weaker than an IR camera: someone with videos of you turning each
-way, switched live in front of the camera, might get past it. The installer
-picks this mode by itself when there is no IR camera; the switch "Use the
-webcam if there is no IR camera" in Settings turns it on or off.
+way, switched live in front of the camera, might get past it. The switch
+"Webcam fallback" in Settings turns this mode off; an IR camera, when there is
+one, is always used instead.
 
 ## How it works
 

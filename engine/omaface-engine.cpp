@@ -97,7 +97,7 @@ struct Config {
   bool attention = true;
   bool confirm = true;          // sudo and polkit wait for the person to choose omaFace
   double timeoutChoose = 30.0;
-  bool rgbFallback = false;     // no IR camera: use the regular webcam, with a head-turn check
+  bool rgbFallback = true;      // no IR camera: use the regular webcam, with a head-turn check
   double thresholdRgb = 0.55;  // webcam genuine scores measured 0.78-0.88
 };
 
@@ -131,7 +131,7 @@ Config loadConfig() {
       else if (k == "threshold") c.threshold = std::clamp(std::stod(v), 0.30, 0.95);
       else if (k == "attention") c.attention = parseBool(v, true);
       else if (k == "confirm") c.confirm = parseBool(v, true);
-      else if (k == "rgb_fallback") c.rgbFallback = parseBool(v, false);
+      else if (k == "rgb_fallback") c.rgbFallback = parseBool(v, true);
       else if (k == "threshold_rgb") c.thresholdRgb = std::clamp(std::stod(v), 0.30, 0.95);
       else if (k == "timeout_choose") c.timeoutChoose = std::clamp(std::stod(v), 5.0, 120.0);
       else if (k == "match_frames") c.matchFrames = std::clamp(std::stoi(v), 1, 5);
@@ -1055,15 +1055,14 @@ int serve() {
   if ((key == "sudo" || key == "polkit" || key == "login") && cred.uid != 0) return finish("denied peer");
   if (!enabled) return finish("disabled");
 
-  // Which camera decides the rules. A regular webcam (rgb_fallback, no IR
-  // camera) is for the lock screen only: a photo or a screen fools it far
-  // more easily, so approving sudo, system prompts or a login stays with an
-  // IR camera or the password. Appearances only match the kind of camera
-  // they were enrolled with.
+  // Which camera decides the rules. The IR camera when there is one; when
+  // there is none, the regular webcam (rgb_fallback), everywhere, with the
+  // head-turn check on every scan, sudo and system prompts always waiting
+  // for the person to ask, and sticky strikes. Appearances only match the
+  // kind of camera they were enrolled with.
   CameraInfo info;
   bool haveCamera = findCamera(cfg, info);
   const bool rgb = haveCamera && !info.ir;
-  if (rgb && key != "lock" && key != "test") return finish("unavailable rgb-lock-only");
   const double threshold = rgb ? cfg.thresholdRgb : cfg.threshold;
   const int lockoutAt = rgb ? kLockoutFailuresRgb : kLockoutFailures;
 
@@ -1084,7 +1083,9 @@ int serve() {
 
   long seq = (long)time(nullptr) * 1000 + getpid() % 1000;
   unlink(choicePath(uid).c_str());  // a choice only counts for the prompt it was made in
-  if ((key == "sudo" || key == "polkit") && cfg.confirm) {
+  // A webcam always asks first for sudo and system prompts, whatever the
+  // confirm setting: looking at the screen must never approve them.
+  if ((key == "sudo" || key == "polkit") && (cfg.confirm || rgb)) {
     std::string choice = awaitChoice(key, uid, seq, cfg.timeoutChoose);
     if (choice != "face") {
       writeStatus(key, "idle", seq);

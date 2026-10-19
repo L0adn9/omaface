@@ -20,7 +20,7 @@ sys.path.insert(0, HERE)
 import patches  # noqa: E402
 
 UPSTREAM = os.environ.get("OMAFACE_UPSTREAM", "/usr/share/omarchy/shell/plugins")
-OWN_FILES = ["manifest.json", "FaceGlyph.qml", "Settings.qml", "EnrollRing.qml"]
+OWN_FILES = ["manifest.json", "FaceGlyph.qml", "Settings.qml", "EnrollRing.qml", "SettingRow.qml", "AppearanceRow.qml"]
 
 
 def sha256(path):

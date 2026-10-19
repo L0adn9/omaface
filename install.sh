@@ -74,22 +74,20 @@ if ! cam=$("$build/engine/omaface-engine" probe); then
     "$build/engine/omaface-engine" cameras 2>/dev/null | sed 's/^/    /' >&2 || true
     fail "no camera found. If yours is listed above but not picked, set device=/dev/videoN in /etc/omaface/config after installing."
   fi
-  # Found automatically: no IR camera, so the regular webcam, with the limits
-  # that keep it safe. Nothing to decide here; Settings shows it too.
+  # Found automatically: no IR camera, so the regular webcam, everywhere,
+  # with the checks that keep it safe. Nothing to decide; Settings shows it.
   cat <<'EOF'
   This laptop has no IR (Windows Hello) camera, so omaFace uses the regular
-  webcam, with limits that keep it safe:
-    - lock screen only: sudo, system prompts and the login screen keep
-      using your password
-    - every unlock asks for a few random head turns, so a photo or a video
-      of you is not enough
-    - three failed tries and it waits for your password
+  webcam, for everything, with checks that keep it safe:
+    - every scan asks for a few random head turns, so a photo or a video of
+      you is not enough
+    - sudo and system prompts always wait for you to press Enter or click
+    - three failed tries and it waits for your password once
 EOF
   webcam=yes
-  login=no
 fi
 if [[ $webcam == yes ]]; then
-  echo "  Webcam: $(cut -f2 <<<"$cam") ($(cut -f1 <<<"$cam"), $(cut -f4 <<<"$cam") $(cut -f3 <<<"$cam")), lock screen only"
+  echo "  Webcam: $(cut -f2 <<<"$cam") ($(cut -f1 <<<"$cam"), $(cut -f4 <<<"$cam") $(cut -f3 <<<"$cam"))"
 else
   echo "  IR camera: $(cut -f2 <<<"$cam") ($(cut -f1 <<<"$cam"), $(cut -f4 <<<"$cam") $(cut -f3 <<<"$cam"))"
 fi

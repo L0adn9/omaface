@@ -17,6 +17,9 @@ Rectangle {
   property bool faceAttempt: false
   property bool pendingPassword: false
   property int faceFailures: 0
+  // What the scanner asks for right now: "turn-left", "turn-right" or
+  // "turn-back" (the webcam's head-turn check), or "" while it just looks.
+  property string faceLive: ""
   property int sessionIndex: {
     for (var i = 0; i < sessionModel.rowCount(); i++) {
       var name = (sessionModel.data(sessionModel.index(i, 0), Qt.DisplayRole) || "").toString()
@@ -68,6 +71,30 @@ Rectangle {
     }
   }
 
+  // The scanner writes its state to /run/omaface/status; the greeter reads it
+  // while a scan runs (QML_XHR_ALLOW_FILE_READ is set for it in 20-omaface.conf).
+  Timer {
+    interval: 150
+    repeat: true
+    running: root.faceAttempt
+    onRunningChanged: if (!running) root.faceLive = ""
+    onTriggered: {
+      var request = new XMLHttpRequest()
+      request.onreadystatechange = function() {
+        if (request.readyState !== XMLHttpRequest.DONE) return
+        try {
+          var status = JSON.parse(request.responseText || "{}")
+          var state = String(status.state || "")
+          root.faceLive = status.service === "login" && state.indexOf("turn-") === 0 ? state : ""
+        } catch (e) {
+          root.faceLive = ""
+        }
+      }
+      request.open("GET", "file:///run/omaface/status")
+      request.send()
+    }
+  }
+
   Timer {
     id: faceIdle
     interval: 1100
@@ -94,25 +121,47 @@ Rectangle {
       anchors.horizontalCenter: parent.horizontalCenter
     }
 
-    Item {
-      width: 72
-      height: 72
+    // The mark, and under it what the scanner asks for. The prompt line keeps
+    // its height when empty so nothing below moves as it changes.
+    Column {
       anchors.horizontalCenter: parent.horizontalCenter
+      spacing: 14
       opacity: root.faceFailures >= 5 ? 0.25 : 1
 
-      FaceGlyph {
-        anchors.fill: parent
-        mode: root.faceState
-        color: "#9ece6a"
-        successColor: "#9ece6a"
-        errorColor: "#f7768e"
-        opacity: root.faceState === "idle" ? 0.55 : 1
+      Item {
+        width: 72
+        height: 72
+        anchors.horizontalCenter: parent.horizontalCenter
+
+        FaceGlyph {
+          anchors.fill: parent
+          mode: root.faceState
+          color: "#9ece6a"
+          successColor: "#9ece6a"
+          errorColor: "#f7768e"
+          opacity: root.faceState === "idle" ? 0.55 : 1
+        }
+
+        MouseArea {
+          anchors.fill: parent
+          cursorShape: Qt.PointingHandCursor
+          onClicked: root.startFace()
+        }
       }
 
-      MouseArea {
-        anchors.fill: parent
-        cursorShape: Qt.PointingHandCursor
-        onClicked: root.startFace()
+      Text {
+        anchors.horizontalCenter: parent.horizontalCenter
+        height: 20
+        verticalAlignment: Text.AlignVCenter
+        text: !root.faceAttempt ? ""
+          : root.faceLive === "turn-left" ? "\u2190  turn your head left"
+          : root.faceLive === "turn-right" ? "turn your head right  \u2192"
+          : root.faceLive === "turn-back" ? "face the camera again"
+          : "look at the camera"
+        color: "#9ece6a"
+        opacity: root.faceLive !== "" ? 1 : 0.6
+        font.family: "JetBrainsMono Nerd Font"
+        font.pixelSize: 16
       }
     }
 

@@ -50,6 +50,24 @@ sddm_in_use() {
   [[ $(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null) == */sddm.service ]]
 }
 
+# The login screen's drop-in: the omaFace theme, and permission for it to read
+# the scanner's live status (the webcam's "turn your head" prompts) through
+# QML's file access, which Qt 6 only allows with this variable. Any greeter
+# environment set elsewhere is kept, since a later file replaces the key.
+write_login_conf() {
+  local env="QML_XHR_ALLOW_FILE_READ=1" other="" f
+  local files=()
+  for f in /etc/sddm.conf.d/*.conf /etc/sddm.conf; do
+    [[ -f $f && $f != */20-omaface.conf ]] && files+=("$f")
+  done
+  if (( ${#files[@]} )); then
+    other=$(awk '/^[[:space:]]*GreeterEnvironment[[:space:]]*=/ { sub(/^[^=]*=[[:space:]]*/, ""); v = $0 } END { print v }' "${files[@]}")
+  fi
+  if [[ -n $other && $other != *QML_XHR_ALLOW_FILE_READ* ]]; then env="$other,$env"; fi
+  printf '# omaFace login theme (omaface disable login reverts to Omarchy'"'"'s theme)\n[General]\nGreeterEnvironment=%s\n\n[Theme]\nCurrent=omaface\n' "$env" >"$1"
+  chmod 0644 "$1"
+}
+
 # SDDM autologin (the Omarchy ISO turns it on for encrypted disks) means the
 # greeter never shows, so there is no login screen to scan at. SDDM reads
 # sddm.conf.d in order and sddm.conf last; a later empty User= turns it off.
