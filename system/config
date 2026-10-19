@@ -1,0 +1,27 @@
+# Face ID configuration. Change it with `faceid enable|disable|set` or the
+# Face ID settings window (faceid settings); both keep this file valid.
+
+# Where Face ID is offered. The password always keeps working everywhere.
+lock=on
+login=on
+sudo=on
+polkit=on
+
+# Require attention: only unlock when your eyes are open and looking at the
+# camera (checked with the IR light's reflection in your pupils).
+attention=on
+
+# Matching. Higher threshold = stricter. A match needs this many lit IR
+# frames in a row above the threshold.
+threshold=0.50
+match_frames=2
+min_face_width=70
+
+# Seconds the camera looks before falling back to the password.
+timeout_sudo=4
+timeout_polkit=5
+timeout_lock=6
+timeout_login=6
+
+# IR camera: auto picks the greyscale camera named "IR".
+device=auto

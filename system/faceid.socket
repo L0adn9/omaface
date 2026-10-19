@@ -1,0 +1,12 @@
+[Unit]
+Description=Face ID verification socket
+
+[Socket]
+ListenStream=/run/faceid.sock
+SocketMode=0666
+Accept=yes
+MaxConnections=8
+MaxConnectionsPerSource=4
+
+[Install]
+WantedBy=sockets.target

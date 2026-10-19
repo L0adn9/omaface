@@ -1,0 +1,7 @@
+[SddmGreeterTheme]
+Name=Omarchy Face ID
+Description=Omarchy's terminal-style login with Face ID: look at the screen, or press Enter on the empty field to scan again
+Author=L0adn9
+Type=sddm-theme
+Version=1.0
+QtVersion=6

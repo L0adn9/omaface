@@ -1,0 +1,449 @@
+"""Face ID additions to Omarchy's lock screen and polkit dialog.
+
+Each patch replaces one exact snippet of the upstream file. Every `old` must
+appear exactly once, otherwise the build stops and the installed plugin is
+left alone (see build-plugin.py). Keep snippets small so upstream changes
+elsewhere in the files never conflict.
+"""
+
+LOCK_SERVICE = [
+    # State for the third authentication flow.
+    (
+        "  property bool strandedLockResolved: false\n",
+        """  property bool strandedLockResolved: false
+
+  // Face ID (l0adn9.faceid): a third PAM flow beside password and
+  // fingerprint. It only ever adds a way in; the password always works.
+  property bool faceConfigured: false
+  property string faceState: "idle"
+  property int faceFailures: 0
+  property double faceLockedAt: 0
+  property double faceStartedAt: 0
+  property double faceEndedAt: 0
+  readonly property int faceMaxFailures: 5
+  readonly property bool faceAvailable: faceConfigured && faceFailures < faceMaxFailures
+""",
+    ),
+    (
+        "    fingerprintRetryTimer.stop()\n    if (passwordPam.active) passwordPam.abort()\n",
+        """    fingerprintRetryTimer.stop()
+    faceSuccessTimer.stop()
+    faceIdleTimer.stop()
+    faceFailures = 0
+    faceState = "idle"
+    if (facePam.active) facePam.abort()
+    if (passwordPam.active) passwordPam.abort()
+""",
+    ),
+    (
+        "    lockRequested = true\n    armBlankTimer()\n",
+        "    lockRequested = true\n    faceLockedAt = Date.now()\n    armBlankTimer()\n",
+    ),
+    (
+        "      root.refreshBackground()\n      root.refreshFingerprintStatus()\n    })\n\n    return true\n",
+        "      root.refreshBackground()\n      root.refreshFingerprintStatus()\n      root.refreshFaceStatus()\n    })\n\n    return true\n",
+    ),
+    # Scan control.
+    (
+        "  WlSessionLock {\n    id: sessionLock\n",
+        """  function refreshFaceStatus() {
+    if (!faceCheckProc.running) faceCheckProc.running = true
+  }
+
+  // Activity on the lock screen (a key, the pointer, a click on the mark)
+  // starts a scan. A lock you have just asked for stays locked while you are
+  // still sitting there, so the first moments after locking are ignored.
+  function faceWake() {
+    if (!lockRequested || !sessionLock.secure || !faceAvailable) return
+    if (facePam.active || faceState === "success") return
+    var now = Date.now()
+    if (now - faceLockedAt < 1500) return
+    if (now - faceEndedAt < 1200) return
+    startFace()
+  }
+
+  function startFace() {
+    if (!lockRequested || !sessionLock.secure || !faceAvailable) return
+    if (facePam.active || faceState === "success") return
+    faceIdleTimer.stop()
+    faceStartedAt = Date.now()
+    faceState = "scanning"
+    if (!facePam.start()) {
+      faceState = "idle"
+      faceEndedAt = Date.now()
+    }
+  }
+
+  // The PAM result only says yes or no; the engine's status file says
+  // whether "no" was a stranger's face or simply nobody in front.
+  function readFaceOutcome() {
+    faceStatusFile.reload()
+    try {
+      var status = JSON.parse(String(faceStatusFile.text() || "{}"))
+      if (status.service === "lock" && status.at * 1000 >= faceStartedAt - 2000) return String(status.state || "")
+    } catch (e) {}
+    return ""
+  }
+
+  function handleFaceFinished(result) {
+    faceEndedAt = Date.now()
+    if (!lockRequested) return
+    if (result === PamResult.Success) {
+      faceState = "success"
+      faceSuccessTimer.restart()
+      return
+    }
+    var outcome = readFaceOutcome()
+    if (outcome === "failure") {
+      faceFailures += 1
+      faceState = "failure"
+      faceIdleTimer.restart()
+    } else {
+      // "attention": your face, but eyes closed or not on the camera; the
+      // view says so until the next scan.
+      faceState = outcome === "unavailable" || outcome === "attention" ? outcome : "idle"
+    }
+  }
+
+  WlSessionLock {
+    id: sessionLock
+""",
+    ),
+    (
+        "        failedAttempts: root.failedAttempts\n        inputEnabled: root.lockRequested\n",
+        """        failedAttempts: root.failedAttempts
+        faceState: root.faceState
+        faceAvailable: root.faceAvailable
+        inputEnabled: root.lockRequested
+""",
+    ),
+    (
+        "        onClearFailureRequested: root.failureMessage = \"\"\n        onWakeRequested: root.runWake()\n",
+        """        onClearFailureRequested: root.failureMessage = ""
+        onWakeRequested: {
+          root.runWake()
+          root.faceWake()
+        }
+        onFaceRequested: root.startFace()
+""",
+    ),
+    (
+        "      failedAttempts: 0\n      inputEnabled: false\n      loadBackground: root.previewVisible\n",
+        "      failedAttempts: 0\n      faceAvailable: root.faceConfigured\n      inputEnabled: false\n      loadBackground: root.previewVisible\n",
+    ),
+    # PAM context, timers and the readiness probe.
+    (
+        "  Timer {\n    id: fingerprintRetryTimer\n",
+        """  PamContext {
+    id: facePam
+    config: "omarchy-lock-face"
+    user: root.userName
+
+    onCompleted: function(result) {
+      root.handleFaceFinished(result)
+    }
+
+    onError: function(error) {
+      root.handleFaceFinished(PamResult.Error)
+    }
+  }
+
+  // Lets the check mark finish drawing before the lock surface goes away.
+  Timer {
+    id: faceSuccessTimer
+    interval: 420
+    repeat: false
+    onTriggered: if (root.lockRequested) root.finishUnlock()
+  }
+
+  Timer {
+    id: faceIdleTimer
+    interval: 1100
+    repeat: false
+    onTriggered: if (root.faceState === "failure") root.faceState = "idle"
+  }
+
+  // Opening the lid wakes the machine while the lock is up. A suspend shows
+  // up as a jump in wall-clock time between ticks; scan right away then, the
+  // way Windows Hello greets you when the lid opens.
+  Timer {
+    id: faceResumeWatch
+    interval: 2000
+    repeat: true
+    running: root.lockRequested && root.faceAvailable
+    property double lastTick: 0
+    onRunningChanged: lastTick = Date.now()
+    onTriggered: {
+      var now = Date.now()
+      var resumed = lastTick > 0 && now - lastTick > interval + 4000
+      lastTick = now
+      if (resumed) root.startFace()
+    }
+  }
+
+  FileView {
+    id: faceStatusFile
+    path: "/run/faceid/status"
+    blockLoading: true
+    printErrors: false
+  }
+
+  Process {
+    id: faceCheckProc
+    command: ["bash", "-c", "[[ -f /etc/pam.d/omarchy-lock-face ]] && [[ -x /usr/local/bin/faceid ]] && /usr/local/bin/faceid ready lock && echo yes || echo no"]
+    stdout: StdioCollector { id: faceCheckStdout; waitForEnd: true }
+    onExited: {
+      root.faceConfigured = String(faceCheckStdout.text || "").trim() === "yes"
+      if (!root.faceConfigured && facePam.active) facePam.abort()
+    }
+  }
+
+  Timer {
+    id: fingerprintRetryTimer
+""",
+    ),
+    (
+        "  Component.onCompleted: {\n    refreshBackground()\n    refreshFingerprintStatus()\n",
+        "  Component.onCompleted: {\n    refreshBackground()\n    refreshFingerprintStatus()\n    refreshFaceStatus()\n",
+    ),
+    (
+        "        fingerprint: root.fingerprintConfigured,\n",
+        "        fingerprint: root.fingerprintConfigured,\n        face: root.faceConfigured,\n        faceState: root.faceState,\n        faceFailures: root.faceFailures,\n",
+    ),
+    (
+        "      root.refreshBackground()\n      root.refreshFingerprintStatus()\n      root.previewVisible = true\n",
+        "      root.refreshBackground()\n      root.refreshFingerprintStatus()\n      root.refreshFaceStatus()\n      root.previewVisible = true\n",
+    ),
+    # The polkit dialog lives in this service too, so one plugin owns every
+    # password prompt in the shell; omarchy.polkit stays disabled meanwhile.
+    (
+        "  IpcHandler {\n    target: \"lock\"\n",
+        """  Polkit {
+    id: polkitDialog
+  }
+
+  // Settings exist only while open (omarchy-shell faceid settings).
+  Loader {
+    id: faceSettings
+    active: false
+    source: "Settings.qml"
+    onLoaded: item.closed.connect(function() { faceSettings.active = false })
+  }
+
+  IpcHandler {
+    target: "faceid"
+
+    function status(): string {
+      return JSON.stringify({
+        plugin: "l0adn9.faceid",
+        lock: true,
+        polkitRegistered: polkitDialog.agentRegistered,
+        face: root.faceConfigured,
+        faceState: root.faceState
+      })
+    }
+
+    function refresh(): string {
+      root.refreshFaceStatus()
+      polkitDialog.refreshFace()
+      return "ok"
+    }
+
+    function settings(): string {
+      if (!faceSettings.active) {
+        faceSettings.active = true
+        return "open"
+      }
+      // Through dismiss(), so a running enrollment releases the camera first.
+      if (faceSettings.item) faceSettings.item.dismiss()
+      else faceSettings.active = false
+      return "closed"
+    }
+  }
+
+  IpcHandler {
+    target: "lock"
+""",
+    ),
+]
+
+LOCK_VIEW = [
+    (
+        "  property string passwordText: \"\"\n  property bool syncingPasswordText: false\n",
+        """  property string passwordText: ""
+  property bool syncingPasswordText: false
+  property string faceState: "idle"
+  property bool faceAvailable: false
+""",
+    ),
+    (
+        "  signal wakeRequested()\n",
+        "  signal wakeRequested()\n  signal faceRequested()\n",
+    ),
+    (
+        "    BorderSurface {\n      id: inputField\n",
+        """    // Face ID: the mark sits above the field and animates while the IR
+    // camera looks. Clicking it asks for another scan.
+    Rectangle {
+      id: faceTile
+      width: Math.round(root.fieldHeight * 1.25)
+      height: width
+      radius: Style.cornerRadius
+      color: Commons.Color.lock.background
+      anchors.horizontalCenter: inputField.horizontalCenter
+      anchors.bottom: inputField.top
+      anchors.bottomMargin: Math.round(root.fieldHeight * 0.45)
+      visible: (root.faceAvailable && root.faceState !== "unavailable") || root.faceState === "success"
+      opacity: visible ? 1 : 0
+
+      FaceGlyph {
+        objectName: "faceIndicator"
+        anchors.centerIn: parent
+        width: Math.round(parent.width * 0.66)
+        height: width
+        mode: root.faceState
+        opacity: root.faceState === "idle" ? 0.6 : 1
+        color: Commons.Color.lock.text
+        successColor: Commons.Color.lock.borderActive
+        errorColor: Commons.Color.lock.textError
+        Behavior on opacity { NumberAnimation { duration: 180 } }
+      }
+
+      MouseArea {
+        anchors.fill: parent
+        cursorShape: Qt.PointingHandCursor
+        onClicked: {
+          root.wakeRequested()
+          root.faceRequested()
+        }
+      }
+    }
+
+    Text {
+      anchors.horizontalCenter: faceTile.horizontalCenter
+      anchors.bottom: faceTile.top
+      anchors.bottomMargin: Math.round(root.fieldHeight * 0.25)
+      visible: faceTile.visible && (root.faceState === "scanning" || root.faceState === "attention")
+      text: root.faceState === "attention" ? "Open your eyes and look at the camera" : "Look at the camera"
+      color: Commons.Color.lock.text
+      opacity: 0.7
+      font.family: Style.font.family
+      font.pixelSize: Style.font.bodySmall
+    }
+
+    BorderSurface {
+      id: inputField
+""",
+    ),
+]
+
+POLKIT = [
+    (
+        "  property bool laptopClosed: false\n",
+        """  property bool laptopClosed: false
+  // Face ID: faceid-pam sits in the polkit stack and a face is enrolled.
+  // The engine's status file drives the animation while the camera looks.
+  property bool facePamConfigured: false
+  property bool faceReady: false
+  readonly property bool faceConfigured: facePamConfigured && faceReady
+  property string faceState: "idle"
+  property double flowStartedAt: 0
+  readonly property bool agentRegistered: polkitAgent.isRegistered
+""",
+    ),
+    (
+        "  readonly property bool fingerprintMode: fingerprintConfigured && !laptopClosed",
+        "  readonly property bool fingerprintMode: (fingerprintConfigured || faceConfigured) && !laptopClosed",
+    ),
+    (
+        "  function loadPamConfig(raw) {\n    fingerprintConfigured = PolkitModel.fingerprintConfiguredFromPamConfig(raw)\n  }\n",
+        """  function loadPamConfig(raw) {
+    fingerprintConfigured = PolkitModel.fingerprintConfiguredFromPamConfig(raw)
+    facePamConfigured = String(raw || "").indexOf("faceid-pam") !== -1
+  }
+
+  function refreshFace() {
+    if (!faceReadyProc.running) faceReadyProc.running = true
+  }
+
+  function loadFaceStatus(raw) {
+    try {
+      var status = JSON.parse(String(raw || "{}"))
+      if (status.service !== "polkit" || status.at * 1000 < flowStartedAt - 2000) return
+      var state = String(status.state || "")
+      faceState = state === "scanning" || state === "success" || state === "failure" ? state : "idle"
+    } catch (e) {}
+  }
+""",
+    ),
+    (
+        "  function beginFlow() {\n    closeTimer.stop()\n    closing = false\n",
+        """  function beginFlow() {
+    closeTimer.stop()
+    closeTimer.interval = 300
+    closing = false
+    flowStartedAt = Date.now()
+    faceState = "idle"
+    refreshFace()
+""",
+    ),
+    (
+        "    function onAuthenticationSucceeded() {\n      root.closing = true\n      closeTimer.restart()\n",
+        """    function onAuthenticationSucceeded() {
+      root.closing = true
+      // Let the check mark draw when the face is what got you in.
+      closeTimer.interval = root.faceState === "success" ? 520 : 300
+      closeTimer.restart()
+""",
+    ),
+    (
+        "  Process {\n    id: laptopClosedProc\n",
+        """  FileView {
+    path: "/run/faceid/status"
+    watchChanges: true
+    printErrors: false
+    onLoaded: root.loadFaceStatus(text())
+    onFileChanged: reload()
+  }
+
+  Process {
+    id: faceReadyProc
+    command: ["bash", "-c", "[[ -x /usr/local/bin/faceid ]] && /usr/local/bin/faceid ready polkit && echo yes || echo no"]
+    stdout: StdioCollector { id: faceReadyOut; waitForEnd: true }
+    onExited: root.faceReady = String(faceReadyOut.text || "").trim() === "yes"
+  }
+
+  Process {
+    id: laptopClosedProc
+""",
+    ),
+    (
+        "        visible: root.fingerprintMode\n        text: \"\\udb80\\ude37\"\n",
+        "        visible: root.fingerprintMode && !root.faceConfigured\n        text: \"\\udb80\\ude37\"\n",
+    ),
+    (
+        "      Row {\n        id: cardRow\n",
+        """      FaceGlyph {
+        anchors.centerIn: parent
+        width: Math.round(root.fieldHeight * 0.8)
+        height: width
+        visible: root.fingerprintMode && root.faceConfigured
+        mode: root.faceState
+        color: root.foreground
+        successColor: root.accent
+        errorColor: Commons.Color.polkit.textError
+      }
+
+      Row {
+        id: cardRow
+""",
+    ),
+]
+
+# (upstream path relative to the shell plugins dir, file name in the plugin, patches)
+FILES = [
+    ("lock/Service.qml", "Service.qml", LOCK_SERVICE),
+    ("lock/LockView.qml", "LockView.qml", LOCK_VIEW),
+    ("polkit/PolkitAgent.qml", "Polkit.qml", POLKIT),
+    ("polkit/PolkitModel.js", "PolkitModel.js", []),
+]

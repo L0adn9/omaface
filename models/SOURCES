@@ -1,0 +1,4 @@
+# OpenCV Zoo (github.com/opencv/opencv_zoo), fetched by install.sh and checked
+# against SHA256SUMS (the hashes recorded in the repo's Git LFS pointers).
+face_detection_yunet_2023mar.onnx    models/face_detection_yunet/      MIT
+face_recognition_sface_2021dec.onnx  models/face_recognition_sface/    Apache-2.0

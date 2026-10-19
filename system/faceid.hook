@@ -1,0 +1,10 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = opencv
+
+[Action]
+Description = Rebuilding the Face ID engine against the new OpenCV...
+When = PostTransaction
+Exec = /usr/local/lib/faceid/rebuild

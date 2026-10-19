@@ -1,0 +1,590 @@
+#!/bin/bash
+
+# faceid — Face ID for Omarchy: IR face unlock for the lock screen, login
+# screen, sudo and polkit prompts. The password always keeps working.
+
+set -euo pipefail
+
+LIB=/usr/local/lib/faceid
+SHARE=/usr/local/share/faceid
+CONF=/etc/faceid/config
+SDDM_CONF=/etc/sddm.conf.d/20-faceid.conf
+SDDM_THEME=/usr/share/sddm/themes/omarchy-faceid
+PLUGIN_ID=l0adn9.faceid
+PLACES=(lock login sudo polkit)
+MAX_APPEARANCES=3 # kMaxAppearances in the engine
+
+# Where the PAM lines go and whether SDDM is in use; installed with Face ID.
+if [[ -r $LIB/pam.sh ]]; then
+  source "$LIB/pam.sh"
+else
+  sddm_autologin_user() { :; }
+fi
+
+die() { echo "faceid: $*" >&2; exit 1; }
+
+usage() {
+  cat <<'USAGE'
+Usage: faceid <command>
+
+  status [--json]            what is set up and where Face ID is used
+  cameras                    list cameras and which one Face ID uses
+  emitter                    check that the IR light comes on
+  enroll [--name NAME]       add your face (or an alternate appearance)
+  test                       look at the camera and see if you are recognized
+  rename <N> <name>          rename appearance N (see status)
+  remove <N|all>             remove appearance N (see status) or all of them
+  enable  <place...|all>     use Face ID for: lock login sudo polkit
+  disable <place...|all>     stop using Face ID there (password only)
+  set <key> <value>          attention on|off, threshold, match_frames, timeout_{sudo,polkit,lock,login}
+  settings                   open the Face ID settings window
+  doctor                     check every part of the installation
+  sync                       rebuild the shell plugin after an Omarchy update
+  uninstall                  remove Face ID and restore the original setup
+USAGE
+}
+
+# ------------------------------------------------------------------ helpers
+
+# Commands that change system state re-run themselves as root: sudo in a
+# terminal, pkexec from the settings window.
+as_root() {
+  (( EUID == 0 )) && return 0
+  if [[ -t 0 ]]; then
+    exec sudo "$0" "$@"
+  else
+    exec pkexec /usr/local/bin/faceid "$@"
+  fi
+}
+
+target_user() {
+  if [[ -n ${PKEXEC_UID:-} ]]; then
+    getent passwd "$PKEXEC_UID" | cut -d: -f1
+  elif [[ -n ${SUDO_USER:-} && $SUDO_USER != root ]]; then
+    echo "$SUDO_USER"
+  elif (( EUID != 0 )); then
+    id -un
+  else
+    die "run through sudo or pkexec so Face ID knows whose face this is"
+  fi
+}
+
+conf_get() {
+  local key=$1 fallback=$2 value
+  value=$(sed -n "s/^[[:space:]]*$key[[:space:]]*=[[:space:]]*\([^#[:space:]]*\).*/\1/p" "$CONF" 2>/dev/null | tail -1)
+  echo "${value:-$fallback}"
+}
+
+conf_set() {
+  local key=$1 value=$2 tmp
+  tmp=$(mktemp /etc/faceid/.config.XXXXXX)
+  if grep -qE "^[[:space:]]*$key[[:space:]]*=" "$CONF"; then
+    sed "s|^[[:space:]]*$key[[:space:]]*=.*|$key=$value|" "$CONF" >"$tmp"
+  else
+    cat "$CONF" >"$tmp"
+    echo "$key=$value" >>"$tmp"
+  fi
+  chmod 0644 "$tmp"
+  mv "$tmp" "$CONF"
+}
+
+is_on() { [[ $(conf_get "$1" off) =~ ^(on|yes|true|1)$ ]]; }
+
+json_bool() { if "$@"; then echo true; else echo false; fi; }
+
+# The installer set the login screen up only where SDDM is the login manager.
+login_supported() { [[ -f $SDDM_THEME/Main.qml ]] && grep -q faceid-pam /etc/pam.d/sddm 2>/dev/null; }
+
+socket_active() { systemctl is-active --quiet faceid.socket 2>/dev/null; }
+
+locked_out() {
+  local f=/run/faceid/fail-$(id -u "$1") count last
+  [[ -r $f ]] || return 1
+  read -r count last <"$f" || return 1
+  (( count >= 5 && $(date +%s) - last <= 300 ))
+}
+
+appearances_json() { "$LIB/faceid-engine" list "$1" 2>/dev/null || echo "[]"; }
+
+appearance_count() { appearances_json "$1" | { grep -o '"name"' || true; } | wc -l; }
+
+# ------------------------------------------------------------------ commands
+
+cmd_status() {
+  local user json=0
+  [[ ${1:-} == --json ]] && json=1
+  user=$(id -un)
+  (( EUID == 0 )) && user=$(target_user)
+
+  local installed=false
+  [[ -x $LIB/faceid-engine && -r $CONF ]] && installed=true
+
+  if (( json )); then
+    local places="" p
+    for p in "${PLACES[@]}"; do places+="${places:+,}\"$p\":$(json_bool is_on "$p")"; done
+    printf '{"installed":%s,"service":%s,"user":"%s","appearances":%s,"maxAppearances":%d,"places":{%s},"attention":%s,"loginSupported":%s,"autologin":%s,"lockedOut":%s,"camera":"%s"}\n' \
+      "$installed" "$(json_bool socket_active)" "$user" "$(appearances_json "$user")" "$MAX_APPEARANCES" "$places" \
+      "$([[ $(conf_get attention on) == off ]] && echo false || echo true)" \
+      "$(json_bool login_supported)" "$([[ -n $(sddm_autologin_user) ]] && echo true || echo false)" \
+      "$(json_bool locked_out "$user")" "$("$LIB/faceid-engine" probe 2>/dev/null | cut -f1,2 | tr '\t' ' ' | tr -d '"\\')"
+    return
+  fi
+
+  [[ $installed == true ]] || die "not installed"
+  local count
+  count=$(appearance_count "$user")
+  echo "Face ID for $user"
+  echo "  camera       $("$LIB/faceid-engine" probe 2>/dev/null | cut -f2 || echo none)"
+  echo "  service      $(socket_active && echo ready || echo stopped)"
+  echo "  appearances  $count"
+  "$LIB/faceid-engine" list "$user" 2>/dev/null | tr '{' '\n' | sed -n 's/.*"name":"\([^"]*\)","created":"\([^"]*\)".*/\1  \2/p' |
+    nl -w5 -s'  ' | sed 's/T/ /'
+  local p
+  for p in "${PLACES[@]}"; do
+    if [[ $p == login ]] && ! login_supported; then printf '  %-12s %s\n' login "not available (SDDM is not the login manager)"; continue; fi
+    printf '  %-12s %s\n' "$p" "$(is_on "$p" && echo on || echo off)"
+  done
+  if login_supported && [[ -n $(sddm_autologin_user) ]]; then echo "  (SDDM signs you in automatically, so the login screen does not show)"; fi
+  printf '  %-12s %s\n' attention "$([[ $(conf_get attention on) == off ]] && echo "off (any open or closed eyes)" || echo "on (eyes open, looking at the camera)")"
+  if locked_out "$user"; then echo "  paused after too many failed scans (5 minutes)"; fi
+  return 0
+}
+
+# Exit 0 when Face ID will actually be tried for <place>: used by the lock
+# screen and polkit dialog to decide whether to show the Face ID mark.
+cmd_ready() {
+  local place=${1:-} user
+  user=$(id -un)
+  [[ -r $CONF ]] || return 1
+  is_on "$place" || return 1
+  socket_active || return 1
+  [[ $(appearance_count "$user") -gt 0 ]] || return 1
+  return 0
+}
+
+select_login_theme() {
+  [[ -f $SDDM_THEME/Main.qml ]] || return 0
+  printf '# Face ID login theme (faceid disable login reverts to Omarchy'"'"'s theme)\n[Theme]\nCurrent=omarchy-faceid\n' >"$SDDM_CONF"
+  chmod 0644 "$SDDM_CONF"
+}
+
+cmd_enroll() {
+  as_root enroll "$@"
+  local user
+  user=$(target_user)
+  "$LIB/faceid-engine" enroll "$user" "$@" || return $?
+  # The login screen switches to the Face ID theme once there is a face.
+  if is_on login && [[ ! -f $SDDM_CONF ]]; then select_login_theme; fi
+  return 0
+}
+
+cmd_remove() {
+  [[ -n ${1:-} ]] || die "usage: faceid remove <N|all>"
+  [[ $1 == all || $1 =~ ^[0-9]+$ ]] || die "usage: faceid remove <N|all>"
+  as_root remove "$@"
+  "$LIB/faceid-engine" remove "$(target_user)" "$1"
+}
+
+cmd_cameras() {
+  "$LIB/faceid-engine" cameras | awk -F'\t' '{ printf "  %-12s %-36s %-18s %s\n", $1, $2, $3, $4 }'
+}
+
+cmd_emitter() {
+  local out
+  out=$("$LIB/faceid-engine" emitter 2>/dev/null || true)
+  case $out in
+    *'"pulsing"'*) echo "IR light: on, pulsing every other frame (normal)" ;;
+    *'"steady"'*) echo "IR light: on, or the room is bright in infrared (sunlight)" ;;
+    *'"dark"'*)
+      cat <<'EOF'
+IR light: off. The camera only sees ambient light, so Face ID will rarely
+find a face. Many laptops need the light switched on once:
+    omarchy pkg aur add linux-enable-ir-emitter
+    sudo linux-enable-ir-emitter configure
+EOF
+      return 1 ;;
+    *'"busy"'*) echo "IR light: camera busy, try again in a moment"; return 1 ;;
+    *) echo "IR light: could not check ($out)"; return 1 ;;
+  esac
+}
+
+cmd_rename() {
+  [[ ${1:-} =~ ^[0-9]+$ && -n ${2:-} ]] || die "usage: faceid rename <N> <name>"
+  local n=$1
+  shift
+  as_root rename "$n" "$@"
+  "$LIB/faceid-engine" rename "$(target_user)" "$n" "$*"
+}
+
+cmd_toggle() {
+  local action=$1
+  shift
+  (( $# > 0 )) || die "usage: faceid $action <lock|login|sudo|polkit|all>"
+  local places=() p
+  for p in "$@"; do
+    if [[ $p == all ]]; then places+=("${PLACES[@]}"); continue; fi
+    [[ " ${PLACES[*]} " == *" $p "* ]] || die "unknown place '$p' (lock, login, sudo, polkit, all)"
+    places+=("$p")
+  done
+  as_root "$action" "$@"
+  for p in "${places[@]}"; do
+    if [[ $action == enable ]]; then
+      if [[ $p == login ]] && ! login_supported; then
+        echo "Face ID for login: not available (SDDM is not the login manager)"
+        continue
+      fi
+      conf_set "$p" on
+      if [[ $p == login ]]; then
+        if [[ $(appearance_count "$(target_user)") -gt 0 ]]; then select_login_theme
+        else echo "  (the login screen switches to Face ID after: faceid enroll)"; fi
+      fi
+    else
+      conf_set "$p" off
+      [[ $p == login ]] && rm -f "$SDDM_CONF"
+    fi
+    echo "Face ID for $p: $([[ $action == enable ]] && echo on || echo off)"
+  done
+}
+
+cmd_set() {
+  local key=${1:-} value=${2:-}
+  case "$key" in
+    threshold) [[ $value =~ ^0\.[3-9][0-9]*$ ]] || die "threshold must be between 0.30 and 0.99" ;;
+    match_frames) [[ $value =~ ^[1-5]$ ]] || die "match_frames must be 1-5" ;;
+    timeout_sudo | timeout_polkit | timeout_lock | timeout_login)
+      [[ $value =~ ^([1-9]|1[0-5])$ ]] || die "$key must be 1-15 seconds" ;;
+    min_face_width) [[ $value =~ ^[0-9]{2,3}$ ]] || die "min_face_width must be 30-300" ;;
+    attention) [[ $value == on || $value == off ]] || die "attention must be on or off" ;;
+    device) [[ $value == auto || $value =~ ^/dev/(video[0-9]+|v4l/by-(id|path)/[A-Za-z0-9._:-]+)$ ]] || die "device must be auto or a /dev/video path" ;;
+    *) die "unknown setting '$key'" ;;
+  esac
+  as_root set "$@"
+  conf_set "$key" "$value"
+  echo "$key=$value"
+}
+
+# Self-check through the real socket. Never authenticates anything: the
+# engine treats faceid-test as a dry run and the caller only sees scores.
+cmd_test() {
+  local json=0
+  [[ ${1:-} == --json ]] && json=1
+  socket_active || die "service not running (faceid doctor)"
+  # exec: stopping the test (Esc in the settings window) must reach the client
+  # holding the socket, or the engine keeps scanning until its timeout.
+  exec python3 -I - "$(id -un)" "$json" <<'PY'
+import json, socket, sys
+user, as_json = sys.argv[1], sys.argv[2] == "1"
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(20)
+s.connect("/run/faceid.sock")
+s.sendall(f"VERIFY {user} faceid-test\n".encode())
+best, buf = None, b""
+messages = {"fail": "Not recognized", "timeout": "No face found", "locked-out": "Paused after too many attempts",
+            "busy": "Camera busy", "disabled": "Face ID is off",
+            "attention": "Recognized, but your eyes were closed or you were not looking at the camera"}
+eyes = {"ok": "looking at the camera", "eyes": "eyes closed or not looking at the camera",
+        "head": "head turned or tilted away", "off": "attention off"}
+seen_attention = set()
+def out(obj, text):
+    print(json.dumps(obj) if as_json else text, flush=True)
+if not as_json:
+    print("Look at the screen…", flush=True)
+while True:
+    try:
+        chunk = s.recv(4096)
+    except socket.timeout:
+        break
+    if not chunk:
+        break
+    buf += chunk
+    while b"\n" in buf:
+        line, buf = buf.split(b"\n", 1)
+        parts = line.decode(errors="replace").split()
+        if not parts:
+            continue
+        if parts[0] == "STATUS":
+            if as_json:
+                out({"type": "status", "state": parts[1]}, "")
+        elif parts[0] == "SCORE":
+            score = float(parts[1])
+            best = score if best is None else max(best, score)
+            attention = parts[5] if len(parts) > 5 and parts[4] == "attention" else "off"
+            seen_attention.add(attention)
+            if not as_json:
+                print(f"  score {score:.3f}   {eyes.get(attention, attention)}", flush=True)
+            else:
+                out({"type": "score", "score": score, "attention": attention}, "")
+        elif parts[0] == "RESULT":
+            result = parts[1]
+            detail = " ".join(parts[2:])
+            message = messages.get(result, (result + " " + detail).strip())
+            if result == "unavailable" and detail.startswith("not-enrolled"):
+                message = "Camera works, but no face is enrolled yet" if "no-face-seen" not in detail \
+                    else "No face enrolled yet (and none seen by the camera)"
+            elif result == "unavailable":
+                message = {"lid-closed": "Lid is closed", "camera": "Camera unavailable",
+                           "no-camera": "No IR camera found"}.get(detail, message)
+            out({"type": "result", "result": result, "score": best, "message": message,
+                 "attention": sorted(seen_attention)},
+                ("Recognized" if result == "ok" else message) + (f"  (best {best:.3f})" if best is not None else ""))
+            sys.exit(0 if result == "ok" else 1)
+sys.exit(1)
+PY
+}
+
+cmd_settings() {
+  omarchy-shell faceid settings >/dev/null || die "the Face ID shell plugin is not running (faceid doctor)"
+}
+
+cmd_sync() {
+  (( EUID != 0 )) || die "run sync as your user, not root"
+  local dest="$HOME/.config/omarchy/plugins/$PLUGIN_ID"
+  local stage="${XDG_RUNTIME_DIR:-/tmp}/faceid-plugin.$$"
+  local backup="$HOME/.local/share/omarchy-plugin-backups/$PLUGIN_ID-$(date +%Y%m%d-%H%M%S)"
+  python3 -I "$SHARE/tools/build-plugin.py" "$SHARE/plugin" "$stage" || return 1
+  if [[ -d $dest ]] && diff -rq "$stage" "$dest" >/dev/null 2>&1; then
+    rm -rf "$stage"
+    echo "Plugin already up to date."
+    return 0
+  fi
+  mkdir -p "$(dirname "$backup")"
+  [[ -d $dest ]] && cp -a "$dest" "$backup"
+  rm -rf "$dest.new"
+  cp -a "$stage" "$dest.new"
+  rm -rf "$stage"
+  [[ -d $dest ]] && rm -rf "$dest"
+  mv "$dest.new" "$dest"
+  echo "Plugin rebuilt (previous copy in $backup). Restarting the shell to load it…"
+  omarchy restart shell >/dev/null 2>&1 || true
+  if wait_plugin_live; then
+    echo "Face ID plugin is live."
+    return 0
+  fi
+  echo "faceid: the rebuilt plugin did not come up; restoring the previous copy" >&2
+  if [[ -d $backup ]]; then
+    rm -rf "$dest"
+    cp -a "$backup" "$dest"
+    omarchy restart shell >/dev/null 2>&1 || true
+    wait_plugin_live && { echo "Previous plugin restored."; return 1; }
+  fi
+  fallback_to_stock
+  return 1
+}
+
+plugin_live() {
+  local out
+  out=$(timeout 3 omarchy-shell faceid status 2>/dev/null) || return 1
+  [[ $out == *"\"plugin\":\"$PLUGIN_ID\""* && $out == *'"polkitRegistered":true'* ]]
+}
+
+wait_plugin_live() {
+  local i
+  for i in $(seq 1 30); do
+    plugin_live && return 0
+    sleep 0.5
+  done
+  return 1
+}
+
+# Never leave the machine without a working lock screen or polkit agent:
+# hand both back to Omarchy's own plugins.
+fallback_to_stock() {
+  echo "faceid: switching back to Omarchy's own lock screen and polkit dialog" >&2
+  omarchy plugin disable "$PLUGIN_ID" >/dev/null 2>&1 || true
+  omarchy plugin enable omarchy.lock >/dev/null 2>&1 || true
+  omarchy plugin enable omarchy.polkit >/dev/null 2>&1 || true
+  omarchy restart shell >/dev/null 2>&1 || true
+  notify-send -u critical "Face ID" "The Face ID plugin failed to load, so Omarchy's own lock screen is back. Run: faceid doctor" 2>/dev/null || true
+}
+
+cmd_doctor() {
+  local mode=${1:-}
+  local fails=0 warns=0
+  ok()   { [[ $mode == --quiet ]] || printf '  \e[32mok\e[0m    %s\n' "$*"; }
+  warn() { printf '  \e[33mwarn\e[0m  %s\n' "$*"; warns=$((warns + 1)); }
+  bad()  { printf '  \e[31mFAIL\e[0m  %s\n' "$*"; fails=$((fails + 1)); }
+
+  [[ $mode == --quiet ]] || echo "Face ID doctor"
+  local user
+  user=$(id -un)
+
+  if [[ -x $LIB/faceid-engine && -x $LIB/faceid-pam ]]; then ok "binaries installed"; else bad "binaries missing in $LIB (re-run install.sh)"; fi
+  if ldd "$LIB/faceid-engine" 2>/dev/null | grep -q 'not found'; then
+    bad "engine cannot find its OpenCV libraries: sudo $LIB/rebuild"
+  elif "$LIB/faceid-engine" selftest >/dev/null 2>&1; then
+    ok "engine self-test (models + OpenCV)"
+  else
+    bad "engine self-test failed: sudo $LIB/rebuild"
+  fi
+  if (cd "$SHARE/models" && sha256sum -c --quiet SHA256SUMS) >/dev/null 2>&1; then ok "model files verified"; else bad "model checksums do not match"; fi
+  if socket_active; then ok "faceid.socket listening"; else bad "faceid.socket not active: sudo systemctl enable --now faceid.socket"; fi
+  [[ -d /run/faceid ]] && ok "/run/faceid present" || bad "/run/faceid missing: sudo systemd-tmpfiles --create /etc/tmpfiles.d/faceid.conf"
+
+  local cam
+  if cam=$("$LIB/faceid-engine" probe 2>/dev/null); then
+    ok "IR camera: $(cut -f1,2 <<<"$cam" | tr '\t' ' ') ($(cut -f4 <<<"$cam"))"
+    # YUYV is what colour webcams send; picked automatically only when the
+    # name says IR, so this is a camera forced with device= in the config.
+    if [[ $(cut -f4 <<<"$cam") == YUYV && ! $(cut -f2 <<<"$cam") =~ [Ii][Rr]|[Ii]nfrared ]]; then
+      warn "that camera looks like a colour webcam, which a photo can fool; check device= in $CONF (faceid cameras)"
+    fi
+  else
+    bad "no IR camera found (faceid cameras lists what is there)"
+  fi
+  # Turning the camera on is only done when someone asked for the doctor,
+  # never in the quiet runs after updates.
+  if [[ -z $mode ]]; then
+    local light
+    light=$("$LIB/faceid-engine" emitter 2>/dev/null || true)
+    case $light in
+      *'"pulsing"'* | *'"steady"'*) ok "IR light comes on" ;;
+      *'"dark"'*) warn "IR light stays off: faceid emitter (says how to switch it on)" ;;
+      *) warn "IR light not checked (camera busy)" ;;
+    esac
+  fi
+
+  grep -q faceid-pam /etc/pam.d/sudo 2>/dev/null && ok "PAM: sudo" || bad "PAM: sudo line missing"
+  grep -q faceid-pam /etc/pam.d/polkit-1 2>/dev/null && ok "PAM: polkit" || bad "PAM: polkit line missing"
+  if login_supported; then ok "PAM: login (sddm)"
+  elif is_on login && [[ -f $SDDM_THEME/Main.qml ]]; then bad "PAM: sddm line missing"; fi
+  [[ -f /etc/pam.d/omarchy-lock-face ]] && ok "PAM: lock screen" || bad "PAM: /etc/pam.d/omarchy-lock-face missing"
+  if declare -F pam_anchor >/dev/null; then
+    if pam_anchor /etc/pam.d/sudo "${PAM_ANCHORS_SUDO[@]}" >/dev/null &&
+      pam_anchor /etc/pam.d/polkit-1 "${PAM_ANCHORS_POLKIT[@]}" >/dev/null; then
+      ok "password fallback intact (sudo, polkit)"
+    else
+      bad "password lines missing from sudo/polkit PAM"
+    fi
+  fi
+
+  local count
+  count=$(appearance_count "$user")
+  if login_supported && [[ -n $(sddm_autologin_user) ]]; then
+    ok "login screen skipped by SDDM autologin (Face ID is ready if you turn it off)"
+  fi
+  if login_supported && is_on login; then
+    if [[ -f $SDDM_CONF && -f $SDDM_THEME/Main.qml ]]; then ok "login screen uses the Face ID theme"
+    elif (( count == 0 )); then ok "login screen switches to the Face ID theme after you enroll"
+    else bad "login is on but the theme is not selected: faceid enable login"; fi
+  fi
+  local stock_main=/usr/share/sddm/themes/omarchy/Main.qml
+  if [[ -f $SHARE/sddm-upstream.sha256 && -f $stock_main ]]; then
+    if [[ $(sha256sum "$stock_main" | cut -d' ' -f1) == "$(cat "$SHARE/sddm-upstream.sha256")" ]]; then
+      ok "Omarchy login theme unchanged since install"
+    else
+      warn "Omarchy updated its login theme; the Face ID theme still works but may look older (re-run install.sh to refresh it)"
+    fi
+  fi
+
+  if (( count > 0 )); then ok "$count appearance(s) enrolled for $user"; else warn "no face enrolled: faceid enroll"; fi
+  if locked_out "$user"; then warn "paused for 5 minutes after too many failed scans"; fi
+
+  local plugin_dir="$HOME/.config/omarchy/plugins/$PLUGIN_ID"
+  if [[ -f $plugin_dir/manifest.json ]]; then ok "shell plugin installed"; else bad "shell plugin missing: faceid sync"; fi
+  local shell_json="$HOME/.config/omarchy/shell.json"
+  if jq -e '(.disabledPlugins // []) | (index("omarchy.lock") != null and index("omarchy.polkit") != null)' "$shell_json" >/dev/null 2>&1; then
+    ok "stock lock + polkit plugins handed over"
+  else
+    bad "omarchy.lock / omarchy.polkit still enabled next to Face ID (re-run install.sh)"
+  fi
+  local live=1
+  if [[ $mode == --after-update ]]; then wait_plugin_live || live=0; else plugin_live || live=0; fi
+  if (( live )); then
+    ok "lock screen + polkit dialog live in the shell"
+  else
+    bad "Face ID plugin not answering in the shell: omarchy restart shell"
+    if [[ $mode == --after-update ]]; then fallback_to_stock; fi
+  fi
+
+  if [[ -f $plugin_dir/upstream.json ]]; then
+    local drift
+    drift=$(python3 -I - "$plugin_dir/upstream.json" <<'PY'
+import hashlib, json, os, sys
+data = json.load(open(sys.argv[1]))
+for rel, digest in data["sha256"].items():
+    path = os.path.join(data["upstream"], rel)
+    try:
+        now = hashlib.sha256(open(path, "rb").read()).hexdigest()
+    except OSError:
+        now = "missing"
+    if now != digest:
+        print(rel)
+PY
+)
+    if [[ -z $drift ]]; then
+      ok "built from the current Omarchy lock screen and polkit dialog"
+    elif [[ $mode == --after-update ]]; then
+      echo "  Omarchy changed: $(tr '\n' ' ' <<<"$drift")— rebuilding the plugin"
+      if cmd_sync; then ok "plugin rebuilt for the new Omarchy"; else bad "plugin rebuild failed, kept the working copy"; fi
+    else
+      warn "Omarchy updated $(tr '\n' ' ' <<<"$drift")— run: faceid sync"
+    fi
+  fi
+
+  [[ -f /etc/pacman.d/hooks/faceid.hook ]] && ok "rebuild hook for OpenCV upgrades" || warn "pacman rebuild hook missing"
+  if pacman -Qi opencv 2>/dev/null | grep -q 'Install Reason *: Explicitly'; then ok "opencv kept as an explicit package"; else warn "opencv is only a dependency; an orphan cleanup could remove it: sudo pacman -D --asexplicit opencv"; fi
+
+  if [[ $mode != --quiet ]]; then
+    echo
+    if (( fails )); then echo "$fails problem(s), $warns warning(s)"; elif (( warns )); then echo "All good, $warns warning(s)"; else echo "All good"; fi
+  fi
+  if [[ $mode == --after-update ]] && (( fails )); then
+    notify-send -u critical "Face ID" "$fails problem(s) after the update. Run: faceid doctor" 2>/dev/null || true
+  fi
+  (( fails == 0 ))
+}
+
+cmd_uninstall() {
+  (( EUID == 0 )) && exec "$LIB/uninstall" "$@"
+
+  echo "Handing the lock screen and polkit dialog back to Omarchy"
+  omarchy plugin disable "$PLUGIN_ID" >/dev/null 2>&1 || true
+  omarchy plugin enable omarchy.lock >/dev/null 2>&1 || true
+  omarchy plugin enable omarchy.polkit >/dev/null 2>&1 || true
+  omarchy restart shell >/dev/null 2>&1 || true
+  local i
+  for i in $(seq 1 30); do timeout 3 omarchy-shell lock status >/dev/null 2>&1 && break; sleep 0.5; done
+
+  local dest="$HOME/.config/omarchy/plugins/$PLUGIN_ID"
+  if [[ -d $dest ]]; then
+    local backup="$HOME/.local/share/omarchy-plugin-backups/$PLUGIN_ID-$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$(dirname "$backup")"
+    mv "$dest" "$backup"
+    echo "Plugin moved to $backup"
+  fi
+  rm -f "$HOME/.local/share/applications/faceid.desktop" \
+    "$HOME/.local/share/icons/hicolor/scalable/apps/faceid.svg" \
+    "$HOME/.config/omarchy/hooks/post-update.d/faceid"
+  local hc="$HOME/.local/bin/omarchy-health-check"
+  if [[ -f $hc ]] && grep -q 'faceid doctor' "$hc"; then
+    python3 -I - "$hc" <<'PY'
+import re, sys
+path = sys.argv[1]
+text = open(path).read()
+text = re.sub(r'head_ "Face ID \(~/projects/faceid\)".*?\nfi\n\n', '', text, count=1, flags=re.S)
+open(path, "w").write(text)
+PY
+  fi
+
+  echo "Removing the system parts (root)"
+  if [[ -t 0 ]]; then sudo "$LIB/uninstall" "$@"; else pkexec "$LIB/uninstall" "$@"; fi
+}
+
+case "${1:-status}" in
+  status) shift || true; cmd_status "$@" ;;
+  ready) shift; cmd_ready "$@" ;;
+  enroll | add) shift; cmd_enroll "$@" ;;
+  test) shift; cmd_test "$@" ;;
+  cameras) cmd_cameras ;;
+  emitter) cmd_emitter ;;
+  remove) shift; cmd_remove "$@" ;;
+  rename) shift; cmd_rename "$@" ;;
+  enable | disable) cmd_toggle "$@" ;;
+  set) shift; cmd_set "$@" ;;
+  settings) cmd_settings ;;
+  sync) cmd_sync ;;
+  doctor) shift; cmd_doctor "$@" ;;
+  uninstall) shift; cmd_uninstall "$@" ;;
+  -h | --help | help) usage ;;
+  *) usage >&2; exit 2 ;;
+esac

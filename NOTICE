@@ -1,0 +1,17 @@
+Face ID for Omarchy includes or builds on work by others:
+
+Omarchy (https://github.com/basecamp/omarchy), MIT License,
+Copyright (c) David Heinemeier Hansson.
+  - sddm/Main.qml and the images in sddm/ are Omarchy's login screen with the
+    Face ID mark added.
+  - The lock screen and polkit dialog are not copied into this repository:
+    install.sh builds them on your machine from Omarchy's installed files plus
+    the patches in tools/patches.py.
+
+Face models, downloaded by install.sh from OpenCV Zoo
+(https://github.com/opencv/opencv_zoo) and checked against models/SHA256SUMS;
+not redistributed here:
+  - YuNet face detector (face_detection_yunet_2023mar.onnx), MIT License.
+  - SFace face recognizer (face_recognition_sface_2021dec.onnx), Apache License 2.0.
+
+OpenCV (https://opencv.org), Apache License 2.0, used as a system library.

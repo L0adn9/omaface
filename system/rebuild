@@ -1,0 +1,24 @@
+#!/bin/bash
+# Rebuild the Face ID engine after an OpenCV upgrade (pacman hook). A new
+# binary only replaces the old one after it passes the self-test; if anything
+# fails, Face ID quietly falls back to the password until this is re-run.
+
+SRC=/usr/local/src/faceid/engine
+LIB=/usr/local/lib/faceid
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+cp -a "$SRC/." "$tmp/"
+if ! make -C "$tmp" -s faceid-engine >"$tmp/build.log" 2>&1; then
+  install -m0644 "$tmp/build.log" /var/log/faceid-rebuild.log
+  echo "faceid: engine rebuild failed (see /var/log/faceid-rebuild.log); passwords still work everywhere."
+  exit 0
+fi
+if ! OPENCV_LOG_LEVEL=ERROR "$tmp/faceid-engine" selftest >/dev/null 2>&1; then
+  echo "faceid: rebuilt engine failed its self-test; kept the previous one. Passwords still work."
+  exit 0
+fi
+install -m0755 -o root -g root "$tmp/faceid-engine" "$LIB/faceid-engine.new"
+mv -f "$LIB/faceid-engine.new" "$LIB/faceid-engine"
+rm -f /var/log/faceid-rebuild.log
+echo "faceid: engine rebuilt for opencv $(pacman -Q opencv 2>/dev/null | cut -d' ' -f2)"

@@ -1,0 +1,7 @@
+#!/bin/bash
+# Face ID after `omarchy update`: rebuild the shell plugin if Omarchy changed
+# its lock screen or polkit dialog, and fall back to Omarchy's own lock screen
+# if the plugin no longer loads. Never leaves the machine without a lock.
+command -v faceid >/dev/null 2>&1 || exit 0
+echo "Checking Face ID…"
+faceid doctor --after-update || true

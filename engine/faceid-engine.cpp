@@ -1,0 +1,1443 @@
+// faceid-engine — IR face enrollment and verification for Face ID on Omarchy.
+//
+// Modes:
+//   serve                      one verification over the socket on stdin/stdout
+//                              (systemd faceid.socket, Accept=yes)
+//   enroll <user> [--ui]       capture a new appearance (root only)
+//   test <user> [--ui]         print live match scores, never authenticates
+//   probe                      print the IR camera that would be used
+//
+// The engine never grants anything by itself. PAM only trusts faceid-pam,
+// which exits 0 solely when this program answers "RESULT ok" on the socket.
+
+#include <opencv2/core.hpp>
+#include <opencv2/core/ocl.hpp>
+#include <opencv2/core/utils/logger.hpp>
+#include <opencv2/imgproc.hpp>
+#include <opencv2/objdetect/face.hpp>
+
+#include <linux/videodev2.h>
+#include <systemd/sd-login.h>
+#include <poll.h>
+#include <pwd.h>
+#include <signal.h>
+#include <sys/file.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <cerrno>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <dirent.h>
+#include <fstream>
+#include <numeric>
+#include <sstream>
+#include <string>
+#include <vector>
+
+namespace {
+
+#ifndef FACEID_CONFIG
+#define FACEID_CONFIG "/etc/faceid/config"
+#endif
+const char* kConfigPath = FACEID_CONFIG;
+const char* kDataDir = "/var/lib/faceid";
+const char* kRunDir = "/run/faceid";
+#ifndef FACEID_MODEL_DIR
+#define FACEID_MODEL_DIR "/usr/local/share/faceid/models"
+#endif
+const char* kDetectorModel = FACEID_MODEL_DIR "/face_detection_yunet_2023mar.onnx";
+const char* kRecognizerModel = FACEID_MODEL_DIR "/face_recognition_sface_2021dec.onnx";
+
+const int kMaxAppearances = 3;
+const int kLockoutFailures = 5;
+const int kLockoutSeconds = 300;
+const int kFeatureSize = 128;
+
+using Clock = std::chrono::steady_clock;
+
+double secondsSince(Clock::time_point start) {
+  return std::chrono::duration<double>(Clock::now() - start).count();
+}
+
+// ------------------------------------------------------------------ config
+
+struct Config {
+  std::string device = "auto";
+  bool lock = true;
+  bool login = false;
+  bool sudo = true;
+  bool polkit = true;
+  double threshold = 0.50;
+  int matchFrames = 2;
+  double timeoutSudo = 4.0;
+  double timeoutPolkit = 5.0;
+  double timeoutLock = 6.0;
+  double timeoutLogin = 6.0;
+  int minFaceWidth = 70;
+  bool attention = true;
+};
+
+bool parseBool(const std::string& v, bool fallback) {
+  if (v == "on" || v == "yes" || v == "true" || v == "1") return true;
+  if (v == "off" || v == "no" || v == "false" || v == "0") return false;
+  return fallback;
+}
+
+Config loadConfig() {
+  Config c;
+  std::ifstream in(kConfigPath);
+  std::string line;
+  while (std::getline(in, line)) {
+    auto hash = line.find('#');
+    if (hash != std::string::npos) line.erase(hash);
+    auto eq = line.find('=');
+    if (eq == std::string::npos) continue;
+    auto trim = [](std::string s) {
+      s.erase(0, s.find_first_not_of(" \t"));
+      s.erase(s.find_last_not_of(" \t\r") + 1);
+      return s;
+    };
+    std::string k = trim(line.substr(0, eq)), v = trim(line.substr(eq + 1));
+    try {
+      if (k == "device") c.device = v;
+      else if (k == "lock") c.lock = parseBool(v, c.lock);
+      else if (k == "login") c.login = parseBool(v, c.login);
+      else if (k == "sudo") c.sudo = parseBool(v, c.sudo);
+      else if (k == "polkit") c.polkit = parseBool(v, c.polkit);
+      else if (k == "threshold") c.threshold = std::clamp(std::stod(v), 0.30, 0.95);
+      else if (k == "attention") c.attention = parseBool(v, true);
+      else if (k == "match_frames") c.matchFrames = std::clamp(std::stoi(v), 1, 5);
+      else if (k == "timeout_sudo") c.timeoutSudo = std::clamp(std::stod(v), 1.0, 15.0);
+      else if (k == "timeout_polkit") c.timeoutPolkit = std::clamp(std::stod(v), 1.0, 15.0);
+      else if (k == "timeout_lock") c.timeoutLock = std::clamp(std::stod(v), 1.0, 15.0);
+      else if (k == "timeout_login") c.timeoutLogin = std::clamp(std::stod(v), 1.0, 15.0);
+      else if (k == "min_face_width") c.minFaceWidth = std::clamp(std::stoi(v), 30, 300);
+    } catch (...) {
+      // A malformed value keeps the default rather than failing open or closed.
+    }
+  }
+  return c;
+}
+
+// ------------------------------------------------------------------ camera
+
+struct CameraInfo {
+  std::string path;
+  std::string card;
+  uint32_t fourcc = 0;
+  uint32_t width = 0, height = 0;
+  int score = 0;  // higher = more certainly the IR camera
+};
+
+bool xioctl(int fd, unsigned long req, void* arg) {
+  int r;
+  do r = ioctl(fd, req, arg); while (r == -1 && errno == EINTR);
+  return r != -1;
+}
+
+std::string fourccName(uint32_t f) {
+  std::string s;
+  for (int i = 0; i < 4; i++) s += char((f >> (8 * i)) & 0xff);
+  while (!s.empty() && s.back() == ' ') s.pop_back();
+  return s;
+}
+
+// "IR camera", "Integrated IR", "Infrared": a whole word, not just the two
+// letters (they sit inside ordinary words like "Firmware").
+bool hasIrWord(const std::string& text) {
+  std::string word;
+  for (char ch : text + " ") {
+    if (isalnum((unsigned char)ch)) { word += (char)tolower((unsigned char)ch); continue; }
+    if (word == "ir" || word == "infrared" || word.rfind("ircam", 0) == 0) return true;
+    word.clear();
+  }
+  return false;
+}
+
+// The frame size nearest 640 wide: enough for a face at arm's length, small
+// enough to keep each frame cheap. Some drivers list nothing; S_FMT adjusts.
+void pickSize(int fd, uint32_t fourcc, uint32_t& w, uint32_t& h) {
+  w = 640;
+  h = 480;
+  v4l2_frmsizeenum fs{};
+  fs.pixel_format = fourcc;
+  long best = -1;
+  for (fs.index = 0; xioctl(fd, VIDIOC_ENUM_FRAMESIZES, &fs); fs.index++) {
+    if (fs.type != V4L2_FRMSIZE_TYPE_DISCRETE) {
+      w = std::clamp<uint32_t>(640, fs.stepwise.min_width, fs.stepwise.max_width);
+      h = std::clamp<uint32_t>(480, fs.stepwise.min_height, fs.stepwise.max_height);
+      return;
+    }
+    if (fs.discrete.width < 240) continue;
+    long d = std::labs((long)fs.discrete.width - 640);
+    if (best < 0 || d < best) {
+      best = d;
+      w = fs.discrete.width;
+      h = fs.discrete.height;
+    }
+  }
+}
+
+// IR cameras deliver greyscale (GREY, or Y16 on some). A few deliver YUYV,
+// like ordinary colour webcams; those only count when the name says IR,
+// because a colour camera can be fooled by a photo. `forced` (device= in the
+// config) accepts any capture device and leaves that choice to the user.
+bool inspectDevice(const std::string& path, CameraInfo& out, bool forced = false) {
+  int fd = ::open(path.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
+  if (fd < 0) return false;
+  bool ok = false;
+  v4l2_capability cap{};
+  if (xioctl(fd, VIDIOC_QUERYCAP, &cap)) {
+    uint32_t caps = (cap.capabilities & V4L2_CAP_DEVICE_CAPS) ? cap.device_caps : cap.capabilities;
+    if ((caps & V4L2_CAP_VIDEO_CAPTURE) && (caps & V4L2_CAP_STREAMING)) {
+      bool grey = false, y16 = false, yuyv = false;
+      v4l2_fmtdesc fmt{};
+      fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+      for (fmt.index = 0; xioctl(fd, VIDIOC_ENUM_FMT, &fmt); fmt.index++) {
+        if (fmt.pixelformat == V4L2_PIX_FMT_GREY) grey = true;
+        else if (fmt.pixelformat == V4L2_PIX_FMT_Y16) y16 = true;
+        else if (fmt.pixelformat == V4L2_PIX_FMT_YUYV) yuyv = true;
+      }
+      std::string card = reinterpret_cast<const char*>(cap.card);
+      // uvcvideo names nodes "<product>: <stream>"; the stream part is the
+      // stronger hint, since one product often has a colour and an IR node.
+      size_t colon = card.rfind(':');
+      bool irStream = hasIrWord(colon == std::string::npos ? card : card.substr(colon + 1));
+      bool irProduct = colon != std::string::npos && hasIrWord(card.substr(0, colon));
+      out.fourcc = grey ? V4L2_PIX_FMT_GREY
+                 : y16 ? V4L2_PIX_FMT_Y16
+                 : (yuyv && (irStream || irProduct || forced)) ? V4L2_PIX_FMT_YUYV : 0;
+      if (out.fourcc) {
+        out.path = path;
+        out.card = card;
+        out.score = (grey || y16 ? 4 : 0) + (irStream ? 2 : 0) + (irProduct ? 1 : 0);
+        pickSize(fd, out.fourcc, out.width, out.height);
+        ok = true;
+      }
+    }
+  }
+  ::close(fd);
+  return ok;
+}
+
+bool findCamera(const Config& cfg, CameraInfo& out) {
+  if (cfg.device != "auto") return inspectDevice(cfg.device, out, true);
+  bool any = false;
+  for (int i = 0; i < 64; i++) {
+    CameraInfo info;
+    if (!inspectDevice("/dev/video" + std::to_string(i), info)) continue;
+    if (!any || info.score > out.score) out = info;
+    any = true;
+  }
+  return any;
+}
+
+class Camera {
+ public:
+  ~Camera() { close(); }
+
+  bool open(const CameraInfo& info, std::string& err) {
+    fd_ = ::open(info.path.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
+    if (fd_ < 0) { err = std::string("cannot open camera: ") + strerror(errno); return false; }
+
+    v4l2_format fmt{};
+    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    fmt.fmt.pix.width = info.width;
+    fmt.fmt.pix.height = info.height;
+    fmt.fmt.pix.pixelformat = info.fourcc;
+    fmt.fmt.pix.field = V4L2_FIELD_ANY;
+    if (!xioctl(fd_, VIDIOC_S_FMT, &fmt) || fmt.fmt.pix.pixelformat != info.fourcc) {
+      err = errno == EBUSY ? "camera busy" : "camera refused the " + fourccName(info.fourcc) + " format";
+      return false;
+    }
+    fourcc_ = info.fourcc;
+    width_ = fmt.fmt.pix.width;
+    height_ = fmt.fmt.pix.height;
+    uint32_t bpp = fourcc_ == V4L2_PIX_FMT_GREY ? 1 : 2;
+    stride_ = fmt.fmt.pix.bytesperline ? fmt.fmt.pix.bytesperline : width_ * bpp;
+
+    v4l2_requestbuffers req{};
+    req.count = 4;
+    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    req.memory = V4L2_MEMORY_MMAP;
+    if (!xioctl(fd_, VIDIOC_REQBUFS, &req) || req.count < 2) {
+      err = errno == EBUSY ? "camera busy" : "camera buffer request failed";
+      return false;
+    }
+    for (uint32_t i = 0; i < req.count; i++) {
+      v4l2_buffer buf{};
+      buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+      buf.memory = V4L2_MEMORY_MMAP;
+      buf.index = i;
+      if (!xioctl(fd_, VIDIOC_QUERYBUF, &buf)) { err = "camera buffer query failed"; return false; }
+      void* p = mmap(nullptr, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, buf.m.offset);
+      if (p == MAP_FAILED) { err = "camera mmap failed"; return false; }
+      buffers_.push_back({p, buf.length});
+      if (!xioctl(fd_, VIDIOC_QBUF, &buf)) { err = "camera queue failed"; return false; }
+    }
+    v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (!xioctl(fd_, VIDIOC_STREAMON, &type)) {
+      err = errno == EBUSY ? "camera busy" : "camera stream failed";
+      return false;
+    }
+    streaming_ = true;
+    return true;
+  }
+
+  // Returns false on timeout or error.
+  bool grab(cv::Mat& out, int timeoutMs) {
+    pollfd p{fd_, POLLIN, 0};
+    int r;
+    do r = poll(&p, 1, timeoutMs); while (r < 0 && errno == EINTR);
+    if (r <= 0) return false;
+    v4l2_buffer buf{};
+    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buf.memory = V4L2_MEMORY_MMAP;
+    if (!xioctl(fd_, VIDIOC_DQBUF, &buf)) return false;
+    uint32_t bpp = fourcc_ == V4L2_PIX_FMT_GREY ? 1 : 2;
+    bool ok = buf.bytesused >= stride_ * (height_ - 1) + width_ * bpp;
+    if (ok) {
+      void* data = buffers_[buf.index].first;
+      if (fourcc_ == V4L2_PIX_FMT_GREY) {
+        cv::Mat(height_, width_, CV_8UC1, data, stride_).copyTo(out);
+      } else if (fourcc_ == V4L2_PIX_FMT_YUYV) {
+        cv::extractChannel(cv::Mat(height_, width_, CV_8UC2, data, stride_), out, 0);
+      } else {
+        // Y16 carries 10, 12 or 16 significant bits; find out from the
+        // brightest value seen and keep the scale steady between frames.
+        cv::Mat wide(height_, width_, CV_16UC1, data, stride_);
+        double maxv = 0;
+        cv::minMaxLoc(wide, nullptr, &maxv);
+        int bits = maxv < 1024 ? 10 : (maxv < 4096 ? 12 : 16);
+        y16Bits_ = std::max(y16Bits_, bits);
+        wide.convertTo(out, CV_8U, 255.0 / ((1 << y16Bits_) - 1));
+      }
+    }
+    xioctl(fd_, VIDIOC_QBUF, &buf);
+    return ok;
+  }
+
+  uint32_t width() const { return width_; }
+
+  void close() {
+    if (fd_ < 0) return;
+    if (streaming_) {
+      v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+      xioctl(fd_, VIDIOC_STREAMOFF, &type);
+      streaming_ = false;
+    }
+    for (auto& b : buffers_) munmap(b.first, b.second);
+    buffers_.clear();
+    ::close(fd_);
+    fd_ = -1;
+  }
+
+ private:
+  int fd_ = -1;
+  bool streaming_ = false;
+  uint32_t fourcc_ = V4L2_PIX_FMT_GREY;
+  int y16Bits_ = 10;
+  uint32_t width_ = 0, height_ = 0, stride_ = 0;
+  std::vector<std::pair<void*, size_t>> buffers_;
+};
+
+// min_face_width is set for a 640-pixel-wide camera; scale it so a face at
+// the same distance counts the same on a smaller or larger sensor.
+int minFaceFor(const Config& cfg, const Camera& cam) {
+  return std::max(30, int(cfg.minFaceWidth * (cam.width() ? cam.width() : 640) / 640.0));
+}
+
+// The emitter lights every other frame. Unlit frames only carry ambient IR,
+// which ranges from black at night to bright in sunlight, so compare against
+// the recent lit level instead of a fixed cutoff. With strong ambient light
+// the two converge and every frame is simply treated as usable.
+class DarkFrameFilter {
+ public:
+  bool isDark(const cv::Mat& grey) {
+    cv::Mat small;
+    cv::resize(grey, small, cv::Size(64, 40), 0, 0, cv::INTER_AREA);
+    double mean = cv::mean(small)[0];
+    if (mean < 3.0) return true;
+    if (litLevel_ > 0 && mean < litLevel_ * 0.45) return true;
+    litLevel_ = litLevel_ <= 0 ? mean : litLevel_ * 0.7 + mean * 0.3;
+    return false;
+  }
+
+ private:
+  double litLevel_ = 0;
+};
+
+// ------------------------------------------------------------------ models
+
+struct Face {
+  cv::Mat row;          // 1x15 YuNet output
+  float width = 0;
+  float score = 0;
+};
+
+class FaceModels {
+ public:
+  bool load(std::string& err) {
+    try {
+      detector_ = cv::FaceDetectorYN::create(kDetectorModel, "", cv::Size(320, 320), 0.80f, 0.3f, 5);
+      recognizer_ = cv::FaceRecognizerSF::create(kRecognizerModel, "");
+    } catch (const cv::Exception& e) {
+      err = std::string("model load failed: ") + e.what();
+      return false;
+    }
+    if (!detector_ || !recognizer_) { err = "model load failed"; return false; }
+    return true;
+  }
+
+  // Largest detected face, or none.
+  bool detect(const cv::Mat& bgr, Face& out, int* count = nullptr) {
+    if (bgr.size() != inputSize_) {
+      inputSize_ = bgr.size();
+      detector_->setInputSize(inputSize_);
+    }
+    cv::Mat faces;
+    detector_->detect(bgr, faces);
+    if (count) *count = faces.rows;
+    if (faces.rows < 1) return false;
+    int best = 0;
+    for (int i = 1; i < faces.rows; i++)
+      if (faces.at<float>(i, 2) > faces.at<float>(best, 2)) best = i;
+    out.row = faces.row(best).clone();
+    out.width = faces.at<float>(best, 2);
+    out.score = faces.at<float>(best, 14);
+    return true;
+  }
+
+  cv::Mat feature(const cv::Mat& bgr, const Face& face) {
+    cv::Mat aligned, feat;
+    recognizer_->alignCrop(bgr, face.row, aligned);
+    recognizer_->feature(aligned, feat);
+    feat = feat.reshape(1, 1).clone();
+    feat.convertTo(feat, CV_32F);
+    double n = cv::norm(feat);
+    if (n > 0) feat /= n;
+    return feat;
+  }
+
+ private:
+  cv::Ptr<cv::FaceDetectorYN> detector_;
+  cv::Ptr<cv::FaceRecognizerSF> recognizer_;
+  cv::Size inputSize_;
+};
+
+// ------------------------------------------------------------------ gallery
+
+struct Appearance {
+  std::string name;
+  std::string created;
+  cv::Mat features;  // N x 128, rows L2-normalised
+  float eyeRing = 0; // the eyes as enrollment saw them (0 = not measured)
+  float eyeArea = 0;
+  float headYaw = 0;  // head pose while looking straight at the screen
+  float headPitch = 0;
+};
+
+std::string userDir(const std::string& user) { return std::string(kDataDir) + "/" + user; }
+std::string galleryPath(const std::string& user) { return userDir(user) + "/faces.yml"; }
+
+std::vector<Appearance> loadGallery(const std::string& user) {
+  std::vector<Appearance> out;
+  if (access(galleryPath(user).c_str(), R_OK) != 0) return out;
+  try {
+    cv::FileStorage fs(galleryPath(user), cv::FileStorage::READ);
+    if (!fs.isOpened()) return out;
+    cv::FileNode list = fs["appearances"];
+    for (auto it = list.begin(); it != list.end(); ++it) {
+      Appearance a;
+      (*it)["name"] >> a.name;
+      (*it)["created"] >> a.created;
+      (*it)["features"] >> a.features;
+      (*it)["eye_ring"] >> a.eyeRing;
+      (*it)["eye_area"] >> a.eyeArea;
+      (*it)["head_yaw"] >> a.headYaw;
+      (*it)["head_pitch"] >> a.headPitch;
+      if (a.features.empty() || a.features.cols != kFeatureSize || a.features.type() != CV_32F) continue;
+      out.push_back(a);
+    }
+  } catch (const cv::Exception&) {
+    out.clear();
+  }
+  return out;
+}
+
+bool saveGallery(const std::string& user, const std::vector<Appearance>& gallery, std::string& err) {
+  passwd* pw = getpwnam(user.c_str());
+  if (!pw) { err = "unknown user"; return false; }
+  mkdir(kDataDir, 0755);
+  std::string dir = userDir(user);
+  mkdir(dir.c_str(), 0750);
+  // root owns the template so a process running as the user cannot swap in
+  // someone else's face; the user's group may read it for the lock screen.
+  if (chown(dir.c_str(), 0, pw->pw_gid) != 0 || chmod(dir.c_str(), 0750) != 0) {
+    err = "cannot set data directory permissions";
+    return false;
+  }
+  std::string tmp = galleryPath(user) + ".tmp";
+  try {
+    cv::FileStorage fs(tmp, cv::FileStorage::WRITE);
+    if (!fs.isOpened()) { err = "cannot write gallery"; return false; }
+    fs << "version" << 1;
+    fs << "appearances" << "[";
+    for (auto& a : gallery)
+      fs << "{" << "name" << a.name << "created" << a.created << "eye_ring" << a.eyeRing
+         << "eye_area" << a.eyeArea << "head_yaw" << a.headYaw << "head_pitch" << a.headPitch
+         << "features" << a.features << "}";
+    fs << "]";
+    fs.release();
+  } catch (const cv::Exception& e) {
+    err = e.what();
+    return false;
+  }
+  if (chown(tmp.c_str(), 0, pw->pw_gid) != 0 || chmod(tmp.c_str(), 0640) != 0 ||
+      rename(tmp.c_str(), galleryPath(user).c_str()) != 0) {
+    unlink(tmp.c_str());
+    err = "cannot install gallery";
+    return false;
+  }
+  return true;
+}
+
+double bestScore(const std::vector<Appearance>& gallery, const cv::Mat& feat, size_t* which = nullptr) {
+  double best = -1;
+  for (size_t i = 0; i < gallery.size(); i++) {
+    cv::Mat scores = gallery[i].features * feat.t();
+    double mx;
+    cv::minMaxLoc(scores, nullptr, &mx);
+    if (mx > best) {
+      best = mx;
+      if (which) *which = i;
+    }
+  }
+  return best;
+}
+
+// ------------------------------------------------------------------ attention
+
+// Face ID should not open for a face that is asleep or looking elsewhere.
+// The IR light sits right beside the lens, so an eye pointed at the camera
+// sends the light straight back off the retina: the whole pupil glows, like
+// red-eye in a flash photo. The glow only shows within a few degrees of the
+// camera (measured: strong looking into it, mostly gone at the middle of the
+// screen), so this asks for a glance at the camera. A closed or downcast eye
+// shows no glow, and an eye turned away keeps at most a tiny corneal glint. Measured on both eyes in a patch normalised to the
+// distance between them, so face size and head tilt do not matter.
+
+struct EyeReading {
+  float ring = 0;   // how much the brightest blob outshines the ring around it
+  float area = 0;   // its size, in a patch where the eyes are 100 px apart
+  float offset = 0; // how far it sits from the eye landmark, same units
+};
+
+EyeReading readEye(const cv::Mat& grey, cv::Point2f eye, double angle, double scale) {
+  // Map the eye to the middle of a 60x40 patch, eye line level, eyes 100 px apart.
+  double al = scale * std::cos(angle), be = scale * std::sin(angle);
+  cv::Matx23d M(al, be, (1 - al) * eye.x - be * eye.y + 30 - eye.x,
+                -be, al, be * eye.x + (1 - al) * eye.y + 20 - eye.y);
+  cv::Mat patch;
+  cv::warpAffine(grey, patch, M, cv::Size(60, 40), cv::INTER_LINEAR, cv::BORDER_REPLICATE);
+  const cv::Rect core(10, 6, 40, 28);
+  cv::Mat c = patch(core);
+  double mx;
+  cv::Point mxl;
+  cv::minMaxLoc(c, nullptr, &mx, nullptr, &mxl);
+  std::vector<uchar> v(c.begin<uchar>(), c.end<uchar>());
+  std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+  double med = v[v.size() / 2];
+  cv::Mat labels;
+  cv::connectedComponents(c >= std::max(med + 0.6 * (mx - med), med + 25.0), labels, 8);
+  cv::Mat blob = labels == labels.at<int>(mxl);
+  EyeReading r;
+  r.area = cv::countNonZero(blob);
+  cv::Mat grown, ring;
+  cv::dilate(blob, grown, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(7, 7)));
+  ring = grown & ~blob;
+  double inside = cv::mean(c, blob)[0];
+  r.ring = cv::countNonZero(ring) ? float(inside - cv::mean(c, ring)[0]) : 0.f;
+  double sx = 0, sy = 0;
+  for (int y = 0; y < blob.rows; y++)
+    for (int x = 0; x < blob.cols; x++)
+      if (blob.at<uchar>(y, x)) { sx += x; sy += y; }
+  float cx = r.area ? sx / r.area : mxl.x, cy = r.area ? sy / r.area : mxl.y;
+  r.offset = std::max(std::fabs(cx - (30 - core.x)), std::fabs(cy - (20 - core.y)));
+  return r;
+}
+
+// Both eyes, YuNet's right eye (image left) first.
+void readEyes(const cv::Mat& grey, const Face& f, EyeReading& right, EyeReading& left) {
+  const float* p = f.row.ptr<float>();
+  cv::Point2f re(p[4], p[5]), le(p[6], p[7]);
+  cv::Point2f d = le - re;
+  double iod = std::max(1.0f, std::hypot(d.x, d.y));
+  double angle = std::atan2(d.y, d.x);
+  right = readEye(grey, re, angle, 100.0 / iod);
+  left = readEye(grey, le, angle, 100.0 / iod);
+}
+
+cv::Point2f headPose(const Face& f);
+
+// "ok", or why not: "head" (turned away) or "eyes" (closed, or looking away).
+// An appearance enrolled with a baseline scales the cut-offs to that person
+// and camera (some IR modules give a dark pupil and only a corneal glint);
+// without one, the defaults were measured on a bright-pupil camera.
+//
+// The glow also shows looking a little above the camera. Tilting the head
+// back to look up gives that away: the pitch drops more than 0.1 below how
+// the head sat at enrollment, while posture and lid angle move it by about
+// 0.05 from day to day.
+std::string attentionCheck(const cv::Mat& grey, const Face& f, const Appearance& a) {
+  cv::Point2f pose = headPose(f);
+  bool havePose = a.headPitch > 0;
+  if (std::fabs(pose.x - (havePose ? a.headYaw : 0.f)) > 0.2f) return "head";
+  if (havePose && pose.y < a.headPitch - 0.09f) return "head";
+  float ringMin = 40, areaMin = 20, areaMax = 250;
+  if (a.eyeRing > 0 && a.eyeArea > 0) {
+    ringMin = std::clamp(a.eyeRing * 0.45f, 25.0f, 60.0f);
+    areaMin = std::clamp(a.eyeArea * 0.3f, 3.0f, 20.0f);
+    areaMax = std::max(250.0f, a.eyeArea * 4);
+  }
+  EyeReading r, l;
+  readEyes(grey, f, r, l);
+  for (auto& e : {r, l})
+    if (e.ring < ringMin || e.area < areaMin || e.area > areaMax || e.offset > 10) return "eyes";
+  return "ok";
+}
+
+// ------------------------------------------------------------------ system checks
+
+bool lidClosed() {
+  DIR* d = opendir("/proc/acpi/button/lid");
+  if (!d) return false;
+  bool closed = false;
+  while (dirent* e = readdir(d)) {
+    if (e->d_name[0] == '.') continue;
+    std::ifstream f(std::string("/proc/acpi/button/lid/") + e->d_name + "/state");
+    std::string s((std::istreambuf_iterator<char>(f)), {});
+    if (s.find("closed") != std::string::npos) closed = true;
+  }
+  closedir(d);
+  return closed;
+}
+
+// sudo and polkit only accept a face while the user is physically at this
+// machine: an active, non-remote logind session on a seat. The login screen
+// has no user session yet, so there any active local seat session (the
+// greeter's) will do: pass uid = -1.
+bool hasActiveLocalSession(uid_t uid) {
+  char** sessions = nullptr;
+  int n = uid == (uid_t)-1 ? sd_get_sessions(&sessions) : sd_uid_get_sessions(uid, 1, &sessions);
+  if (n <= 0 || !sessions) return false;
+  bool found = false;
+  for (int i = 0; i < n; i++) {
+    const char* id = sessions[i];
+    char* seat = nullptr;
+    char* state = nullptr;
+    if (!found && sd_session_is_active(id) > 0 && sd_session_is_remote(id) == 0 &&
+        sd_session_get_seat(id, &seat) >= 0 && seat && *seat &&
+        sd_session_get_state(id, &state) >= 0 && state && strcmp(state, "active") == 0)
+      found = true;
+    free(seat);
+    free(state);
+    free(sessions[i]);
+  }
+  free(sessions);
+  return found;
+}
+
+std::string failPath(uid_t uid) { return std::string(kRunDir) + "/fail-" + std::to_string(uid); }
+
+// Consecutive "a face was seen and it was not you" results.
+struct Failures { int count = 0; time_t last = 0; };
+
+Failures readFailures(uid_t uid) {
+  Failures f;
+  std::ifstream in(failPath(uid));
+  in >> f.count >> f.last;
+  if (!in) f = Failures{};
+  if (f.last && time(nullptr) - f.last > kLockoutSeconds) f = Failures{};
+  return f;
+}
+
+void writeFailures(uid_t uid, const Failures& f) {
+  std::string path = failPath(uid);
+  if (f.count == 0) { unlink(path.c_str()); return; }
+  std::ofstream out(path, std::ios::trunc);
+  out << f.count << " " << f.last << "\n";
+}
+
+// Live state for the lock screen and polkit dialog animation. World-readable,
+// holds no biometric data: just what the scanner is doing right now.
+void writeStatus(const std::string& service, const std::string& state, long seq) {
+  std::string path = std::string(kRunDir) + "/status";
+  int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+  if (fd < 0) return;
+  fchmod(fd, 0644);
+  char buf[256];
+  int n = snprintf(buf, sizeof buf, "{\"service\":\"%s\",\"state\":\"%s\",\"seq\":%ld,\"at\":%ld}\n",
+                   service.c_str(), state.c_str(), seq, (long)time(nullptr));
+  if (n > 0) (void)!write(fd, buf, std::min<int>(n, sizeof buf - 1));
+  ::close(fd);
+}
+
+// ------------------------------------------------------------------ serve
+
+struct Request {
+  std::string user;
+  std::string service;
+};
+
+bool readLine(int fd, std::string& line, int timeoutMs) {
+  auto start = Clock::now();
+  line.clear();
+  while (line.size() < 256) {
+    int left = timeoutMs - int(secondsSince(start) * 1000);
+    if (left <= 0) return false;
+    pollfd p{fd, POLLIN, 0};
+    if (poll(&p, 1, left) <= 0) return false;
+    char c;
+    ssize_t r = read(fd, &c, 1);
+    if (r <= 0) return false;
+    if (c == '\n') return true;
+    line.push_back(c);
+  }
+  return false;
+}
+
+void sendLine(const std::string& s) {
+  std::string l = s + "\n";
+  ssize_t r = send(STDOUT_FILENO, l.data(), l.size(), MSG_NOSIGNAL);
+  if (r < 0) (void)!write(STDOUT_FILENO, l.data(), l.size());
+}
+
+bool clientGone() {
+  pollfd p{STDIN_FILENO, POLLIN | POLLRDHUP, 0};
+  if (poll(&p, 1, 0) <= 0) return false;
+  if (p.revents & (POLLHUP | POLLRDHUP | POLLERR)) return true;
+  char c;
+  return recv(STDIN_FILENO, &c, 1, MSG_PEEK | MSG_DONTWAIT) == 0;
+}
+
+int finish(const std::string& result) {
+  sendLine("RESULT " + result);
+  return result == "ok" ? 0 : 1;
+}
+
+int serve() {
+  std::string line;
+  if (!readLine(STDIN_FILENO, line, 3000)) return finish("error bad-request");
+  std::istringstream ss(line);
+  std::string verb;
+  Request req;
+  ss >> verb >> req.user >> req.service;
+  if (verb != "VERIFY" || req.user.empty() || req.service.empty()) return finish("error bad-request");
+
+  // The peer may only ask about itself, unless it is root (sudo, polkit).
+  ucred cred{};
+  socklen_t len = sizeof cred;
+  if (getsockopt(STDIN_FILENO, SOL_SOCKET, SO_PEERCRED, &cred, &len) != 0) return finish("error no-peer");
+  passwd* pw = getpwnam(req.user.c_str());
+  if (!pw) return finish("error unknown-user");
+  uid_t uid = pw->pw_uid;
+  if (cred.uid != 0 && cred.uid != uid) return finish("denied peer");
+
+  Config cfg = loadConfig();
+  std::string key;
+  double timeout = 0;
+  bool enabled = false, needsSession = false, needsSeat = false, test = false;
+  if (req.service == "sudo") { key = "sudo"; enabled = cfg.sudo; timeout = cfg.timeoutSudo; needsSession = true; }
+  else if (req.service == "polkit-1") { key = "polkit"; enabled = cfg.polkit; timeout = cfg.timeoutPolkit; needsSession = true; }
+  else if (req.service == "sddm") { key = "login"; enabled = cfg.login; timeout = cfg.timeoutLogin; needsSeat = true; }
+  else if (req.service == "omarchy-lock-face") { key = "lock"; enabled = cfg.lock; timeout = cfg.timeoutLock; }
+  else if (req.service == "faceid-test") { key = "test"; enabled = true; timeout = 8.0; test = true; }
+  else return finish("disabled unknown-service");
+  // Only the lock screen and the self-test may be asked for by the user itself;
+  // sudo, polkit and login requests must come from their root PAM stacks.
+  if ((key == "sudo" || key == "polkit" || key == "login") && cred.uid != 0) return finish("denied peer");
+  if (!enabled) return finish("disabled");
+
+  auto gallery = loadGallery(req.user);
+  // The self-test still runs the camera and models with nothing enrolled, so
+  // a fresh install can be checked end to end before the first enrollment.
+  if (gallery.empty() && !test) return finish("unavailable not-enrolled");
+  // The lock screen hides the Face ID mark while the camera cannot see you.
+  if (lidClosed()) { writeStatus(key, "unavailable", 0); return finish("unavailable lid-closed"); }
+  if (needsSession && !hasActiveLocalSession(uid)) return finish("unavailable no-local-session");
+  if (needsSeat && !hasActiveLocalSession((uid_t)-1)) return finish("unavailable no-local-seat");
+
+  Failures fails = readFailures(uid);
+  if (!test && fails.count >= kLockoutFailures) return finish("locked-out");
+
+  mkdir(kRunDir, 0755);
+  int lockFd = ::open((std::string(kRunDir) + "/camera.lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+  bool haveLock = false;
+  for (int i = 0; i < 20 && lockFd >= 0; i++) {
+    if (flock(lockFd, LOCK_EX | LOCK_NB) == 0) { haveLock = true; break; }
+    usleep(50000);
+  }
+  if (!haveLock) return finish("busy");
+
+  CameraInfo info;
+  if (!findCamera(cfg, info)) { writeStatus(key, "unavailable", 0); return finish("unavailable no-camera"); }
+
+  FaceModels models;
+  std::string err;
+  if (!models.load(err)) { fprintf(stderr, "%s\n", err.c_str()); return finish("error models"); }
+
+  Camera cam;
+  if (!cam.open(info, err)) {
+    fprintf(stderr, "%s\n", err.c_str());
+    writeStatus(key, "unavailable", 0);
+    return finish("unavailable camera");
+  }
+  const int minFace = minFaceFor(cfg, cam);
+
+  long seq = (long)time(nullptr) * 1000 + getpid() % 1000;
+  writeStatus(key, "scanning", seq);
+  sendLine("STATUS scanning");
+
+  auto start = Clock::now();
+  int matches = 0, rejected = 0, inattentive = 0;
+  bool sawFace = false;
+  std::string lastStatus = "scanning";
+  cv::Mat grey, bgr;
+  DarkFrameFilter darkFilter;
+  while (secondsSince(start) < timeout) {
+    if (clientGone()) { writeStatus(key, "idle", seq); return 1; }
+    if (!cam.grab(grey, 500)) continue;
+    if (darkFilter.isDark(grey)) continue;
+    cv::cvtColor(grey, bgr, cv::COLOR_GRAY2BGR);
+    Face face;
+    if (!models.detect(bgr, face) || face.width < minFace) {
+      matches = 0;
+      if (lastStatus != "noface") { sendLine("STATUS noface"); lastStatus = "noface"; }
+      continue;
+    }
+    sawFace = true;
+    if (gallery.empty()) {
+      if (lastStatus != "face") { sendLine("STATUS face"); lastStatus = "face"; }
+      cam.close();
+      writeStatus(key, "idle", seq);
+      return finish("unavailable not-enrolled");
+    }
+    size_t which = 0;
+    double score = bestScore(gallery, models.feature(bgr, face), &which);
+    std::string attention = "off";
+    if (cfg.attention && (score >= cfg.threshold || test)) attention = attentionCheck(grey, face, gallery[which]);
+    if (test) {
+      char b[128];
+      snprintf(b, sizeof b, "SCORE %.3f width %.0f attention %s", score, face.width, attention.c_str());
+      sendLine(b);
+    }
+    if (score >= cfg.threshold && attention != "off" && attention != "ok") {
+      // Your face, but asleep or looking elsewhere: not a match, and not a
+      // stranger either, so it never counts toward the lockout.
+      matches = 0;
+      inattentive++;
+      if (lastStatus != "attention") { sendLine("STATUS attention"); lastStatus = "attention"; }
+    } else if (score >= cfg.threshold) {
+      if (++matches >= cfg.matchFrames) {
+        cam.close();
+        writeStatus(key, "success", seq);
+        if (!test) writeFailures(uid, Failures{});
+        return finish("ok");
+      }
+      if (lastStatus != "face") { sendLine("STATUS face"); lastStatus = "face"; }
+    } else {
+      matches = 0;
+      rejected++;
+      if (lastStatus != "nomatch") { sendLine("STATUS nomatch"); lastStatus = "nomatch"; }
+    }
+  }
+  cam.close();
+  if (inattentive > 0) {
+    writeStatus(key, "attention", seq);
+    return finish("attention");
+  }
+  // Only a face that was seen and rejected counts toward the lockout; nobody
+  // in front of the camera is just a timeout.
+  if (sawFace && rejected > 0) {
+    writeStatus(key, "failure", seq);
+    if (!test) {
+      fails.count++;
+      fails.last = time(nullptr);
+      writeFailures(uid, fails);
+    }
+    return finish("fail");
+  }
+  writeStatus(key, "timeout", seq);
+  if (gallery.empty()) return finish("unavailable not-enrolled no-face-seen");
+  return finish("timeout");
+}
+
+// ------------------------------------------------------------------ enroll + test
+
+// Mirrored braille rendering of the IR frame, cropped around the face: a live
+// preview that fits a terminal or a QML Text and never leaves the machine.
+std::vector<std::string> brailleFrame(const cv::Mat& grey, const cv::Rect& focus, int cols, int rows) {
+  int dw = cols * 2, dh = rows * 4;
+  cv::Rect roi = focus & cv::Rect(0, 0, grey.cols, grey.rows);
+  if (roi.width < 8 || roi.height < 8) roi = cv::Rect(0, 0, grey.cols, grey.rows);
+  cv::Mat small;
+  cv::resize(grey(roi), small, cv::Size(dw, dh), 0, 0, cv::INTER_AREA);
+  cv::flip(small, small, 1);
+  cv::equalizeHist(small, small);
+  static const int bayer[4][4] = {{0, 8, 2, 10}, {12, 4, 14, 6}, {3, 11, 1, 9}, {15, 7, 13, 5}};
+  static const int bit[4][2] = {{0x01, 0x08}, {0x02, 0x10}, {0x04, 0x20}, {0x40, 0x80}};
+  std::vector<std::string> out;
+  for (int r = 0; r < rows; r++) {
+    std::string line;
+    for (int c = 0; c < cols; c++) {
+      int code = 0;
+      for (int y = 0; y < 4; y++)
+        for (int x = 0; x < 2; x++) {
+          int px = c * 2 + x, py = r * 4 + y;
+          int v = small.at<uint8_t>(py, px);
+          if (v > (bayer[py % 4][px % 4] * 16 + 8)) code |= bit[y][x];
+        }
+      int cp = 0x2800 + code;
+      line += char(0xE0 | (cp >> 12));
+      line += char(0x80 | ((cp >> 6) & 0x3F));
+      line += char(0x80 | (cp & 0x3F));
+    }
+    out.push_back(line);
+  }
+  return out;
+}
+
+// Appearance names are shown in the settings window and stored in YAML: keep
+// any language, drop control characters and quotes, collapse spaces, and cap
+// the length without cutting a UTF-8 character in half.
+std::string cleanName(const std::string& in) {
+  const size_t kMaxBytes = 40;
+  std::string out;
+  bool space = false;
+  for (unsigned char c : in) {
+    if (c < 0x20 || c == 0x7f || c == '"' || c == '\\' || c == ' ') { space = !out.empty(); continue; }
+    if (space) { out += ' '; space = false; }
+    out += (char)c;
+  }
+  if (out.size() > kMaxBytes) {
+    size_t cut = kMaxBytes;
+    while (cut > 0 && ((unsigned char)out[cut] & 0xC0) == 0x80) cut--;
+    out.resize(cut);
+    while (!out.empty() && out.back() == ' ') out.pop_back();
+  }
+  return out;
+}
+
+std::string jsonEscape(const std::string& s) {
+  std::string o;
+  for (char c : s) {
+    if (c == '"' || c == '\\') { o += '\\'; o += c; }
+    else if ((unsigned char)c < 0x20) o += ' ';
+    else o += c;
+  }
+  return o;
+}
+
+// Head pose from the five YuNet landmarks: yaw from the nose against the eye
+// midpoint, pitch from where the nose sits between the eyes and the mouth.
+cv::Point2f headPose(const Face& f) {
+  const float* p = f.row.ptr<float>();
+  float rex = p[4], rey = p[5], lex = p[6], ley = p[7], nx = p[8], ny = p[9];
+  float rmx = p[10], rmy = p[11], lmx = p[12], lmy = p[13];
+  float eyeMidX = (rex + lex) / 2, eyeMidY = (rey + ley) / 2;
+  float mouthMidY = (rmy + lmy) / 2;
+  float eyeDist = std::max(1.0f, std::hypot(lex - rex, ley - rey));
+  float yaw = (nx - eyeMidX) / eyeDist;
+  float span = std::max(1.0f, mouthMidY - eyeMidY);
+  float pitch = (ny - eyeMidY) / span;
+  (void)rmx; (void)lmx;
+  return {yaw, pitch};
+}
+
+std::string nowIso() {
+  char b[32];
+  time_t t = time(nullptr);
+  strftime(b, sizeof b, "%Y-%m-%dT%H:%M:%S", localtime(&t));
+  return b;
+}
+
+volatile sig_atomic_t gStop = 0;
+void onSignal(int) { gStop = 1; }
+
+// The settings window runs enrollment through pkexec, so the process is root
+// and the window cannot signal it. Instead it closes our stdin when it stops
+// or goes away; notice that before every frame so the camera turns off at once.
+bool uiCallerGone() {
+  struct stat st;
+  if (fstat(STDIN_FILENO, &st) != 0 || !(S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode))) return false;
+  pollfd p{STDIN_FILENO, POLLIN, 0};
+  if (poll(&p, 1, 0) <= 0) return false;
+  if (p.revents & (POLLHUP | POLLERR | POLLNVAL)) return true;
+  char sink[64];
+  return read(STDIN_FILENO, sink, sizeof sink) == 0;
+}
+
+// A reader that stops reading would otherwise block us mid-write with the
+// camera still streaming. Give it a second, then give up.
+bool writeAllUi(const std::string& line) {
+  size_t off = 0;
+  while (off < line.size()) {
+    pollfd p{STDOUT_FILENO, POLLOUT, 0};
+    if (poll(&p, 1, 1000) <= 0 || (p.revents & (POLLERR | POLLHUP | POLLNVAL))) return false;
+    ssize_t n = write(STDOUT_FILENO, line.data() + off, line.size() - off);
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) return false;
+    off += n;
+  }
+  return true;
+}
+
+int enroll(const std::string& user, const std::string& name, bool ui) {
+  if (geteuid() != 0) { fprintf(stderr, "faceid-engine: enroll must run as root\n"); return 2; }
+  passwd* pw = getpwnam(user.c_str());
+  if (!pw) { fprintf(stderr, "faceid-engine: unknown user %s\n", user.c_str()); return 2; }
+
+  // A closed stdout means the settings window went away: stop and save nothing.
+  auto emit = [&](const std::string& json, const std::string& human) {
+    if (ui) {
+      if (!writeAllUi(json + "\n")) gStop = 1;
+      return;
+    }
+    if (!human.empty()) printf("%s\n", human.c_str());
+    if (fflush(stdout) != 0 || ferror(stdout)) gStop = 1;
+  };
+  auto fail = [&](const std::string& msg) {
+    emit("{\"type\":\"error\",\"message\":\"" + jsonEscape(msg) + "\"}", "Face ID: " + msg);
+    return 1;
+  };
+
+  auto gallery = loadGallery(user);
+  if ((int)gallery.size() >= kMaxAppearances)
+    return fail("already " + std::to_string(kMaxAppearances) + " appearances, remove one first");
+
+  Config cfg = loadConfig();
+  CameraInfo info;
+  if (!findCamera(cfg, info)) return fail("no IR camera found");
+  FaceModels models;
+  std::string err;
+  if (!models.load(err)) return fail(err);
+
+  mkdir(kRunDir, 0755);
+  int lockFd = ::open((std::string(kRunDir) + "/camera.lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+  if (lockFd < 0 || flock(lockFd, LOCK_EX) != 0) return fail("camera lock failed");
+
+  Camera cam;
+  if (!cam.open(info, err)) return fail(err);
+  const int minFace = minFaceFor(cfg, cam);
+
+  const int segments = 24;
+  std::vector<int> filled(segments, 0);
+  std::vector<cv::Mat> frontal, angled(segments);
+  bool haveCenter = false;
+  cv::Point2f center(0, 0);
+  std::vector<cv::Point2f> centerSamples;
+  // The eyes as the straight-ahead samples see them: this person's baseline
+  // for the attention check. Glare (some glasses) can hide them; after a few
+  // seconds enrollment goes on without, and the defaults apply.
+  std::vector<float> eyeRings, eyeAreas;
+  bool frontalSeen = false;
+  auto frontalStart = Clock::now();
+  auto eyesOpenNow = [&](const cv::Mat& frame, const Face& f) {
+    EyeReading r, l;
+    readEyes(frame, f, r, l);
+    if (!frontalSeen) { frontalSeen = true; frontalStart = Clock::now(); }
+    bool open = std::min(r.ring, l.ring) >= 25 && std::min(r.area, l.area) >= 3 && std::max(r.offset, l.offset) <= 10;
+    if (open) {
+      eyeRings.push_back(std::min(r.ring, l.ring));
+      eyeAreas.push_back(std::min(r.area, l.area));
+    }
+    return open || secondsSince(frontalStart) > 8;
+  };
+  auto start = Clock::now();
+  const double limit = 45.0;
+  std::string hint;
+  int lastFilled = -1;
+  cv::Mat grey, bgr;
+  DarkFrameFilter darkFilter;
+
+  emit("{\"type\":\"start\",\"segments\":" + std::to_string(segments) + "}",
+       "Face ID: look at the screen, then slowly move your head in a circle.");
+
+  while (!gStop && secondsSince(start) < limit) {
+    if (ui && uiCallerGone()) { gStop = 1; break; }
+    if (!cam.grab(grey, 500)) continue;
+    if (darkFilter.isDark(grey)) continue;
+    cv::cvtColor(grey, bgr, cv::COLOR_GRAY2BGR);
+    Face face;
+    int count = 0;
+    bool got = models.detect(bgr, face, &count);
+    cv::Rect focus(0, 0, grey.cols, grey.rows);
+    if (got) {
+      const float* p = face.row.ptr<float>();
+      float cx = p[0] + p[2] / 2, cy = p[1] + p[3] / 2, s = std::max(p[2], p[3]) * 1.9f;
+      focus = cv::Rect(int(cx - s / 2), int(cy - s * 0.42f * 1.25f), int(s), int(s * 0.62f * 1.25f));
+    }
+
+    if (!got) hint = "Position your face in front of the camera";
+    else if (count > 1) hint = "Only one face, please";
+    else if (face.width < minFace + 15) hint = "Move a little closer";
+    else if (face.score < 0.88f) hint = "Hold still";
+    else {
+      cv::Point2f pose = headPose(face);
+      if (!haveCenter && !eyesOpenNow(grey, face)) {
+        hint = "Open your eyes and look at the screen";
+      } else if (!haveCenter) {
+        centerSamples.push_back(pose);
+        hint = "Look straight at the screen";
+        frontal.push_back(models.feature(bgr, face));
+        if (centerSamples.size() >= 5) {
+          for (auto& c : centerSamples) center += c;
+          center *= 1.0f / centerSamples.size();
+          haveCenter = true;
+        }
+      } else {
+        cv::Point2f d = pose - center;
+        // Pitch moves less than yaw for the same head turn; even them out.
+        d.y *= 1.6f;
+        float mag = std::hypot(d.x, d.y);
+        if (mag < 0.07f) {
+          hint = "Slowly move your head in a circle";
+          if (frontal.size() < 8 && eyesOpenNow(grey, face)) frontal.push_back(models.feature(bgr, face));
+        } else if (mag > 0.75f) {
+          hint = "Not so far";
+        } else {
+          hint = "Keep going";
+          // 0 = up, clockwise as seen on screen (mirrored, like a selfie).
+          double ang = std::atan2(-d.x, -d.y);
+          int seg = int(std::floor((ang + CV_PI) / (2 * CV_PI) * segments)) % segments;
+          seg = (seg + segments / 2) % segments;
+          if (mag > 0.12f && !filled[seg]) {
+            filled[seg] = 1;
+            angled[seg] = models.feature(bgr, face);
+          }
+        }
+      }
+    }
+
+    int nFilled = std::count(filled.begin(), filled.end(), 1);
+    if (ui) {
+      auto art = brailleFrame(grey, focus, 30, 12);
+      std::string json = "{\"type\":\"frame\",\"face\":" + std::string(got ? "true" : "false") +
+                         ",\"hint\":\"" + jsonEscape(hint) + "\",\"filled\":[";
+      for (int i = 0; i < segments; i++) json += (i ? "," : "") + std::to_string(filled[i]);
+      json += "],\"frontal\":" + std::to_string(frontal.size()) + ",\"preview\":[";
+      for (size_t i = 0; i < art.size(); i++) json += (i ? ",\"" : "\"") + art[i] + "\"";
+      json += "]}";
+      emit(json, "");
+    } else if (nFilled != lastFilled) {
+      printf("\r  %3d%%  %s            ", nFilled * 100 / segments, hint.c_str());
+      fflush(stdout);
+    }
+    lastFilled = nFilled;
+
+    if (nFilled >= segments * 3 / 4 && frontal.size() >= 6) break;
+  }
+  cam.close();
+  if (!ui) printf("\n");
+
+  int nFilled = std::count(filled.begin(), filled.end(), 1);
+  if (gStop) return fail("cancelled");
+  if (frontal.size() < 4) return fail("could not see your face clearly, try again in better position");
+  if (nFilled < segments / 2) return fail("not enough head movement captured, try again");
+
+  Appearance a;
+  a.name = cleanName(name);
+  if (a.name.empty()) a.name = gallery.empty() ? "Face" : "Appearance " + std::to_string(gallery.size() + 1);
+  a.created = nowIso();
+  if (eyeRings.size() >= 3) {
+    auto median = [](std::vector<float> v) {
+      std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+      return v[v.size() / 2];
+    };
+    a.eyeRing = median(eyeRings);
+    a.eyeArea = median(eyeAreas);
+  }
+  a.headYaw = center.x;
+  a.headPitch = center.y;
+  for (auto& f : frontal) a.features.push_back(f);
+  for (auto& f : angled) if (!f.empty()) a.features.push_back(f);
+  gallery.push_back(a);
+  if (!saveGallery(user, gallery, err)) return fail(err);
+  // A fresh enrollment clears any lockout from earlier failed scans.
+  writeFailures(pw->pw_uid, Failures{});
+
+  emit("{\"type\":\"done\",\"samples\":" + std::to_string(a.features.rows) + ",\"appearances\":" +
+           std::to_string(gallery.size()) + ",\"eyes\":" + (a.eyeRing > 0 ? "true" : "false") + "}",
+       "Face ID: enrolled \"" + a.name + "\" (" + std::to_string(a.features.rows) + " samples).");
+  return 0;
+}
+
+#ifdef FACEID_DEV
+// Development only: build a throwaway gallery from the first frontal frames,
+// then print scores for the following ones. Nothing is written to disk.
+int calib(double seconds) {
+  Config cfg;
+  CameraInfo info;
+  if (!findCamera(cfg, info)) { printf("no camera\n"); return 1; }
+  FaceModels models;
+  std::string err;
+  if (!models.load(err)) { printf("%s\n", err.c_str()); return 1; }
+  Camera cam;
+  auto t0 = Clock::now();
+  if (!cam.open(info, err)) { printf("%s\n", err.c_str()); return 1; }
+  printf("open %.3fs %s %s\n", secondsSince(t0), info.path.c_str(), info.card.c_str());
+  Appearance a;
+  cv::Mat grey, bgr;
+  DarkFrameFilter darkFilter;
+  int lit = 0, dark = 0, detected = 0;
+  double firstFace = -1;
+  std::vector<double> scores;
+  while (secondsSince(t0) < seconds) {
+    if (!cam.grab(grey, 500)) continue;
+    if (darkFilter.isDark(grey)) { dark++; continue; }
+    lit++;
+    cv::cvtColor(grey, bgr, cv::COLOR_GRAY2BGR);
+    auto td = Clock::now();
+    Face f;
+    if (!models.detect(bgr, f)) continue;
+    double tdet = secondsSince(td);
+    detected++;
+    if (firstFace < 0) firstFace = secondsSince(t0);
+    auto tf = Clock::now();
+    cv::Mat feat = models.feature(bgr, f);
+    double tfe = secondsSince(tf);
+    if (a.features.rows < 6) { a.features.push_back(feat); continue; }
+    std::vector<Appearance> g{a};
+    double sc = bestScore(g, feat);
+    scores.push_back(sc);
+    cv::Point2f pose = headPose(f);
+    printf("t=%.2f w=%.0f det=%.3f score=%.3f mean=%.0f det_ms=%.0f feat_ms=%.0f yaw=%.2f pitch=%.2f\n",
+           secondsSince(t0), f.width, f.score, sc, cv::mean(grey)[0], tdet * 1000, tfe * 1000, pose.x, pose.y);
+  }
+  std::sort(scores.begin(), scores.end());
+  printf("lit=%d dark=%d detected=%d first_face=%.2fs\n", lit, dark, detected, firstFace);
+  if (!scores.empty())
+    printf("scores min=%.3f p10=%.3f median=%.3f\n", scores.front(), scores[scores.size() / 10], scores[scores.size() / 2]);
+  return 0;
+}
+#endif
+
+int listAppearances(const std::string& user) {
+  auto gallery = loadGallery(user);
+  printf("[");
+  for (size_t i = 0; i < gallery.size(); i++)
+    printf("%s{\"name\":\"%s\",\"created\":\"%s\",\"samples\":%d}", i ? "," : "",
+           jsonEscape(gallery[i].name).c_str(), jsonEscape(gallery[i].created).c_str(), gallery[i].features.rows);
+  printf("]\n");
+  return 0;
+}
+
+int removeAppearance(const std::string& user, const std::string& which) {
+  if (geteuid() != 0) { fprintf(stderr, "faceid-engine: remove must run as root\n"); return 2; }
+  auto gallery = loadGallery(user);
+  if (which == "all") {
+    unlink(galleryPath(user).c_str());
+    rmdir(userDir(user).c_str());
+    printf("Removed all appearances.\n");
+    return 0;
+  }
+  int index = atoi(which.c_str());
+  if (index < 1 || index > (int)gallery.size()) {
+    fprintf(stderr, "faceid: no appearance %s (have %zu)\n", which.c_str(), gallery.size());
+    return 1;
+  }
+  std::string name = gallery[index - 1].name;
+  gallery.erase(gallery.begin() + (index - 1));
+  std::string err;
+  if (gallery.empty()) {
+    unlink(galleryPath(user).c_str());
+    rmdir(userDir(user).c_str());
+  } else if (!saveGallery(user, gallery, err)) {
+    fprintf(stderr, "faceid: %s\n", err.c_str());
+    return 1;
+  }
+  printf("Removed \"%s\".\n", name.c_str());
+  return 0;
+}
+
+int renameAppearance(const std::string& user, const std::string& which, const std::string& rawName) {
+  if (geteuid() != 0) { fprintf(stderr, "faceid-engine: rename must run as root\n"); return 2; }
+  auto gallery = loadGallery(user);
+  int index = atoi(which.c_str());
+  if (index < 1 || index > (int)gallery.size()) {
+    fprintf(stderr, "faceid: no appearance %s (have %zu)\n", which.c_str(), gallery.size());
+    return 1;
+  }
+  std::string name = cleanName(rawName);
+  if (name.empty()) { fprintf(stderr, "faceid: the name is empty\n"); return 1; }
+  gallery[index - 1].name = name;
+  std::string err;
+  if (!saveGallery(user, gallery, err)) {
+    fprintf(stderr, "faceid: %s\n", err.c_str());
+    return 1;
+  }
+  printf("Renamed appearance %d to \"%s\".\n", index, name.c_str());
+  return 0;
+}
+
+// Loads both models and runs them once on a synthetic frame: proves the
+// binary, its OpenCV libraries and the model files still work together.
+int selftest() {
+  FaceModels models;
+  std::string err;
+  if (!models.load(err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
+  cv::Mat bgr(400, 640, CV_8UC3, cv::Scalar(40, 40, 40));
+  cv::circle(bgr, cv::Point(320, 200), 90, cv::Scalar(160, 160, 160), cv::FILLED);
+  Face face;
+  models.detect(bgr, face);
+  face.row = cv::Mat::zeros(1, 15, CV_32F);
+  float* p = face.row.ptr<float>();
+  float pts[15] = {230, 110, 180, 180, 280, 170, 360, 170, 320, 210, 290, 250, 350, 250, 0.9f};
+  std::copy(pts, pts + 15, p);
+  cv::Mat feat = models.feature(bgr, face);
+  if (feat.cols != kFeatureSize) { fprintf(stderr, "unexpected feature size %d\n", feat.cols); return 1; }
+  printf("ok\n");
+  return 0;
+}
+
+int probe() {
+  Config cfg = loadConfig();
+  CameraInfo info;
+  if (!findCamera(cfg, info)) { printf("none\n"); return 1; }
+  printf("%s\t%s\t%ux%u\t%s\n", info.path.c_str(), info.card.c_str(), info.width, info.height,
+         fourccName(info.fourcc).c_str());
+  return 0;
+}
+
+// Every capture device, what it offers, and which one Face ID would use:
+// the first thing to look at on a laptop where the IR camera is not found.
+int listCameras() {
+  Config cfg = loadConfig();
+  CameraInfo chosen;
+  bool have = findCamera(cfg, chosen);
+  int shown = 0;
+  for (int i = 0; i < 64; i++) {
+    std::string path = "/dev/video" + std::to_string(i);
+    int fd = ::open(path.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) continue;
+    v4l2_capability cap{};
+    bool capture = false;
+    std::string formats;
+    if (xioctl(fd, VIDIOC_QUERYCAP, &cap)) {
+      uint32_t caps = (cap.capabilities & V4L2_CAP_DEVICE_CAPS) ? cap.device_caps : cap.capabilities;
+      capture = (caps & V4L2_CAP_VIDEO_CAPTURE) && (caps & V4L2_CAP_STREAMING);
+      v4l2_fmtdesc fmt{};
+      fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+      for (fmt.index = 0; capture && xioctl(fd, VIDIOC_ENUM_FMT, &fmt); fmt.index++)
+        formats += (formats.empty() ? "" : ",") + fourccName(fmt.pixelformat);
+    }
+    ::close(fd);
+    if (!capture) continue;
+    CameraInfo info;
+    std::string verdict = have && chosen.path == path ? "used by Face ID"
+                        : inspectDevice(path, info) ? "IR candidate"
+                        : "colour camera, not used";
+    printf("%s\t%s\t%s\t%s\n", path.c_str(), reinterpret_cast<const char*>(cap.card), formats.c_str(), verdict.c_str());
+    shown++;
+  }
+  if (!shown) printf("no cameras\n");
+  return have ? 0 : 1;
+}
+
+// Whether the IR light comes on. Most IR cameras pulse it on every other
+// frame; some keep it on. Many laptops leave it off until it is switched on
+// once (linux-enable-ir-emitter), and then every frame is near black.
+int checkEmitter() {
+  Config cfg = loadConfig();
+  CameraInfo info;
+  if (!findCamera(cfg, info)) { printf("{\"verdict\":\"no-camera\"}\n"); return 1; }
+  Camera cam;
+  std::string err;
+  if (!cam.open(info, err)) {
+    printf("{\"verdict\":\"%s\"}\n", err == "camera busy" ? "busy" : "error");
+    return 1;
+  }
+  std::vector<double> means;
+  cv::Mat grey, small;
+  auto start = Clock::now();
+  while (secondsSince(start) < 2.5 && means.size() < 40) {
+    if (!cam.grab(grey, 500)) continue;
+    cv::resize(grey, small, cv::Size(64, 40), 0, 0, cv::INTER_AREA);
+    means.push_back(cv::mean(small)[0]);
+  }
+  cam.close();
+  // The first frames are often the sensor settling; leave them out.
+  if (means.size() > 8) means.erase(means.begin(), means.begin() + 4);
+  if (means.size() < 6) { printf("{\"verdict\":\"no-frames\",\"frames\":%zu}\n", means.size()); return 1; }
+  int alternating = 0;
+  double hi = 0, lo = 0;
+  for (size_t i = 0; i + 1 < means.size(); i++) {
+    double a = std::max(means[i], means[i + 1]), b = std::min(means[i], means[i + 1]);
+    if (a > b * 1.6 + 2) alternating++;
+    hi += a;
+    lo += b;
+  }
+  size_t pairs = means.size() - 1;
+  hi /= pairs;
+  lo /= pairs;
+  double avg = std::accumulate(means.begin(), means.end(), 0.0) / means.size();
+  const char* verdict = alternating * 10 >= (int)pairs * 6 ? "pulsing" : (avg >= 18 ? "steady" : "dark");
+  printf("{\"verdict\":\"%s\",\"frames\":%zu,\"lit\":%.1f,\"unlit\":%.1f,\"mean\":%.1f}\n",
+         verdict, means.size(), hi, lo, avg);
+  return strcmp(verdict, "dark") == 0 ? 3 : 0;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  // OpenCL would load the NVIDIA ICD and wake the dGPU from D3cold for a job
+  // the CPU finishes in milliseconds.
+  setenv("OPENCV_OPENCL_DEVICE", "disabled", 1);
+  setenv("OPENCV_OPENCL_RUNTIME", "disabled", 1);
+  cv::ocl::setUseOpenCL(false);
+  cv::utils::logging::setLogLevel(cv::utils::logging::LOG_LEVEL_ERROR);
+  cv::setNumThreads(4);
+  umask(022);
+
+  signal(SIGINT, onSignal);
+  signal(SIGTERM, onSignal);
+  signal(SIGPIPE, SIG_IGN);
+
+  std::string mode = argc > 1 ? argv[1] : "";
+  if (mode == "serve") return serve();
+  if (mode == "probe") return probe();
+  if (mode == "selftest") return selftest();
+  if (mode == "list" && argc > 2) return listAppearances(argv[2]);
+  if (mode == "cameras") return listCameras();
+  if (mode == "emitter") return checkEmitter();
+  if (mode == "remove" && argc > 3) return removeAppearance(argv[2], argv[3]);
+  if (mode == "rename" && argc > 4) return renameAppearance(argv[2], argv[3], argv[4]);
+#ifdef FACEID_DEV
+  if (mode == "calib") return calib(argc > 2 ? atof(argv[2]) : 10);
+#endif
+  if (mode == "enroll" && argc > 2) {
+    std::string name;
+    bool ui = false;
+    for (int i = 3; i < argc; i++) {
+      std::string a = argv[i];
+      if (a == "--ui") ui = true;
+      else if (a == "--name" && i + 1 < argc) name = argv[++i];
+    }
+    return enroll(argv[2], name, ui);
+  }
+  fprintf(stderr,
+          "usage: faceid-engine serve | probe | cameras | emitter | selftest | list <user> | remove <user> <n|all> | rename <user> <n> <name> | enroll <user> [--name N] [--ui]\n"
+          "self-test goes through the socket: faceid test\n");
+  return 2;
+}

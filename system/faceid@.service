@@ -1,0 +1,43 @@
+# One short-lived instance per verification. Nothing stays resident: the
+# engine starts when PAM asks, looks for up to a few seconds, and exits.
+[Unit]
+Description=Face ID verification
+CollectMode=inactive-or-failed
+
+[Service]
+ExecStart=/usr/local/lib/faceid/faceid-engine serve
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+RuntimeMaxSec=40
+# Exit 1 is an ordinary "not you / no face" answer, not a service failure.
+SuccessExitStatus=1
+Environment=OPENCV_OPENCL_DEVICE=disabled OPENCV_OPENCL_RUNTIME=disabled OPENCV_LOG_LEVEL=ERROR
+UMask=0022
+
+# Root, but boxed in: the IR camera, its own runtime dir, read-only elsewhere.
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+DevicePolicy=closed
+DeviceAllow=char-video4linux rw
+PrivateNetwork=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/run/faceid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
