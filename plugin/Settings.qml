@@ -44,6 +44,8 @@ Item {
 
   readonly property var appearances: Array.isArray(status.appearances) ? status.appearances : []
   readonly property int maxAppearances: status.maxAppearances || 3
+  // No IR camera: the regular webcam, lock screen only, with a head-turn check.
+  readonly property bool webcam: status.cameraKind === "webcam"
   readonly property var places: status.places || ({})
   readonly property bool authPending: actionProc.running || (enrollProc.running && enrollPhase === "auth")
   // Login is only offered where the installer found SDDM as the login manager.
@@ -181,6 +183,9 @@ Item {
       if (ev.state === "nomatch") testText = "Not recognized yet…"
       else if (ev.state === "noface") testText = "Looking for a face…"
       else if (ev.state === "face") testText = "Recognizing…"
+      else if (ev.state === "turn-left") testText = "\u2190  Turn your head left"
+      else if (ev.state === "turn-right") testText = "Turn your head right  \u2192"
+      else if (ev.state === "turn-back") testText = "Face the camera again"
     } else if (ev.type === "result") {
       if (ev.result === "ok") {
         testState = "success"
@@ -360,9 +365,10 @@ Item {
                 font.pixelSize: Style.font.bodySmall
                 text: !root.loaded ? "Checking…"
                   : (root.status.installed !== true ? "Not installed"
-                  : (root.status.lockedOut === true ? "Paused after too many attempts"
+                  : (root.status.lockedOut === true ? "Paused: use your password once to resume"
                   : (root.appearances.length === 0 ? "Not set up"
                   : (root.appearances.length === 1 ? "1 appearance" : root.appearances.length + " appearances")
+                    + (root.webcam ? "  ·  webcam" : "")
                     + (root.status.service === true ? "  ·  ready" : "  ·  service stopped"))))
               }
             }
@@ -405,7 +411,11 @@ Item {
                   }
                   Text {
                     width: parent.width
-                    text: modelData.key === "login" && root.status.autologin === true
+                    text: root.webcam && modelData.key === "lock"
+                      ? "Unlock with your face and a few head turns"
+                      : root.webcam
+                      ? "Needs an IR camera; a regular webcam only unlocks the lock screen"
+                      : modelData.key === "login" && root.status.autologin === true
                       ? "SDDM signs you in automatically, so the login screen does not show"
                       : modelData.detail
                     color: root.foreground
@@ -420,9 +430,10 @@ Item {
                   id: placeSwitch
                   anchors.right: parent.right
                   anchors.verticalCenter: parent.verticalCenter
-                  checked: root.places[modelData.key] === true
+                  checked: root.places[modelData.key] === true && (!root.webcam || modelData.key === "lock")
                   busy: actionProc.running
                   interactive: root.status.installed === true && !actionProc.running
+                    && (!root.webcam || modelData.key === "lock")
                   foreground: root.foreground
                   accent: root.accent
                   onToggled: root.run([checked ? "disable" : "enable", modelData.key],
@@ -432,6 +443,51 @@ Item {
             }
 
             Item {
+              width: parent.width
+              height: Math.max(webcamText.implicitHeight, webcamSwitch.implicitHeight)
+
+              Column {
+                id: webcamText
+                anchors.left: parent.left
+                anchors.right: webcamSwitch.left
+                anchors.rightMargin: Style.space(10)
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.space(1)
+                Text {
+                  text: "Use the webcam if there is no IR camera"
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                }
+                Text {
+                  width: parent.width
+                  text: root.webcam
+                    ? "In use: this laptop has no IR camera. Every unlock asks for a few random head turns; three failed tries and it waits for your password. Off turns Face ID off"
+                    : "Lock screen only, with a head-turn check. Not used while the IR camera works"
+                  color: root.foreground
+                  opacity: 0.5
+                  wrapMode: Text.WordWrap
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+              }
+
+              ToggleSwitch {
+                id: webcamSwitch
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                checked: root.status.rgbFallback === true
+                busy: actionProc.running
+                interactive: root.status.installed === true && !actionProc.running
+                foreground: root.foreground
+                accent: root.accent
+                onToggled: root.run(["set", "rgb_fallback", checked ? "off" : "on"],
+                  "Webcam " + (checked ? "off" : "on"))
+              }
+            }
+
+            Item {
+              visible: !root.webcam
               width: parent.width
               height: Math.max(attentionText.implicitHeight, attentionSwitch.implicitHeight)
 
@@ -474,6 +530,7 @@ Item {
             }
 
             Item {
+              visible: !root.webcam
               width: parent.width
               height: Math.max(confirmText.implicitHeight, confirmSwitch.implicitHeight)
 
@@ -592,6 +649,7 @@ Item {
                   }
                   Text {
                     text: String(modelData.created || "").replace("T", "  ").slice(0, 17)
+                      + (modelData.kind === "rgb" ? "  ·  webcam" : "")
                     color: root.foreground
                     opacity: 0.5
                     font.family: root.fontFamily

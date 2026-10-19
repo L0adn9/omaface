@@ -13,6 +13,7 @@
 #include <opencv2/core.hpp>
 #include <opencv2/core/ocl.hpp>
 #include <opencv2/core/utils/logger.hpp>
+#include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/objdetect/face.hpp>
 
@@ -22,6 +23,7 @@
 #include <pwd.h>
 #include <signal.h>
 #include <sys/file.h>
+#include <sys/random.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -50,8 +52,15 @@ namespace {
 #define FACEID_CONFIG "/etc/faceid/config"
 #endif
 const char* kConfigPath = FACEID_CONFIG;
-const char* kDataDir = "/var/lib/faceid";
-const char* kRunDir = "/run/faceid";
+// Overridable so a development build can run against scratch directories.
+#ifndef FACEID_DATA_DIR
+#define FACEID_DATA_DIR "/var/lib/faceid"
+#endif
+#ifndef FACEID_RUN_DIR
+#define FACEID_RUN_DIR "/run/faceid"
+#endif
+const char* kDataDir = FACEID_DATA_DIR;
+const char* kRunDir = FACEID_RUN_DIR;
 #ifndef FACEID_MODEL_DIR
 #define FACEID_MODEL_DIR "/usr/local/share/faceid/models"
 #endif
@@ -60,6 +69,7 @@ const char* kRecognizerModel = FACEID_MODEL_DIR "/face_recognition_sface_2021dec
 
 const int kMaxAppearances = 3;
 const int kLockoutFailures = 5;
+const int kLockoutFailuresRgb = 3;  // a webcam is easier to fool; fewer tries
 const int kLockoutSeconds = 300;
 const int kFeatureSize = 128;
 
@@ -87,6 +97,8 @@ struct Config {
   bool attention = true;
   bool confirm = true;          // sudo and polkit wait for the person to choose Face ID
   double timeoutChoose = 30.0;
+  bool rgbFallback = false;     // no IR camera: use the regular webcam, with a head-turn check
+  double thresholdRgb = 0.55;  // webcam genuine scores measured 0.78-0.88
 };
 
 bool parseBool(const std::string& v, bool fallback) {
@@ -119,6 +131,8 @@ Config loadConfig() {
       else if (k == "threshold") c.threshold = std::clamp(std::stod(v), 0.30, 0.95);
       else if (k == "attention") c.attention = parseBool(v, true);
       else if (k == "confirm") c.confirm = parseBool(v, true);
+      else if (k == "rgb_fallback") c.rgbFallback = parseBool(v, false);
+      else if (k == "threshold_rgb") c.thresholdRgb = std::clamp(std::stod(v), 0.30, 0.95);
       else if (k == "timeout_choose") c.timeoutChoose = std::clamp(std::stod(v), 5.0, 120.0);
       else if (k == "match_frames") c.matchFrames = std::clamp(std::stoi(v), 1, 5);
       else if (k == "timeout_sudo") c.timeoutSudo = std::clamp(std::stod(v), 1.0, 15.0);
@@ -141,6 +155,7 @@ struct CameraInfo {
   uint32_t fourcc = 0;
   uint32_t width = 0, height = 0;
   int score = 0;  // higher = more certainly the IR camera
+  bool ir = true; // false: a regular colour webcam (see rgb_fallback)
 };
 
 bool xioctl(int fd, unsigned long req, void* arg) {
@@ -194,9 +209,11 @@ void pickSize(int fd, uint32_t fourcc, uint32_t& w, uint32_t& h) {
 
 // IR cameras deliver greyscale (GREY, or Y16 on some). A few deliver YUYV,
 // like ordinary colour webcams; those only count when the name says IR,
-// because a colour camera can be fooled by a photo. `forced` (device= in the
-// config) accepts any capture device and leaves that choice to the user.
-bool inspectDevice(const std::string& path, CameraInfo& out, bool forced = false) {
+// because a colour camera can be fooled by a photo. `colour` also accepts a
+// regular webcam (YUYV or MJPG) as a non-IR camera: the rgb_fallback, which
+// adds a head-turn check against photos. `forced` (device= in the config)
+// accepts any capture device.
+bool inspectDevice(const std::string& path, CameraInfo& out, bool forced = false, bool colour = false) {
   int fd = ::open(path.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
   if (fd < 0) return false;
   bool ok = false;
@@ -204,13 +221,14 @@ bool inspectDevice(const std::string& path, CameraInfo& out, bool forced = false
   if (xioctl(fd, VIDIOC_QUERYCAP, &cap)) {
     uint32_t caps = (cap.capabilities & V4L2_CAP_DEVICE_CAPS) ? cap.device_caps : cap.capabilities;
     if ((caps & V4L2_CAP_VIDEO_CAPTURE) && (caps & V4L2_CAP_STREAMING)) {
-      bool grey = false, y16 = false, yuyv = false;
+      bool grey = false, y16 = false, yuyv = false, mjpg = false;
       v4l2_fmtdesc fmt{};
       fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
       for (fmt.index = 0; xioctl(fd, VIDIOC_ENUM_FMT, &fmt); fmt.index++) {
         if (fmt.pixelformat == V4L2_PIX_FMT_GREY) grey = true;
         else if (fmt.pixelformat == V4L2_PIX_FMT_Y16) y16 = true;
         else if (fmt.pixelformat == V4L2_PIX_FMT_YUYV) yuyv = true;
+        else if (fmt.pixelformat == V4L2_PIX_FMT_MJPEG) mjpg = true;
       }
       std::string card = reinterpret_cast<const char*>(cap.card);
       // uvcvideo names nodes "<product>: <stream>"; the stream part is the
@@ -218,9 +236,11 @@ bool inspectDevice(const std::string& path, CameraInfo& out, bool forced = false
       size_t colon = card.rfind(':');
       bool irStream = hasIrWord(colon == std::string::npos ? card : card.substr(colon + 1));
       bool irProduct = colon != std::string::npos && hasIrWord(card.substr(0, colon));
+      out.ir = grey || y16 || (yuyv && (irStream || irProduct));
       out.fourcc = grey ? V4L2_PIX_FMT_GREY
                  : y16 ? V4L2_PIX_FMT_Y16
-                 : (yuyv && (irStream || irProduct || forced)) ? V4L2_PIX_FMT_YUYV : 0;
+                 : (yuyv && out.ir) ? V4L2_PIX_FMT_YUYV
+                 : (forced || colour) ? (yuyv ? V4L2_PIX_FMT_YUYV : mjpg ? V4L2_PIX_FMT_MJPEG : 0) : 0;
       if (out.fourcc) {
         out.path = path;
         out.card = card;
@@ -243,7 +263,12 @@ bool findCamera(const Config& cfg, CameraInfo& out) {
     if (!any || info.score > out.score) out = info;
     any = true;
   }
-  return any;
+  if (any || !cfg.rgbFallback) return any;
+  // No IR camera, and the person chose the regular webcam: the first one
+  // (the built-in camera comes first on laptops).
+  for (int i = 0; i < 64; i++)
+    if (inspectDevice("/dev/video" + std::to_string(i), out, false, true)) return true;
+  return false;
 }
 
 class Camera {
@@ -265,6 +290,7 @@ class Camera {
       return false;
     }
     fourcc_ = info.fourcc;
+    ir_ = info.ir;
     width_ = fmt.fmt.pix.width;
     height_ = fmt.fmt.pix.height;
     uint32_t bpp = fourcc_ == V4L2_PIX_FMT_GREY ? 1 : 2;
@@ -298,8 +324,10 @@ class Camera {
     return true;
   }
 
-  // Returns false on timeout or error.
-  bool grab(cv::Mat& out, int timeoutMs) {
+  // Returns false on timeout or error. `out` is always greyscale; `colour`,
+  // when asked for, is the BGR frame the face models take (an IR frame is
+  // simply repeated in all three channels).
+  bool grab(cv::Mat& out, int timeoutMs, cv::Mat* colour = nullptr) {
     pollfd p{fd_, POLLIN, 0};
     int r;
     do r = poll(&p, 1, timeoutMs); while (r < 0 && errno == EINTR);
@@ -309,10 +337,22 @@ class Camera {
     buf.memory = V4L2_MEMORY_MMAP;
     if (!xioctl(fd_, VIDIOC_DQBUF, &buf)) return false;
     uint32_t bpp = fourcc_ == V4L2_PIX_FMT_GREY ? 1 : 2;
-    bool ok = buf.bytesused >= stride_ * (height_ - 1) + width_ * bpp;
+    bool ok = fourcc_ == V4L2_PIX_FMT_MJPEG ? buf.bytesused > 0 : buf.bytesused >= stride_ * (height_ - 1) + width_ * bpp;
     if (ok) {
       void* data = buffers_[buf.index].first;
-      if (fourcc_ == V4L2_PIX_FMT_GREY) {
+      if (!ir_ && fourcc_ == V4L2_PIX_FMT_MJPEG) {
+        cv::Mat bgr = cv::imdecode(cv::Mat(1, (int)buf.bytesused, CV_8UC1, data), cv::IMREAD_COLOR);
+        ok = !bgr.empty();
+        if (ok) {
+          cv::cvtColor(bgr, out, cv::COLOR_BGR2GRAY);
+          if (colour) *colour = bgr;
+        }
+      } else if (!ir_) {
+        cv::Mat bgr;
+        cv::cvtColor(cv::Mat(height_, width_, CV_8UC2, data, stride_), bgr, cv::COLOR_YUV2BGR_YUYV);
+        cv::cvtColor(bgr, out, cv::COLOR_BGR2GRAY);
+        if (colour) *colour = bgr;
+      } else if (fourcc_ == V4L2_PIX_FMT_GREY) {
         cv::Mat(height_, width_, CV_8UC1, data, stride_).copyTo(out);
       } else if (fourcc_ == V4L2_PIX_FMT_YUYV) {
         cv::extractChannel(cv::Mat(height_, width_, CV_8UC2, data, stride_), out, 0);
@@ -326,12 +366,14 @@ class Camera {
         y16Bits_ = std::max(y16Bits_, bits);
         wide.convertTo(out, CV_8U, 255.0 / ((1 << y16Bits_) - 1));
       }
+      if (ok && ir_ && colour) cv::cvtColor(out, *colour, cv::COLOR_GRAY2BGR);
     }
     xioctl(fd_, VIDIOC_QBUF, &buf);
     return ok;
   }
 
   uint32_t width() const { return width_; }
+  bool ir() const { return ir_; }
 
   void close() {
     if (fd_ < 0) return;
@@ -350,6 +392,7 @@ class Camera {
   int fd_ = -1;
   bool streaming_ = false;
   uint32_t fourcc_ = V4L2_PIX_FMT_GREY;
+  bool ir_ = true;
   int y16Bits_ = 10;
   uint32_t width_ = 0, height_ = 0, stride_ = 0;
   std::vector<std::pair<void*, size_t>> buffers_;
@@ -380,6 +423,13 @@ class DarkFrameFilter {
  private:
   double litLevel_ = 0;
 };
+
+// An IR frame between the emitter's flashes, or a webcam frame too dark to
+// show a face (lens covered, lights off).
+bool unusable(const Camera& cam, DarkFrameFilter& filter, const cv::Mat& grey) {
+  if (cam.ir()) return filter.isDark(grey);
+  return cv::mean(grey)[0] < 12.0;
+}
 
 // ------------------------------------------------------------------ models
 
@@ -449,6 +499,7 @@ struct Appearance {
   float eyeArea = 0;
   float headYaw = 0;  // head pose while looking straight at the screen
   float headPitch = 0;
+  std::string kind = "ir";  // the camera it was enrolled with: "ir" or "rgb"
 };
 
 std::string userDir(const std::string& user) { return std::string(kDataDir) + "/" + user; }
@@ -470,6 +521,9 @@ std::vector<Appearance> loadGallery(const std::string& user) {
       (*it)["eye_area"] >> a.eyeArea;
       (*it)["head_yaw"] >> a.headYaw;
       (*it)["head_pitch"] >> a.headPitch;
+      std::string kind;
+      (*it)["kind"] >> kind;
+      if (kind == "rgb") a.kind = kind;
       if (a.features.empty() || a.features.cols != kFeatureSize || a.features.type() != CV_32F) continue;
       out.push_back(a);
     }
@@ -487,7 +541,9 @@ bool saveGallery(const std::string& user, const std::vector<Appearance>& gallery
   mkdir(dir.c_str(), 0750);
   // root owns the template so a process running as the user cannot swap in
   // someone else's face; the user's group may read it for the lock screen.
-  if (chown(dir.c_str(), 0, pw->pw_gid) != 0 || chmod(dir.c_str(), 0750) != 0) {
+  // (Only root can hand the files to root; a development build running as
+  // the user keeps them its own.)
+  if ((geteuid() == 0 && chown(dir.c_str(), 0, pw->pw_gid) != 0) || chmod(dir.c_str(), 0750) != 0) {
     err = "cannot set data directory permissions";
     return false;
   }
@@ -498,7 +554,7 @@ bool saveGallery(const std::string& user, const std::vector<Appearance>& gallery
     fs << "version" << 1;
     fs << "appearances" << "[";
     for (auto& a : gallery)
-      fs << "{" << "name" << a.name << "created" << a.created << "eye_ring" << a.eyeRing
+      fs << "{" << "name" << a.name << "created" << a.created << "kind" << a.kind << "eye_ring" << a.eyeRing
          << "eye_area" << a.eyeArea << "head_yaw" << a.headYaw << "head_pitch" << a.headPitch
          << "features" << a.features << "}";
     fs << "]";
@@ -507,7 +563,7 @@ bool saveGallery(const std::string& user, const std::vector<Appearance>& gallery
     err = e.what();
     return false;
   }
-  if (chown(tmp.c_str(), 0, pw->pw_gid) != 0 || chmod(tmp.c_str(), 0640) != 0 ||
+  if ((geteuid() == 0 && chown(tmp.c_str(), 0, pw->pw_gid) != 0) || chmod(tmp.c_str(), 0640) != 0 ||
       rename(tmp.c_str(), galleryPath(user).c_str()) != 0) {
     unlink(tmp.c_str());
     err = "cannot install gallery";
@@ -665,14 +721,20 @@ bool hasActiveLocalSession(uid_t uid) {
 std::string failPath(uid_t uid) { return std::string(kRunDir) + "/fail-" + std::to_string(uid); }
 
 // Consecutive "a face was seen and it was not you" results.
-struct Failures { int count = 0; time_t last = 0; };
+// Rejected faces, per user. IR strikes wear off after kLockoutSeconds.
+// Webcam strikes are sticky: once paused, Face ID stays off until the
+// password is used (RESET from the lock screen) or the machine restarts,
+// so a photo or video gets three tries, not three every five minutes.
+struct Failures { int count = 0; time_t last = 0; bool sticky = false; };
 
 Failures readFailures(uid_t uid) {
   Failures f;
   std::ifstream in(failPath(uid));
+  int sticky = 0;
   in >> f.count >> f.last;
-  if (!in) f = Failures{};
-  if (f.last && time(nullptr) - f.last > kLockoutSeconds) f = Failures{};
+  if (!in) return Failures{};
+  if (in >> sticky) f.sticky = sticky != 0;
+  if (!f.sticky && f.last && time(nullptr) - f.last > kLockoutSeconds) f = Failures{};
   return f;
 }
 
@@ -680,7 +742,7 @@ void writeFailures(uid_t uid, const Failures& f) {
   std::string path = failPath(uid);
   if (f.count == 0) { unlink(path.c_str()); return; }
   std::ofstream out(path, std::ios::trunc);
-  out << f.count << " " << f.last << "\n";
+  out << f.count << " " << f.last << " " << (f.sticky ? 1 : 0) << "\n";
 }
 
 // Live state for the lock screen and polkit dialog animation. World-readable,
@@ -740,6 +802,160 @@ int finish(const std::string& result) {
   return result == "ok" ? 0 : 1;
 }
 
+// ------------------------------------------------------------------ webcam liveness
+
+cv::Rect2f faceBox(const Face& f) {
+  const float* p = f.row.ptr<float>();
+  return {p[0], p[1], p[2], p[3]};
+}
+
+// A regular webcam cannot tell a face from a photo or a video of it, so the
+// webcam mode asks the head to follow a random sequence: three moves, each
+// to a random one of the two places it is not (from facing the camera: left
+// or right; from a side: the other side or back), then back to facing the
+// camera, where the face must still match. Each move is asked after a short
+// random pause and must be finished within two seconds, but not so fast that
+// it was anticipated.
+//
+// A real head turning moves the nose sideways against the eyes; a photo or a
+// screen tilted the same way keeps the nose between the eyes (it is flat),
+// so it never registers as a turn. A recording cannot follow a sequence it
+// does not know: a clip turning one way fails at the first other move, and a
+// blind guess at three moves is right one time in eight. Every frame must
+// keep showing the same single face. Measured on a laptop webcam: facing yaw
+// ~ -0.06, turned left ~ +0.25, turned right ~ -0.47.
+//
+// Returns "ok"; "unsettled" when the person never faced the camera long
+// enough to be asked (an ordinary timeout); or a failure that counts toward
+// the lockout: "wrong" (moved somewhere else), "slow" (asked, no answer),
+// "early" (answered before it could have been read), "lost" (face gone or
+// swapped), "identity" (the face back at the camera is not a match).
+// "gone": the client left.
+std::string headTurnChallenge(Camera& cam, FaceModels& models, const std::vector<Appearance>& gallery,
+                              double threshold, int minFace, const std::string& key,
+                              long seq, const Face& matched) {
+  const float kTurn = 0.18f, kWrong = 0.25f, kCentre = 0.15f;
+  const double kSettle = 5.0, kAnswer = 2.5, kTooFast = 0.15, kLost = 1.0;
+  cv::Rect2f last = faceBox(matched);
+  auto lastSeen = Clock::now();
+  DarkFrameFilter unusedFilter;
+  cv::Mat grey, bgr;
+
+  // One frame: 1 = a face to judge, 0 = nothing usable yet, -1 = lost or
+  // swapped, -2 = the client went away, -3 = more than one face in view.
+  auto next = [&](Face& f) -> int {
+    if (clientGone()) return -2;
+    if (secondsSince(lastSeen) > kLost) return -1;
+    if (!cam.grab(grey, 500, &bgr) || unusable(cam, unusedFilter, grey)) return 0;
+    int count = 0;
+    if (!models.detect(bgr, f, &count) || f.width < minFace * 0.8f) return 0;
+    if (count > 1) return -3;
+    cv::Rect2f b = faceBox(f);
+    float jump = std::hypot(b.x + b.width / 2 - (last.x + last.width / 2), b.y + b.height / 2 - (last.y + last.height / 2));
+    if (jump > 0.35f * last.width) return -1;
+    last = b;
+    lastSeen = Clock::now();
+    return 1;
+  };
+
+  // Places: 0 = facing the camera, +1 = turned left, -1 = turned right
+  // (relative to y0, the person's left is positive).
+  float y0 = headPose(matched).x;
+  auto at = [&](float d, int place) {
+    return place == 0 ? std::fabs(d) <= kCentre : (place > 0 ? d >= kTurn : d <= -kTurn);
+  };
+
+  // Settle: facing the camera for a random pause before the first ask.
+  // Looking away restarts the pause; never settling is no failure.
+  {
+    unsigned char rnd;
+    if (getrandom(&rnd, 1, 0) != 1) return "lost";
+    const double pause = 0.4 + rnd / 255.0 * 0.6;
+    const float yMatched = y0;
+    auto settleStart = Clock::now(), facingSince = Clock::now();
+    float lastYaw = 0;
+    int facing = 0;
+    Face f;
+    while (true) {
+      if (secondsSince(settleStart) > kSettle) {
+        fprintf(stderr, "faceid: head-turn check: not facing the camera (yaw %.2f, expected %.2f)\n", lastYaw, yMatched);
+        return "unsettled";
+      }
+      int r = next(f);
+      if (r == -2) return "gone";
+      if (r == -3) return "crowd";
+      if (r == -1) return "lost";
+      if (r != 1) continue;
+      lastYaw = headPose(f).x;
+      if (std::fabs(lastYaw - yMatched) > kCentre) { facing = 0; continue; }
+      if (facing == 0) facingSince = Clock::now();
+      y0 = facing == 0 ? lastYaw : y0 * 0.8f + lastYaw * 0.2f;
+      if (++facing >= 3 && secondsSince(facingSince) >= pause) break;
+    }
+  }
+
+  unsigned char rnd[8];
+  if (getrandom(rnd, sizeof rnd, 0) != (ssize_t)sizeof rnd) return "lost";
+  int place = 0;
+  Face home;
+  cv::Mat homeFrame;
+  const int kMoves = 3;
+  for (int step = 0; step <= kMoves; step++) {
+    // The two places it is not, picked at random; the last step is home.
+    int target;
+    if (step == kMoves) target = 0;
+    else if (place == 0) target = (rnd[step] & 1) ? 1 : -1;
+    else target = (rnd[step] & 1) ? -place : 0;
+    if (step == kMoves && place == 0) break;  // already home
+
+    // A short random pause, holding the current place, before asking.
+    const double pause = 0.15 + rnd[4 + step % 4] / 255.0 * 0.3;
+    auto holdSince = Clock::now(), holdStart = Clock::now();
+    Face f;
+    while (secondsSince(holdSince) < pause) {
+      if (secondsSince(holdStart) > kAnswer + pause) return "slow";
+      int r = next(f);
+      if (r == -2) return "gone";
+      if (r == -3) return "crowd";
+      if (r == -1) return "lost";
+      if (r == 1 && !at(headPose(f).x - y0, place)) holdSince = Clock::now();
+    }
+
+    const char* ask = target == 0 ? "turn-back" : (target > 0 ? "turn-left" : "turn-right");
+    writeStatus(key, ask, seq);
+    sendLine(std::string("STATUS ") + ask);
+    auto asked = Clock::now();
+    while (true) {
+      if (secondsSince(asked) > kAnswer) return "slow";
+      int r = next(f);
+      if (r == -2) return "gone";
+      if (r == -3) return "crowd";
+      if (r == -1) return "lost";
+      if (r != 1) continue;
+      float d = headPose(f).x - y0;
+      if (at(d, target)) {
+        if (secondsSince(asked) < kTooFast) return "early";
+        break;
+      }
+      // Somewhere it was not asked to go: from facing the camera, the other
+      // side; on the way home, past it to the other side. (Crossing from one
+      // side to the other starts on the far side, so there it only times out.)
+      int away = place == 0 ? -target : (target == 0 ? -place : 0);
+      if ((away > 0 && d >= kWrong) || (away < 0 && d <= -kWrong)) return "wrong";
+    }
+    place = target;
+    if (place == 0) {
+      home = f;
+      bgr.copyTo(homeFrame);
+    }
+  }
+  // The sequence always ends facing the camera; the face that arrived there
+  // must still be the enrolled one.
+  if (bestScore(gallery, models.feature(homeFrame, home)) < threshold) return "identity";
+  writeStatus(key, "scanning", seq);
+  return "ok";
+}
+
 std::string choicePath(uid_t uid) { return std::string(kRunDir) + "/choice-" + std::to_string(uid); }
 
 // sudo and system prompts approve something, so looking at the screen must
@@ -774,6 +990,17 @@ std::string awaitChoice(const std::string& key, uid_t uid, long seq, double time
   return "timeout";
 }
 
+// RESET, from the lock screen after the password unlocked it: the person is
+// back, so earlier rejected scans no longer count.
+int resetStrikes() {
+  ucred cred{};
+  socklen_t len = sizeof cred;
+  if (getsockopt(STDIN_FILENO, SOL_SOCKET, SO_PEERCRED, &cred, &len) != 0) return finish("error no-peer");
+  if (!hasActiveLocalSession(cred.uid)) return finish("denied no-local-session");
+  writeFailures(cred.uid, Failures{});
+  return finish("ok");
+}
+
 // CHOOSE face|password, from the polkit dialog running as the person.
 int choose(const std::string& choice) {
   if (choice != "face" && choice != "password") return finish("error bad-request");
@@ -801,6 +1028,7 @@ int serve() {
   Request req;
   ss >> verb >> req.user >> req.service;
   if (verb == "CHOOSE") return choose(req.user);
+  if (verb == "RESET") return resetStrikes();
   if (verb != "VERIFY" || req.user.empty() || req.service.empty()) return finish("error bad-request");
 
   // The peer may only ask about itself, unless it is root (sudo, polkit).
@@ -827,7 +1055,22 @@ int serve() {
   if ((key == "sudo" || key == "polkit" || key == "login") && cred.uid != 0) return finish("denied peer");
   if (!enabled) return finish("disabled");
 
+  // Which camera decides the rules. A regular webcam (rgb_fallback, no IR
+  // camera) is for the lock screen only: a photo or a screen fools it far
+  // more easily, so approving sudo, system prompts or a login stays with an
+  // IR camera or the password. Appearances only match the kind of camera
+  // they were enrolled with.
+  CameraInfo info;
+  bool haveCamera = findCamera(cfg, info);
+  const bool rgb = haveCamera && !info.ir;
+  if (rgb && key != "lock" && key != "test") return finish("unavailable rgb-lock-only");
+  const double threshold = rgb ? cfg.thresholdRgb : cfg.threshold;
+  const int lockoutAt = rgb ? kLockoutFailuresRgb : kLockoutFailures;
+
   auto gallery = loadGallery(req.user);
+  gallery.erase(std::remove_if(gallery.begin(), gallery.end(),
+                               [&](const Appearance& a) { return (a.kind == "rgb") != rgb; }),
+                gallery.end());
   // The self-test still runs the camera and models with nothing enrolled, so
   // a fresh install can be checked end to end before the first enrollment.
   if (gallery.empty() && !test) return finish("unavailable not-enrolled");
@@ -837,7 +1080,7 @@ int serve() {
   if (needsSeat && !hasActiveLocalSession((uid_t)-1)) return finish("unavailable no-local-seat");
 
   Failures fails = readFailures(uid);
-  if (!test && fails.count >= kLockoutFailures) return finish("locked-out");
+  if (!test && fails.count >= lockoutAt) return finish("locked-out");
 
   long seq = (long)time(nullptr) * 1000 + getpid() % 1000;
   if ((key == "sudo" || key == "polkit") && cfg.confirm) {
@@ -857,8 +1100,7 @@ int serve() {
   }
   if (!haveLock) return finish("busy");
 
-  CameraInfo info;
-  if (!findCamera(cfg, info)) { writeStatus(key, "unavailable", 0); return finish("unavailable no-camera"); }
+  if (!haveCamera) { writeStatus(key, "unavailable", 0); return finish("unavailable no-camera"); }
 
   FaceModels models;
   std::string err;
@@ -883,9 +1125,8 @@ int serve() {
   DarkFrameFilter darkFilter;
   while (secondsSince(start) < timeout) {
     if (clientGone()) { writeStatus(key, "idle", seq); return 1; }
-    if (!cam.grab(grey, 500)) continue;
-    if (darkFilter.isDark(grey)) continue;
-    cv::cvtColor(grey, bgr, cv::COLOR_GRAY2BGR);
+    if (!cam.grab(grey, 500, &bgr)) continue;
+    if (unusable(cam, darkFilter, grey)) continue;
     Face face;
     if (!models.detect(bgr, face) || face.width < minFace) {
       matches = 0;
@@ -902,20 +1143,44 @@ int serve() {
     size_t which = 0;
     double score = bestScore(gallery, models.feature(bgr, face), &which);
     std::string attention = "off";
-    if (cfg.attention && (score >= cfg.threshold || test)) attention = attentionCheck(grey, face, gallery[which]);
+    if (cfg.attention && cam.ir() && (score >= threshold || test)) attention = attentionCheck(grey, face, gallery[which]);
     if (test) {
       char b[128];
       snprintf(b, sizeof b, "SCORE %.3f width %.0f attention %s", score, face.width, attention.c_str());
       sendLine(b);
     }
-    if (score >= cfg.threshold && attention != "off" && attention != "ok") {
+    if (score >= threshold && attention != "off" && attention != "ok") {
       // Your face, but asleep or looking elsewhere: not a match, and not a
       // stranger either, so it never counts toward the lockout.
       matches = 0;
       inattentive++;
       if (lastStatus != "attention") { sendLine("STATUS attention"); lastStatus = "attention"; }
-    } else if (score >= cfg.threshold) {
+    } else if (score >= threshold) {
       if (++matches >= cfg.matchFrames) {
+        if (rgb) {
+          std::string live = headTurnChallenge(cam, models, gallery, threshold, minFace, key, seq, face);
+          if (live == "gone") { writeStatus(key, "idle", seq); return 1; }
+          if (live == "unsettled" || live == "crowd") {
+            // Never faced the camera long enough to be asked, or someone
+            // else came into view: no strike, just no unlock.
+            cam.close();
+            writeStatus(key, "timeout", seq);
+            return finish("timeout " + live);
+          }
+          if (live != "ok") {
+            // Not a stranger necessarily, but not proven live either: it
+            // counts, so a photo or a recording gets three tries at most.
+            cam.close();
+            writeStatus(key, "failure", seq);
+            if (!test) {
+              fails.count++;
+              fails.last = time(nullptr);
+              fails.sticky = true;
+              writeFailures(uid, fails);
+            }
+            return finish("fail liveness " + live);
+          }
+        }
         cam.close();
         writeStatus(key, "success", seq);
         if (!test) writeFailures(uid, Failures{});
@@ -940,6 +1205,7 @@ int serve() {
     if (!test) {
       fails.count++;
       fails.last = time(nullptr);
+      fails.sticky = fails.sticky || rgb;
       writeFailures(uid, fails);
     }
     return finish("fail");
@@ -1070,7 +1336,9 @@ bool writeAllUi(const std::string& line) {
 }
 
 int enroll(const std::string& user, const std::string& name, bool ui) {
+#ifndef FACEID_DEV
   if (geteuid() != 0) { fprintf(stderr, "faceid-engine: enroll must run as root\n"); return 2; }
+#endif
   passwd* pw = getpwnam(user.c_str());
   if (!pw) { fprintf(stderr, "faceid-engine: unknown user %s\n", user.c_str()); return 2; }
 
@@ -1120,6 +1388,7 @@ int enroll(const std::string& user, const std::string& name, bool ui) {
   bool frontalSeen = false;
   auto frontalStart = Clock::now();
   auto eyesOpenNow = [&](const cv::Mat& frame, const Face& f) {
+    if (!cam.ir()) return true;  // the pupil glow needs the IR light
     EyeReading r, l;
     readEyes(frame, f, r, l);
     if (!frontalSeen) { frontalSeen = true; frontalStart = Clock::now(); }
@@ -1142,9 +1411,8 @@ int enroll(const std::string& user, const std::string& name, bool ui) {
 
   while (!gStop && secondsSince(start) < limit) {
     if (ui && uiCallerGone()) { gStop = 1; break; }
-    if (!cam.grab(grey, 500)) continue;
-    if (darkFilter.isDark(grey)) continue;
-    cv::cvtColor(grey, bgr, cv::COLOR_GRAY2BGR);
+    if (!cam.grab(grey, 500, &bgr)) continue;
+    if (unusable(cam, darkFilter, grey)) continue;
     Face face;
     int count = 0;
     bool got = models.detect(bgr, face, &count);
@@ -1226,6 +1494,7 @@ int enroll(const std::string& user, const std::string& name, bool ui) {
   a.name = cleanName(name);
   if (a.name.empty()) a.name = gallery.empty() ? "Face" : "Appearance " + std::to_string(gallery.size() + 1);
   a.created = nowIso();
+  a.kind = cam.ir() ? "ir" : "rgb";
   if (eyeRings.size() >= 3) {
     auto median = [](std::vector<float> v) {
       std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
@@ -1270,10 +1539,9 @@ int calib(double seconds) {
   double firstFace = -1;
   std::vector<double> scores;
   while (secondsSince(t0) < seconds) {
-    if (!cam.grab(grey, 500)) continue;
-    if (darkFilter.isDark(grey)) { dark++; continue; }
+    if (!cam.grab(grey, 500, &bgr)) continue;
+    if (unusable(cam, darkFilter, grey)) { dark++; continue; }
     lit++;
-    cv::cvtColor(grey, bgr, cv::COLOR_GRAY2BGR);
     auto td = Clock::now();
     Face f;
     if (!models.detect(bgr, f)) continue;
@@ -1303,8 +1571,9 @@ int listAppearances(const std::string& user) {
   auto gallery = loadGallery(user);
   printf("[");
   for (size_t i = 0; i < gallery.size(); i++)
-    printf("%s{\"name\":\"%s\",\"created\":\"%s\",\"samples\":%d}", i ? "," : "",
-           jsonEscape(gallery[i].name).c_str(), jsonEscape(gallery[i].created).c_str(), gallery[i].features.rows);
+    printf("%s{\"name\":\"%s\",\"created\":\"%s\",\"kind\":\"%s\",\"samples\":%d}", i ? "," : "",
+           jsonEscape(gallery[i].name).c_str(), jsonEscape(gallery[i].created).c_str(), gallery[i].kind.c_str(),
+           gallery[i].features.rows);
   printf("]\n");
   return 0;
 }
@@ -1377,12 +1646,15 @@ int selftest() {
   return 0;
 }
 
-int probe() {
+// probe webcam: also report a regular webcam when there is no IR camera (the
+// installer asks before using one).
+int probe(bool webcam) {
   Config cfg = loadConfig();
+  if (webcam) cfg.rgbFallback = true;
   CameraInfo info;
   if (!findCamera(cfg, info)) { printf("none\n"); return 1; }
-  printf("%s\t%s\t%ux%u\t%s\n", info.path.c_str(), info.card.c_str(), info.width, info.height,
-         fourccName(info.fourcc).c_str());
+  printf("%s\t%s\t%ux%u\t%s\t%s\n", info.path.c_str(), info.card.c_str(), info.width, info.height,
+         fourccName(info.fourcc).c_str(), info.ir ? "ir" : "webcam");
   return 0;
 }
 
@@ -1482,7 +1754,7 @@ int main(int argc, char** argv) {
 
   std::string mode = argc > 1 ? argv[1] : "";
   if (mode == "serve") return serve();
-  if (mode == "probe") return probe();
+  if (mode == "probe") return probe(argc > 2 && std::string(argv[2]) == "webcam");
   if (mode == "selftest") return selftest();
   if (mode == "list" && argc > 2) return listAppearances(argv[2]);
   if (mode == "cameras") return listCameras();

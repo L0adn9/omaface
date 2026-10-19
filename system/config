@@ -30,5 +30,10 @@ timeout_polkit=5
 timeout_lock=6
 timeout_login=6
 
+# Regular webcam, for laptops without an IR camera (the installer asks):
+# lock screen only, with a random head-turn check on every unlock.
+rgb_fallback=off
+threshold_rgb=0.55
+
 # IR camera: auto picks the greyscale camera named "IR".
 device=auto

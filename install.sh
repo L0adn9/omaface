@@ -67,17 +67,38 @@ trap 'rm -rf "$build"' EXIT
 step "Building the engine"
 cp -a engine "$build/engine"
 make -C "$build/engine" -s clean all
+webcam=no
 if ! cam=$("$build/engine/faceid-engine" probe); then
-  echo "  Cameras on this machine:" >&2
-  "$build/engine/faceid-engine" cameras 2>/dev/null | sed 's/^/    /' >&2 || true
-  fail "no IR camera found. Face ID needs an infrared (Windows Hello) camera; a normal webcam can be fooled by a photo. If yours is listed above but not picked, set device=/dev/videoN in /etc/faceid/config after installing."
+  if ! cam=$("$build/engine/faceid-engine" probe webcam); then
+    echo "  Cameras on this machine:" >&2
+    "$build/engine/faceid-engine" cameras 2>/dev/null | sed 's/^/    /' >&2 || true
+    fail "no camera found. If yours is listed above but not picked, set device=/dev/videoN in /etc/faceid/config after installing."
+  fi
+  # Found automatically: no IR camera, so the regular webcam, with the limits
+  # that keep it safe. Nothing to decide here; Settings shows it too.
+  cat <<'EOF'
+  This laptop has no IR (Windows Hello) camera, so Face ID uses the regular
+  webcam, with limits that keep it safe:
+    - lock screen only: sudo, system prompts and the login screen keep
+      using your password
+    - every unlock asks for a few random head turns, so a photo or a video
+      of you is not enough
+    - three failed tries and it waits for your password
+EOF
+  webcam=yes
+  login=no
 fi
-echo "  IR camera: $(cut -f2 <<<"$cam") ($(cut -f1 <<<"$cam"), $(cut -f4 <<<"$cam") $(cut -f3 <<<"$cam"))"
+if [[ $webcam == yes ]]; then
+  echo "  Webcam: $(cut -f2 <<<"$cam") ($(cut -f1 <<<"$cam"), $(cut -f4 <<<"$cam") $(cut -f3 <<<"$cam")), lock screen only"
+else
+  echo "  IR camera: $(cut -f2 <<<"$cam") ($(cut -f1 <<<"$cam"), $(cut -f4 <<<"$cam") $(cut -f3 <<<"$cam"))"
+fi
 
 # Many laptops keep the IR light off until it is switched on once. Face ID
 # installs either way; this only says what to do about it.
-emitter=$("$build/engine/faceid-engine" emitter 2>/dev/null || true)
+emitter=$([[ $webcam == yes ]] && echo webcam || "$build/engine/faceid-engine" emitter 2>/dev/null || true)
 case $emitter in
+  webcam) ;;
   *'"pulsing"'* | *'"steady"'*) echo "  IR light: on" ;;
   *'"dark"'*)
     cat <<'EOF'
@@ -115,9 +136,9 @@ step "Installing system parts (root)"
 echo "  PAM: sudo, polkit$([[ $login == yes ]] && echo " and login") get one Face ID line above the password;"
 echo "       originals are backed up to /var/lib/faceid/pam-backup"
 if [[ -t 0 ]]; then
-  sudo bash "$REPO/system/install-root.sh" "$REPO" "$build" "$MODEL_CACHE" "$login"
+  sudo bash "$REPO/system/install-root.sh" "$REPO" "$build" "$MODEL_CACHE" "$login" "$webcam"
 else
-  pkexec /usr/bin/bash "$REPO/system/install-root.sh" "$REPO" "$build" "$MODEL_CACHE" "$login"
+  pkexec /usr/bin/bash "$REPO/system/install-root.sh" "$REPO" "$build" "$MODEL_CACHE" "$login" "$webcam"
 fi
 
 step "Installing the shell plugin"

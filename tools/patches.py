@@ -22,6 +22,7 @@ LOCK_SERVICE = [
   property double faceEndedAt: 0
   readonly property int faceMaxFailures: 5
   readonly property bool faceAvailable: faceConfigured && faceFailures < faceMaxFailures
+  property string faceLive: ""
 """,
     ),
     (
@@ -113,6 +114,7 @@ LOCK_SERVICE = [
         "        failedAttempts: root.failedAttempts\n        inputEnabled: root.lockRequested\n",
         """        failedAttempts: root.failedAttempts
         faceState: root.faceState
+        faceLive: root.faceLive
         faceAvailable: root.faceAvailable
         inputEnabled: root.lockRequested
 """,
@@ -186,6 +188,31 @@ LOCK_SERVICE = [
     path: "/run/faceid/status"
     blockLoading: true
     printErrors: false
+  }
+
+  // The webcam's head-turn check asks for moves while it scans; the lock
+  // view shows them as they come.
+  FileView {
+    path: "/run/faceid/status"
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: {
+      try {
+        var status = JSON.parse(String(text() || "{}"))
+        var state = String(status.state || "")
+        root.faceLive = status.service === "lock" && state.indexOf("turn-") === 0 ? state : ""
+      } catch (e) {
+        root.faceLive = ""
+      }
+    }
+  }
+
+  // After the password unlocks, earlier rejected scans no longer count
+  // (webcam strikes otherwise stay until then).
+  Process {
+    id: faceResetProc
+    command: ["bash", "-c", "[[ -x /usr/local/bin/faceid ]] && /usr/local/bin/faceid reset"]
   }
 
   Process {
@@ -265,6 +292,14 @@ LOCK_SERVICE = [
     target: "lock"
 """,
     ),
+    (
+        "      if (result === PamResult.Success) root.finishUnlock()\n      else root.handlePasswordFailure()\n",
+        """      if (result === PamResult.Success) {
+        if (!faceResetProc.running) faceResetProc.running = true
+        root.finishUnlock()
+      } else root.handlePasswordFailure()
+""",
+    ),
 ]
 
 LOCK_VIEW = [
@@ -273,6 +308,7 @@ LOCK_VIEW = [
         """  property string passwordText: ""
   property bool syncingPasswordText: false
   property string faceState: "idle"
+  property string faceLive: ""
   property bool faceAvailable: false
 """,
     ),
@@ -323,12 +359,15 @@ LOCK_VIEW = [
       anchors.horizontalCenter: faceTile.horizontalCenter
       anchors.bottom: faceTile.top
       anchors.bottomMargin: Math.round(root.fieldHeight * 0.25)
-      visible: faceTile.visible && (root.faceState === "scanning" || root.faceState === "attention")
-      text: root.faceState === "attention" ? "Open your eyes and look at the camera" : "Look at the camera"
+      visible: faceTile.visible && (root.faceLive !== "" || root.faceState === "scanning" || root.faceState === "attention")
+      text: root.faceLive === "turn-left" ? "\u2190  Turn your head left"
+        : root.faceLive === "turn-right" ? "Turn your head right  \u2192"
+        : root.faceLive === "turn-back" ? "Face the camera again"
+        : root.faceState === "attention" ? "Open your eyes and look at the camera" : "Look at the camera"
       color: Commons.Color.lock.text
-      opacity: 0.7
+      opacity: root.faceLive !== "" ? 1 : 0.7
       font.family: Style.font.family
-      font.pixelSize: Style.font.bodySmall
+      font.pixelSize: root.faceLive !== "" ? Style.font.body : Style.font.bodySmall
     }
 
     BorderSurface {

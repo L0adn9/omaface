@@ -205,6 +205,12 @@ int main(void) {
         choosing = 1;
         deadline = now_ms() + CHOOSE_DEADLINE_MS;
         say("Enter to use your face  \033[2m·  Esc or any other key for your password\033[0m", 0);
+      } else if (!strncmp(buf, "STATUS turn-", 12)) {
+        // The webcam's head-turn check: each prompt gets its own time.
+        deadline = now_ms() + DEADLINE_MS;
+        if (!strcmp(buf, "STATUS turn-left")) say("turn your head to the left…", 0);
+        else if (!strcmp(buf, "STATUS turn-right")) say("turn your head to the right…", 0);
+        else say("now face the camera again…", 0);
       } else if (!strcmp(buf, "STATUS scanning")) {
         say("looking at the camera…  \033[2m(any key for your password)\033[0m", 0);
       }

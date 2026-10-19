@@ -7,7 +7,7 @@ LDHARDEN = -pie -Wl,-z,relro,-z,now -Wl,--as-needed
 # Arch ships OpenCV 5; derivatives may still have 4 (4.5.4+ has the face API).
 OPENCV_PC := $(shell pkg-config --exists opencv5 && echo opencv5 || echo opencv4)
 OPENCV_CFLAGS := $(shell pkg-config --cflags $(OPENCV_PC))
-OPENCV_LIBS = -lopencv_objdetect -lopencv_dnn -lopencv_imgproc -lopencv_core -lsystemd
+OPENCV_LIBS = -lopencv_objdetect -lopencv_dnn -lopencv_imgcodecs -lopencv_imgproc -lopencv_core -lsystemd
 
 all: faceid-engine faceid-pam
 

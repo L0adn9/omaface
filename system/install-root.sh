@@ -1,6 +1,6 @@
 #!/bin/bash
 # Root half of the Face ID installer. Called by install.sh through sudo:
-#   install-root.sh <repo> <build-dir> <models-dir> <login: yes|no>
+#   install-root.sh <repo> <build-dir> <models-dir> <login: yes|no> <webcam: yes|no>
 # Safe to re-run: every step is idempotent and PAM edits are made once.
 
 set -euo pipefail
@@ -9,6 +9,7 @@ REPO=$1
 BUILD=$2
 MODELS=$3
 LOGIN=${4:-yes}
+WEBCAM=${5:-no}
 
 LIB=/usr/local/lib/faceid
 SHARE=/usr/local/share/faceid
@@ -51,9 +52,24 @@ fi
 
 echo "  configuration (kept if it already exists)"
 [[ -f /etc/faceid/config ]] || install -m0644 "$REPO/system/config" /etc/faceid/config
+set_conf() {
+  if grep -qE "^[[:space:]]*$1[[:space:]]*=" /etc/faceid/config; then
+    sed -i "s/^[[:space:]]*$1[[:space:]]*=.*/$1=$2/" /etc/faceid/config
+  else
+    echo "$1=$2" >>/etc/faceid/config
+  fi
+}
 if [[ $LOGIN != yes ]]; then
   # No SDDM greeter on this machine: nothing to show a face to at login.
-  sed -i 's/^[[:space:]]*login[[:space:]]*=.*/login=off/' /etc/faceid/config
+  set_conf login off
+fi
+if [[ $WEBCAM == yes ]]; then
+  # No IR camera: the regular webcam, for the lock screen only (the engine
+  # enforces that too).
+  set_conf rgb_fallback on
+  set_conf sudo off
+  set_conf polkit off
+  set_conf login off
 fi
 install -d -m0755 /var/lib/faceid
 
