@@ -1,4 +1,16 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" fill="none" stroke="#d0d4d8" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">
-  <path d="M6 24V14Q6 6 14 6H24M76 6H86Q94 6 94 14V24M94 76V86Q94 94 86 94H76M24 94H14Q6 94 6 86V76"/>
-  <path d="M36 37V45M64 37V45M51 37V57H46M37 67Q50 76 63 67"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <!-- Lightly rounded corner brackets around a pixel face (same geometry as FaceGlyph.qml). -->
+  <path d="M7 24V10Q7 7 10 7H24M76 7H90Q93 7 93 10V24M93 76V90Q93 93 90 93H76M24 93H10Q7 93 7 90V76"
+        fill="none" stroke="#d0d4d8" stroke-width="4.6" stroke-linecap="butt" stroke-linejoin="round"/>
+  <g fill="#d0d4d8">
+    <rect x="35" y="35" width="5.1" height="5.1"/>
+    <rect x="35" y="41.2" width="5.1" height="5.1"/>
+    <rect x="59.8" y="35" width="5.1" height="5.1"/>
+    <rect x="59.8" y="41.2" width="5.1" height="5.1"/>
+    <rect x="35" y="53.6" width="5.1" height="5.1"/>
+    <rect x="41.2" y="59.8" width="5.1" height="5.1"/>
+    <rect x="47.4" y="59.8" width="5.1" height="5.1"/>
+    <rect x="53.6" y="59.8" width="5.1" height="5.1"/>
+    <rect x="59.8" y="53.6" width="5.1" height="5.1"/>
+  </g>
 </svg>
