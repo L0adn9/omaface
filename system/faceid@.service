@@ -9,7 +9,7 @@ ExecStart=/usr/local/lib/faceid/faceid-engine serve
 StandardInput=socket
 StandardOutput=socket
 StandardError=journal
-RuntimeMaxSec=40
+RuntimeMaxSec=150
 # Exit 1 is an ordinary "not you / no face" answer, not a service failure.
 SuccessExitStatus=1
 Environment=OPENCV_OPENCL_DEVICE=disabled OPENCV_OPENCL_RUNTIME=disabled OPENCV_LOG_LEVEL=ERROR

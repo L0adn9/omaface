@@ -472,6 +472,48 @@ Item {
                   "Require attention " + (checked ? "off" : "on"))
               }
             }
+
+            Item {
+              width: parent.width
+              height: Math.max(confirmText.implicitHeight, confirmSwitch.implicitHeight)
+
+              Column {
+                id: confirmText
+                anchors.left: parent.left
+                anchors.right: confirmSwitch.left
+                anchors.rightMargin: Style.space(10)
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.space(1)
+                Text {
+                  text: "Ask first for sudo and prompts"
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                }
+                Text {
+                  width: parent.width
+                  text: "The camera waits until you press Enter or click; typing uses the password"
+                  color: root.foreground
+                  opacity: 0.5
+                  wrapMode: Text.WordWrap
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+              }
+
+              ToggleSwitch {
+                id: confirmSwitch
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                checked: root.status.confirm !== false
+                busy: actionProc.running
+                interactive: root.status.installed === true && !actionProc.running
+                foreground: root.foreground
+                accent: root.accent
+                onToggled: root.run(["set", "confirm", checked ? "off" : "on"],
+                  "Ask first " + (checked ? "off" : "on"))
+              }
+            }
           }
 
           PanelSeparator { foreground: root.foreground }

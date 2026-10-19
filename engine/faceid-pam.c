@@ -22,6 +22,9 @@
 
 #define SOCKET_PATH "/run/faceid.sock"
 #define DEADLINE_MS 20000
+// Waiting for the person to choose Face ID or the password (the engine's
+// timeout_choose is at most 120 s).
+#define CHOOSE_DEADLINE_MS 125000
 
 static int tty_fd = -1;
 static struct termios tty_saved;
@@ -140,14 +143,17 @@ int main(void) {
   if (len <= 0 || len >= (int)sizeof request) return 1;
   if (send(sock, request, len, MSG_NOSIGNAL) != len) return 1;
 
-  // sudo in a terminal: show progress, keep typed-ahead keys from echoing in
-  // the clear while the camera looks, and let Enter skip to the password.
+  // sudo in a terminal: ask Face ID or password with a single key, show
+  // progress, keep typed-ahead keys from echoing in the clear while the
+  // camera looks, and let any key skip to the password.
   const char* tty = getenv("PAM_TTY");
   if (!strcmp(service, "sudo") && tty && !strncmp(tty, "/dev/", 5)) {
     tty_fd = open(tty, O_RDWR | O_NOCTTY | O_CLOEXEC);
     if (tty_fd >= 0 && isatty(tty_fd) && tcgetattr(tty_fd, &tty_saved) == 0) {
       struct termios quiet = tty_saved;
-      quiet.c_lflag &= ~(ECHO | ECHONL);
+      quiet.c_lflag &= ~(ECHO | ECHONL | ICANON);
+      quiet.c_cc[VMIN] = 1;
+      quiet.c_cc[VTIME] = 0;
       if (tcsetattr(tty_fd, TCSANOW, &quiet) == 0) tty_changed = 1;
     } else if (tty_fd >= 0) {
       close(tty_fd);
@@ -155,7 +161,7 @@ int main(void) {
     }
   }
 
-  int ok = 0, done = 0, said_nomatch = 0, said_attention = 0;
+  int ok = 0, done = 0, said_nomatch = 0, said_attention = 0, choosing = 0;
   char buf[512];
   size_t used = 0;
   long deadline = now_ms() + DEADLINE_MS;
@@ -169,7 +175,20 @@ int main(void) {
     if (r <= 0) break;
 
     if (nfds == 2 && (fds[1].revents & POLLIN)) {
-      say("skipped", 1);
+      char key[16];
+      ssize_t k = read(tty_fd, key, sizeof key);  // a whole key, escape sequences included
+      if (choosing && k > 0 && (key[0] == '\n' || key[0] == '\r')) {
+        if (send(sock, "CHOICE face\n", 12, MSG_NOSIGNAL) != 12) break;
+        choosing = 0;
+        deadline = now_ms() + DEADLINE_MS;
+        continue;
+      }
+      if (choosing) {
+        (void)!send(sock, "CHOICE password\n", 16, MSG_NOSIGNAL);
+        say("using your password", 1);
+      } else {
+        say("skipped", 1);
+      }
       break;
     }
     if (!(fds[0].revents & (POLLIN | POLLHUP | POLLERR))) continue;
@@ -181,7 +200,14 @@ int main(void) {
     char* line;
     while ((line = memchr(buf, '\n', used)) != NULL) {
       *line = 0;
-      if (!strcmp(buf, "STATUS scanning")) say("looking for you…  \033[2m(Enter to type your password)\033[0m", 0);
+      if (!strcmp(buf, "STATUS choose")) {
+        // Nothing is scanned until the person asks for it.
+        choosing = 1;
+        deadline = now_ms() + CHOOSE_DEADLINE_MS;
+        say("Enter to use your face  \033[2m·  Esc or any other key for your password\033[0m", 0);
+      } else if (!strcmp(buf, "STATUS scanning")) {
+        say("looking at the camera…  \033[2m(any key for your password)\033[0m", 0);
+      }
       else if (!strcmp(buf, "STATUS attention") && !said_attention) {
         say("look at the camera with your eyes open…", 0);
         said_attention = 1;
@@ -196,6 +222,7 @@ int main(void) {
         else if (!strcmp(result, "attention")) say("eyes closed or not looking at the camera", 1);
         else if (!strcmp(result, "timeout")) say("no face found", 1);
         else if (!strcmp(result, "locked-out")) say("too many attempts, use your password", 1);
+        else if (!strcmp(result, "timeout choose")) say("no choice made, using your password", 1);
         else if (!strcmp(result, "busy")) say("camera busy", 1);
         else if (!strncmp(result, "unavailable camera", 18)) say("camera unavailable", 1);
         done = 1;

@@ -348,6 +348,7 @@ POLKIT = [
   readonly property bool faceConfigured: facePamConfigured && faceReady
   property string faceState: "idle"
   property double flowStartedAt: 0
+  property string pendingPassword: ""
   readonly property bool agentRegistered: polkitAgent.isRegistered
 """,
     ),
@@ -371,8 +372,30 @@ POLKIT = [
       var status = JSON.parse(String(raw || "{}"))
       if (status.service !== "polkit" || status.at * 1000 < flowStartedAt - 2000) return
       var state = String(status.state || "")
-      faceState = state === "scanning" || state === "success" || state === "failure" ? state : "idle"
+      faceState = state === "choose" || state === "scanning" || state === "success" || state === "failure" ? state : "idle"
     } catch (e) {}
+  }
+
+  // Ask first: the camera waits until the person picks Face ID (Enter or a
+  // click). Typing picks the password instead, and what was typed is kept
+  // for the password field polkit asks for next.
+  function chooseFace(choice) {
+    if (faceChooseProc.running) return
+    faceState = choice === "face" ? "scanning" : "idle"
+    faceChooseProc.command = ["/usr/local/bin/faceid", "choose", choice]
+    faceChooseProc.running = true
+  }
+
+  function takeTyping(event) {
+    if (event.key === Qt.Key_Backspace) {
+      pendingPassword = pendingPassword.slice(0, -1)
+      return true
+    }
+    var text = String(event.text || "")
+    if (text.length === 0 || text.charCodeAt(0) < 32) return false
+    pendingPassword += text
+    if (faceState === "choose") chooseFace("password")
+    return true
   }
 """,
     ),
@@ -384,6 +407,7 @@ POLKIT = [
     closing = false
     flowStartedAt = Date.now()
     faceState = "idle"
+    pendingPassword = ""
     refreshFace()
 """,
     ),
@@ -404,6 +428,10 @@ POLKIT = [
     printErrors: false
     onLoaded: root.loadFaceStatus(text())
     onFileChanged: reload()
+  }
+
+  Process {
+    id: faceChooseProc
   }
 
   Process {
@@ -434,9 +462,66 @@ POLKIT = [
         errorColor: Commons.Color.polkit.textError
       }
 
+      MouseArea {
+        anchors.fill: parent
+        visible: root.fingerprintMode && root.faceConfigured && root.faceState === "choose"
+        cursorShape: Qt.PointingHandCursor
+        onClicked: root.chooseFace("face")
+      }
+
       Row {
         id: cardRow
 """,
+    ),
+    (
+        "    if (responseRequired) submitted = false\n  }\n",
+        """    if (responseRequired) submitted = false
+    // Keys typed while Face ID was on offer belong to the password.
+    if (responseRequired && pendingPassword.length) {
+      passwordInput.text = pendingPassword
+      pendingPassword = ""
+      passwordInput.cursorPosition = passwordInput.text.length
+    }
+  }
+""",
+    ),
+    (
+        "  function cancelRequest() {\n    var flow = polkitAgent.flow\n    passwordInput.text = \"\"\n",
+        "  function cancelRequest() {\n    var flow = polkitAgent.flow\n    passwordInput.text = \"\"\n    pendingPassword = \"\"\n",
+    ),
+    (
+        """          } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+            if (root.responseRequired) root.submitResponse()
+            event.accepted = true
+          }
+""",
+        """          } else if (root.faceState === "choose" && (event.key === Qt.Key_Return || event.key === Qt.Key_Enter)) {
+            root.chooseFace("face")
+            event.accepted = true
+          } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+            if (root.responseRequired) root.submitResponse()
+            event.accepted = true
+          } else if (root.fingerprintMode && root.faceConfigured && !root.responseRequired && root.takeTyping(event)) {
+            event.accepted = true
+          }
+""",
+    ),
+    (
+        "    Rectangle {\n      width: Math.min(justificationText.implicitWidth",
+        """    Text {
+      anchors.horizontalCenter: card.horizontalCenter
+      anchors.top: card.bottom
+      anchors.topMargin: Style.space(10)
+      visible: root.fingerprintMode && root.faceConfigured && (root.faceState === "choose" || root.faceState === "scanning")
+      text: root.faceState === "choose" ? "Enter or click for Face ID  \u00b7  type for password" : "Look at the camera"
+      color: root.foreground
+      opacity: 0.7
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.bodySmall
+    }
+
+    Rectangle {
+      width: Math.min(justificationText.implicitWidth""",
     ),
 ]
 

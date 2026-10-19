@@ -85,6 +85,8 @@ struct Config {
   double timeoutLogin = 6.0;
   int minFaceWidth = 70;
   bool attention = true;
+  bool confirm = true;          // sudo and polkit wait for the person to choose Face ID
+  double timeoutChoose = 30.0;
 };
 
 bool parseBool(const std::string& v, bool fallback) {
@@ -116,6 +118,8 @@ Config loadConfig() {
       else if (k == "polkit") c.polkit = parseBool(v, c.polkit);
       else if (k == "threshold") c.threshold = std::clamp(std::stod(v), 0.30, 0.95);
       else if (k == "attention") c.attention = parseBool(v, true);
+      else if (k == "confirm") c.confirm = parseBool(v, true);
+      else if (k == "timeout_choose") c.timeoutChoose = std::clamp(std::stod(v), 5.0, 120.0);
       else if (k == "match_frames") c.matchFrames = std::clamp(std::stoi(v), 1, 5);
       else if (k == "timeout_sudo") c.timeoutSudo = std::clamp(std::stod(v), 1.0, 15.0);
       else if (k == "timeout_polkit") c.timeoutPolkit = std::clamp(std::stod(v), 1.0, 15.0);
@@ -736,6 +740,59 @@ int finish(const std::string& result) {
   return result == "ok" ? 0 : 1;
 }
 
+std::string choicePath(uid_t uid) { return std::string(kRunDir) + "/choice-" + std::to_string(uid); }
+
+// sudo and system prompts approve something, so looking at the screen must
+// never be enough on its own: the person first asks for Face ID (Enter in
+// the terminal, a click or Enter in the dialog) or picks the password. The
+// camera stays off while it waits. The terminal client answers on this
+// connection; the dialog, which polkit's sandboxed helper cannot talk to,
+// answers through CHOOSE, which leaves /run/faceid/choice-<uid>.
+std::string awaitChoice(const std::string& key, uid_t uid, long seq, double timeout) {
+  unlink(choicePath(uid).c_str());  // only a choice made for this prompt counts
+  writeStatus(key, "choose", seq);
+  sendLine("STATUS choose");
+  auto start = Clock::now();
+  while (secondsSince(start) < timeout) {
+    pollfd p{STDIN_FILENO, POLLIN, 0};
+    if (poll(&p, 1, 100) > 0) {
+      char c;
+      if (recv(STDIN_FILENO, &c, 1, MSG_PEEK | MSG_DONTWAIT) <= 0) return "gone";
+      std::string line;
+      if (readLine(STDIN_FILENO, line, 500)) {
+        if (line == "CHOICE face") return "face";
+        if (line == "CHOICE password") return "password";
+      }
+    }
+    std::ifstream f(choicePath(uid));
+    std::string choice;
+    if (f >> choice) {
+      unlink(choicePath(uid).c_str());
+      if (choice == "face" || choice == "password") return choice;
+    }
+  }
+  return "timeout";
+}
+
+// CHOOSE face|password, from the polkit dialog running as the person.
+int choose(const std::string& choice) {
+  if (choice != "face" && choice != "password") return finish("error bad-request");
+  ucred cred{};
+  socklen_t len = sizeof cred;
+  if (getsockopt(STDIN_FILENO, SOL_SOCKET, SO_PEERCRED, &cred, &len) != 0) return finish("error no-peer");
+  if (!hasActiveLocalSession(cred.uid)) return finish("denied no-local-session");
+  mkdir(kRunDir, 0755);
+  std::string path = choicePath(cred.uid), tmp = path + ".tmp";
+  {
+    std::ofstream f(tmp, std::ios::trunc);
+    f << choice << "\n";
+    if (!f) return finish("error write");
+  }
+  chmod(tmp.c_str(), 0600);
+  if (rename(tmp.c_str(), path.c_str()) != 0) return finish("error write");
+  return finish("ok");
+}
+
 int serve() {
   std::string line;
   if (!readLine(STDIN_FILENO, line, 3000)) return finish("error bad-request");
@@ -743,6 +800,7 @@ int serve() {
   std::string verb;
   Request req;
   ss >> verb >> req.user >> req.service;
+  if (verb == "CHOOSE") return choose(req.user);
   if (verb != "VERIFY" || req.user.empty() || req.service.empty()) return finish("error bad-request");
 
   // The peer may only ask about itself, unless it is root (sudo, polkit).
@@ -781,6 +839,15 @@ int serve() {
   Failures fails = readFailures(uid);
   if (!test && fails.count >= kLockoutFailures) return finish("locked-out");
 
+  long seq = (long)time(nullptr) * 1000 + getpid() % 1000;
+  if ((key == "sudo" || key == "polkit") && cfg.confirm) {
+    std::string choice = awaitChoice(key, uid, seq, cfg.timeoutChoose);
+    if (choice != "face") {
+      writeStatus(key, "idle", seq);
+      return finish(choice == "password" ? "declined" : (choice == "gone" ? "error client-gone" : "timeout choose"));
+    }
+  }
+
   mkdir(kRunDir, 0755);
   int lockFd = ::open((std::string(kRunDir) + "/camera.lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
   bool haveLock = false;
@@ -805,7 +872,6 @@ int serve() {
   }
   const int minFace = minFaceFor(cfg, cam);
 
-  long seq = (long)time(nullptr) * 1000 + getpid() % 1000;
   writeStatus(key, "scanning", seq);
   sendLine("STATUS scanning");
 

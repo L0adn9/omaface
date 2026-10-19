@@ -7,6 +7,13 @@ login=on
 sudo=on
 polkit=on
 
+# Ask first: sudo and system prompts (polkit) wait until you choose Face ID
+# (Enter in the terminal, Enter or a click in the dialog) before the camera
+# turns on; anything else uses the password. The lock and login screens scan
+# by themselves. timeout_choose: seconds before falling back to the password.
+confirm=on
+timeout_choose=30
+
 # Require attention: only unlock when your eyes are open and looking at the
 # camera (checked with the IR light's reflection in your pupils).
 attention=on
