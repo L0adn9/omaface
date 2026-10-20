@@ -5,12 +5,16 @@
 
 set -euo pipefail
 
-LIB=/usr/local/lib/omaface
-SHARE=/usr/local/share/omaface
+# Filled in when installed: /usr for the package, /usr/local from git.
+PREFIX=@PREFIX@
+LIB=$PREFIX/lib/omaface
+SHARE=$PREFIX/share/omaface
 CONF=/etc/omaface/config
 SDDM_CONF=/etc/sddm.conf.d/20-omaface.conf
 SDDM_THEME=/usr/share/sddm/themes/omaface
 PLUGIN_ID=io.github.l0adn9.omaface
+PLUGIN_DEST="$HOME/.config/omarchy/plugins/$PLUGIN_ID"
+PLUGIN_BACKUPS="$HOME/.local/share/omarchy-plugin-backups"
 PLACES=(lock login sudo polkit)
 MAX_APPEARANCES=3 # kMaxAppearances in the engine
 
@@ -23,10 +27,16 @@ fi
 
 die() { echo "omaface: $*" >&2; exit 1; }
 
+# The package is rebuilt by pacman; a git install keeps its own sources and
+# rebuild hook, and its own uninstall.
+packaged() { [[ $PREFIX == /usr ]]; }
+reinstall_hint() { if packaged; then echo "reinstall the omaface package"; else echo "re-run install.sh"; fi; }
+
 usage() {
   cat <<'USAGE'
 Usage: omaface <command>
 
+  setup                      set omaFace up for you: PAM, lock screen, polkit dialog
   status [--json]            what is set up and where omaFace is used
   cameras                    list cameras and which one omaFace uses
   emitter                    check that the IR light comes on
@@ -41,7 +51,7 @@ Usage: omaface <command>
   settings                   open the omaFace settings window
   doctor                     check every part of the installation
   sync                       rebuild the shell plugin after an Omarchy update
-  uninstall                  remove omaFace and restore the original setup
+  uninstall [--keep-data]    remove omaFace and restore the original setup
 USAGE
 }
 
@@ -54,9 +64,21 @@ as_root() {
   if [[ -t 0 ]]; then
     exec sudo "$0" "$@"
   else
-    exec pkexec /usr/local/bin/omaface "$@"
+    exec pkexec "$PREFIX/bin/omaface" "$@"
   fi
 }
+
+# The same, but coming back: setup and uninstall have a root half in the
+# middle of their user half.
+run_root() {
+  if [[ -t 0 ]]; then
+    sudo "$PREFIX/bin/omaface" "$@"
+  else
+    pkexec "$PREFIX/bin/omaface" "$@"
+  fi
+}
+
+step() { printf '\n\e[1m==> %s\e[0m\n' "$*"; }
 
 target_user() {
   if [[ -n ${PKEXEC_UID:-} ]]; then
@@ -78,6 +100,8 @@ conf_get() {
 
 conf_set() {
   local key=$1 value=$2 tmp
+  # Before setup (choosing the camera when none was found) there is none yet.
+  [[ -f $CONF ]] || install -Dm0644 "$SHARE/config" "$CONF"
   tmp=$(mktemp /etc/omaface/.config.XXXXXX)
   if grep -qE "^[[:space:]]*$key[[:space:]]*=" "$CONF"; then
     sed "s|^[[:space:]]*$key[[:space:]]*=.*|$key=$value|" "$CONF" >"$tmp"
@@ -390,34 +414,56 @@ cmd_settings() {
   omarchy-shell omaface settings >/dev/null || die "the omaFace shell plugin is not running (omaface doctor)"
 }
 
+# build_plugin <out>: the shell plugin, from Omarchy's current lock screen and
+# polkit dialog plus omaFace's patches, passed by Omarchy's validator.
+build_plugin() {
+  python3 -I "$SHARE/tools/build-plugin.py" --prefix "$PREFIX" "$SHARE/plugin" "$1" >/dev/null || return 1
+  if ! omarchy plugin validate "$1" >/dev/null; then
+    echo "omaface: the built plugin failed Omarchy's manifest validation" >&2
+    rm -rf "$1"
+    return 1
+  fi
+}
+
+# replace_plugin <built>: put a built plugin in place. The previous copy goes
+# to the backups, of which the three newest are kept; prints its path.
+replace_plugin() {
+  local backup=""
+  mkdir -p "$(dirname "$PLUGIN_DEST")" "$PLUGIN_BACKUPS"
+  if [[ -d $PLUGIN_DEST ]]; then
+    backup="$PLUGIN_BACKUPS/$PLUGIN_ID-$(date +%Y%m%d-%H%M%S)"
+    cp -a "$PLUGIN_DEST" "$backup"
+  fi
+  rm -rf "$PLUGIN_DEST.new"
+  cp -a "$1" "$PLUGIN_DEST.new"
+  rm -rf "$PLUGIN_DEST"
+  mv "$PLUGIN_DEST.new" "$PLUGIN_DEST"
+  ls -1d "$PLUGIN_BACKUPS/$PLUGIN_ID"-* 2>/dev/null | sort | head -n -3 | xargs -r rm -rf
+  echo "$backup"
+}
+
 cmd_sync() {
   (( EUID != 0 )) || die "run sync as your user, not root"
-  local dest="$HOME/.config/omarchy/plugins/$PLUGIN_ID"
-  local stage="${XDG_RUNTIME_DIR:-/tmp}/omaface-plugin.$$"
-  local backup="$HOME/.local/share/omarchy-plugin-backups/$PLUGIN_ID-$(date +%Y%m%d-%H%M%S)"
-  python3 -I "$SHARE/tools/build-plugin.py" "$SHARE/plugin" "$stage" || return 1
-  if [[ -d $dest ]] && diff -rq "$stage" "$dest" >/dev/null 2>&1; then
+  [[ -d $PLUGIN_DEST ]] || die "not set up for you yet: omaface setup"
+  local stage="${XDG_RUNTIME_DIR:-/tmp}/omaface-plugin.$$" backup
+  build_plugin "$stage" || return 1
+  if diff -rq "$stage" "$PLUGIN_DEST" >/dev/null 2>&1; then
     rm -rf "$stage"
     echo "Plugin already up to date."
     return 0
   fi
-  mkdir -p "$(dirname "$backup")"
-  [[ -d $dest ]] && cp -a "$dest" "$backup"
-  rm -rf "$dest.new"
-  cp -a "$stage" "$dest.new"
+  backup=$(replace_plugin "$stage")
   rm -rf "$stage"
-  [[ -d $dest ]] && rm -rf "$dest"
-  mv "$dest.new" "$dest"
-  echo "Plugin rebuilt (previous copy in $backup). Restarting the shell to load it…"
+  echo "Plugin rebuilt${backup:+ (previous copy in $backup)}. Restarting the shell to load it…"
   omarchy restart shell >/dev/null 2>&1 || true
   if wait_plugin_live; then
     echo "omaFace plugin is live."
     return 0
   fi
   echo "omaface: the rebuilt plugin did not come up; restoring the previous copy" >&2
-  if [[ -d $backup ]]; then
-    rm -rf "$dest"
-    cp -a "$backup" "$dest"
+  if [[ -n $backup && -d $backup ]]; then
+    rm -rf "$PLUGIN_DEST"
+    cp -a "$backup" "$PLUGIN_DEST"
     omarchy restart shell >/dev/null 2>&1 || true
     wait_plugin_live && { echo "Previous plugin restored."; return 1; }
   fi
@@ -462,17 +508,21 @@ cmd_doctor() {
   local user
   user=$(id -un)
 
-  if [[ -x $LIB/omaface-engine && -x $LIB/omaface-pam ]]; then ok "binaries installed"; else bad "binaries missing in $LIB (re-run install.sh)"; fi
+  if [[ -x $LIB/omaface-engine && -x $LIB/omaface-pam ]]; then ok "binaries installed"; else bad "binaries missing in $LIB ($(reinstall_hint))"; fi
+  # After an OpenCV upgrade: a git install rebuilds itself, the package
+  # needs rebuilding like any AUR package.
+  local rebuild="sudo $LIB/rebuild"
+  packaged && rebuild="rebuild the omaface package against the new OpenCV"
   if ldd "$LIB/omaface-engine" 2>/dev/null | grep -q 'not found'; then
-    bad "engine cannot find its OpenCV libraries: sudo $LIB/rebuild"
+    bad "engine cannot find its OpenCV libraries: $rebuild"
   elif "$LIB/omaface-engine" selftest >/dev/null 2>&1; then
     ok "engine self-test (models + OpenCV)"
   else
-    bad "engine self-test failed: sudo $LIB/rebuild"
+    bad "engine self-test failed: $rebuild"
   fi
   if (cd "$SHARE/models" && sha256sum -c --quiet SHA256SUMS) >/dev/null 2>&1; then ok "model files verified"; else bad "model checksums do not match"; fi
   if socket_active; then ok "omaface.socket listening"; else bad "omaface.socket not active: sudo systemctl enable --now omaface.socket"; fi
-  [[ -d /run/omaface ]] && ok "/run/omaface present" || bad "/run/omaface missing: sudo systemd-tmpfiles --create /etc/tmpfiles.d/omaface.conf"
+  [[ -d /run/omaface ]] && ok "/run/omaface present" || bad "/run/omaface missing: sudo systemd-tmpfiles --create omaface.conf"
 
   local cam
   if cam=$("$LIB/omaface-engine" probe 2>/dev/null); then
@@ -502,11 +552,11 @@ cmd_doctor() {
     esac
   fi
 
-  grep -q omaface-pam /etc/pam.d/sudo 2>/dev/null && ok "PAM: sudo" || bad "PAM: sudo line missing"
-  grep -q omaface-pam /etc/pam.d/polkit-1 2>/dev/null && ok "PAM: polkit" || bad "PAM: polkit line missing"
+  grep -q omaface-pam /etc/pam.d/sudo 2>/dev/null && ok "PAM: sudo" || bad "PAM: sudo line missing: omaface setup"
+  grep -q omaface-pam /etc/pam.d/polkit-1 2>/dev/null && ok "PAM: polkit" || bad "PAM: polkit line missing: omaface setup"
   if login_supported; then ok "PAM: login (sddm)"
   elif is_on login && [[ -f $SDDM_THEME/Main.qml ]]; then bad "PAM: sddm line missing"; fi
-  [[ -f /etc/pam.d/omaface-lock ]] && ok "PAM: lock screen" || bad "PAM: /etc/pam.d/omaface-lock missing"
+  [[ -f /etc/pam.d/omaface-lock ]] && ok "PAM: lock screen" || bad "PAM: /etc/pam.d/omaface-lock missing: omaface setup"
   if declare -F pam_anchor >/dev/null; then
     if pam_anchor /etc/pam.d/sudo "${PAM_ANCHORS_SUDO[@]}" >/dev/null &&
       pam_anchor /etc/pam.d/polkit-1 "${PAM_ANCHORS_POLKIT[@]}" >/dev/null; then
@@ -527,24 +577,25 @@ cmd_doctor() {
     else bad "login is on but the theme is not selected: omaface enable login"; fi
   fi
   local stock_main=/usr/share/sddm/themes/omarchy/Main.qml
-  if [[ -f $SHARE/sddm-upstream.sha256 && -f $stock_main ]]; then
-    if [[ $(sha256sum "$stock_main" | cut -d' ' -f1) == "$(cat "$SHARE/sddm-upstream.sha256")" ]]; then
-      ok "Omarchy login theme unchanged since install"
+  local stock_hash=/var/lib/omaface/sddm-upstream.sha256
+  if login_supported && [[ -f $stock_hash && -f $stock_main ]]; then
+    if [[ $(sha256sum "$stock_main" | cut -d' ' -f1) == "$(cat "$stock_hash")" ]]; then
+      ok "Omarchy login theme unchanged since setup"
     else
-      warn "Omarchy updated its login theme; the omaFace theme still works but may look older (re-run install.sh to refresh it)"
+      warn "Omarchy updated its login theme; the omaFace theme still works but may look older until omaFace is updated"
     fi
   fi
 
   if (( count > 0 )); then ok "$count appearance(s) enrolled for $user"; else warn "no face enrolled: omaface enroll"; fi
   if locked_out "$user"; then warn "paused for 5 minutes after too many failed scans"; fi
 
-  local plugin_dir="$HOME/.config/omarchy/plugins/$PLUGIN_ID"
-  if [[ -f $plugin_dir/manifest.json ]]; then ok "shell plugin installed"; else bad "shell plugin missing: omaface sync"; fi
+  local plugin_dir=$PLUGIN_DEST
+  if [[ -f $plugin_dir/manifest.json ]]; then ok "shell plugin installed"; else bad "shell plugin missing: omaface setup"; fi
   local shell_json="$HOME/.config/omarchy/shell.json"
   if jq -e '(.disabledPlugins // []) | (index("omarchy.lock") != null and index("omarchy.polkit") != null)' "$shell_json" >/dev/null 2>&1; then
     ok "stock lock + polkit plugins handed over"
   else
-    bad "omarchy.lock / omarchy.polkit still enabled next to omaFace (re-run install.sh)"
+    bad "omarchy.lock / omarchy.polkit still enabled next to omaFace: omaface setup"
   fi
   local live=1
   if [[ $mode == --after-update ]]; then wait_plugin_live || live=0; else plugin_live || live=0; fi
@@ -560,28 +611,34 @@ cmd_doctor() {
     drift=$(python3 -I - "$plugin_dir/upstream.json" <<'PY'
 import hashlib, json, os, sys
 data = json.load(open(sys.argv[1]))
-for rel, digest in data["sha256"].items():
-    path = os.path.join(data["upstream"], rel)
-    try:
-        now = hashlib.sha256(open(path, "rb").read()).hexdigest()
-    except OSError:
-        now = "missing"
-    if now != digest:
-        print(rel)
+# Omarchy's files the plugin was patched from, then omaFace's own (which an
+# upgrade of omaFace changes; builds from before have no "own").
+for base, hashes in ((data["upstream"], data["sha256"]), (data.get("source", ""), data.get("own", {}))):
+    for rel, digest in hashes.items():
+        try:
+            now = hashlib.sha256(open(os.path.join(base, rel), "rb").read()).hexdigest()
+        except OSError:
+            now = "missing"
+        if now != digest:
+            print(rel)
 PY
 )
     if [[ -z $drift ]]; then
       ok "built from the current Omarchy lock screen and polkit dialog"
     elif [[ $mode == --after-update ]]; then
-      echo "  Omarchy changed: $(tr '\n' ' ' <<<"$drift")— rebuilding the plugin"
-      if cmd_sync; then ok "plugin rebuilt for the new Omarchy"; else bad "plugin rebuild failed, kept the working copy"; fi
+      echo "  changed since the plugin was built: $(tr '\n' ' ' <<<"$drift")— rebuilding it"
+      if cmd_sync; then ok "plugin rebuilt"; else bad "plugin rebuild failed, kept the working copy"; fi
     else
-      warn "Omarchy updated $(tr '\n' ' ' <<<"$drift")— run: omaface sync"
+      warn "changed since the plugin was built: $(tr '\n' ' ' <<<"$drift")— run: omaface sync"
     fi
   fi
 
-  [[ -f /etc/pacman.d/hooks/omaface.hook ]] && ok "rebuild hook for OpenCV upgrades" || warn "pacman rebuild hook missing"
-  if pacman -Qi opencv 2>/dev/null | grep -q 'Install Reason *: Explicitly'; then ok "opencv kept as an explicit package"; else warn "opencv is only a dependency; an orphan cleanup could remove it: sudo pacman -D --asexplicit opencv"; fi
+  # The package depends on opencv; a git install keeps it explicit and
+  # rebuilds itself when it changes.
+  if ! packaged; then
+    [[ -f /etc/pacman.d/hooks/omaface.hook ]] && ok "rebuild hook for OpenCV upgrades" || warn "pacman rebuild hook missing"
+    if pacman -Qi opencv 2>/dev/null | grep -q 'Install Reason *: Explicitly'; then ok "opencv kept as an explicit package"; else warn "opencv is only a dependency; an orphan cleanup could remove it: sudo pacman -D --asexplicit opencv"; fi
+  fi
 
   if [[ $mode != --quiet ]]; then
     echo
@@ -593,8 +650,138 @@ PY
   (( fails == 0 ))
 }
 
+# Wire omaFace in for the user who runs it: settings, PAM and the service
+# (root), then the shell plugin that takes over the lock screen and polkit
+# dialog. Idempotent: the git installer runs it on every upgrade. Like
+# Omarchy's fingerprint setup, the package leaves this to the user.
+cmd_setup() {
+  (( EUID != 0 )) || die "run setup as your user; it asks for root itself"
+  [[ -x $LIB/omaface-engine ]] || die "omaFace is not installed ($LIB is missing)"
+
+  step "Checking this machine"
+  omaface_preflight || exit 1
+  echo "  ok"
+
+  step "Finding the camera"
+  local cam webcam=no what
+  if ! cam=$("$LIB/omaface-engine" probe 2>/dev/null) && ! cam=$("$LIB/omaface-engine" probe webcam 2>/dev/null); then
+    echo "  Cameras on this machine:" >&2
+    "$LIB/omaface-engine" cameras 2>/dev/null | sed 's/^/    /' >&2 || true
+    die "no camera found. If yours is listed above but not picked: omaface set device /dev/videoN, then omaface setup"
+  fi
+  [[ $(cut -f5 <<<"$cam") == webcam ]] && webcam=yes
+  what="$(cut -f2 <<<"$cam") ($(cut -f1 <<<"$cam"), $(cut -f4 <<<"$cam") $(cut -f3 <<<"$cam"))"
+  if [[ $webcam == yes ]]; then
+    # Found automatically: no IR camera, so the regular webcam, everywhere,
+    # with the checks that keep it safe. Nothing to decide; Settings shows it.
+    # Or chosen by hand with device=, which says nothing about IR.
+    echo "  Webcam: $what"
+    if [[ $(conf_get device auto) != auto ]]; then
+      echo "  (chosen with device= in $CONF; omaface set device auto picks an IR camera first)"
+    fi
+    cat <<'EOF'
+  omaFace uses the regular webcam, for everything, with checks that keep it
+  safe:
+    - every scan must see a live face (not a photo or a screen) with open
+      eyes looking at the screen
+    - sudo and system prompts always wait for you to press Enter or click
+    - three failed tries and it waits for your password once
+EOF
+  else
+    echo "  IR camera: $what"
+    # Many laptops keep the IR light off until it is switched on once.
+    # omaFace is set up either way; this only says what to do about it.
+    case $("$LIB/omaface-engine" emitter 2>/dev/null || true) in
+      *'"pulsing"'* | *'"steady"'*) echo "  IR light: on" ;;
+      *'"dark"'*)
+        cat <<'EOF'
+  IR light: did not come on. Many Lenovo, Dell and HP laptops need it switched
+  on once:
+      omarchy pkg aur add linux-enable-ir-emitter
+      sudo linux-enable-ir-emitter configure
+  then check with: omaface emitter
+EOF
+        ;;
+      *) echo "  IR light: could not check (camera busy?); check later with: omaface emitter" ;;
+    esac
+  fi
+
+  step "Setting up the system (root)"
+  echo "  PAM: sudo, polkit$([[ $OMAFACE_LOGIN == yes ]] && echo " and login") get one omaFace line above the password;"
+  echo "       originals are backed up to /var/lib/omaface/pam-backup"
+  run_root _setup-root "$OMAFACE_LOGIN" "$webcam" || die "system setup failed; passwords work as before"
+
+  step "Installing the shell plugin"
+  local stage="${XDG_RUNTIME_DIR:-/tmp}/omaface-plugin.$$" backup manifest dir old
+  build_plugin "$stage" || die "the shell plugin could not be built for this Omarchy; the lock screen is unchanged"
+  # An earlier omaFace build under another plugin id (a lock screen clone
+  # that ships FaceGlyph.qml): switch it off, which hands the lock back to
+  # Omarchy for a moment, and keep a copy, so two lock screens never compete.
+  for manifest in "$(dirname "$PLUGIN_DEST")"/*/manifest.json; do
+    [[ -f $manifest ]] || continue
+    dir=$(dirname "$manifest")
+    old=$(jq -r '.id // ""' "$manifest" 2>/dev/null)
+    [[ -n $old && $old != "$PLUGIN_ID" && -f $dir/FaceGlyph.qml ]] || continue
+    jq -e '.omarchy.clonedFrom == "omarchy.lock"' "$manifest" >/dev/null 2>&1 || continue
+    echo "  replacing the earlier omaFace plugin $old"
+    omarchy plugin disable omarchy.polkit >/dev/null 2>&1 || true
+    omarchy plugin disable "$old" >/dev/null 2>&1 || true
+    mkdir -p "$PLUGIN_BACKUPS"
+    mv "$dir" "$PLUGIN_BACKUPS/$old-$(date +%Y%m%d-%H%M%S)"
+  done
+  backup=$(replace_plugin "$stage")
+  rm -rf "$stage"
+  [[ -z $backup ]] || echo "  previous copy kept in $backup"
+  omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+  local i
+  for i in $(seq 1 40); do
+    omarchy plugin list --json 2>/dev/null | jq -e --arg id "$PLUGIN_ID" 'any(.[]; .id == $id)' >/dev/null && break
+    sleep 0.1
+  done
+
+  step "Handing the lock screen and polkit dialog to omaFace"
+  cp -a "$HOME/.config/omarchy/shell.json" "$HOME/.config/omarchy/shell.json.bak.omaface.$(date +%s)"
+  # Polkit first: two agents cannot be registered at once.
+  omarchy plugin disable omarchy.polkit >/dev/null
+  omarchy plugin enable "$PLUGIN_ID" >/dev/null
+  omarchy restart shell >/dev/null 2>&1 || true
+  if ! wait_plugin_live; then
+    fallback_to_stock
+    die "the plugin did not come up, so Omarchy's own lock screen is back; see: journalctl --user -b | grep -i omaface"
+  fi
+  timeout 3 omarchy-shell lock status >/dev/null || die "lock screen IPC not answering"
+  echo "  lock screen and polkit dialog now run from $PLUGIN_ID"
+
+  step "Update hook"
+  # From installs that kept the launcher entry per user (it is system-wide
+  # now), some under the old name.
+  rm -f "$HOME/.local/share/applications/faceid.desktop" "$HOME/.local/share/applications/omaface.desktop" \
+    "$HOME/.local/share/icons/hicolor/scalable/apps/faceid.svg" "$HOME/.local/share/icons/hicolor/scalable/apps/omaface.svg" \
+    "$HOME/.config/omarchy/hooks/post-update.d/faceid"
+  # After `omarchy update`: rebuild the plugin when Omarchy's lock screen
+  # changed, and fall back to Omarchy's own if it no longer loads.
+  install -Dm0755 "$SHARE/hooks/post-update" "$HOME/.config/omarchy/hooks/post-update.d/omaface"
+  echo "  ok"
+
+  step "Done"
+  cmd_doctor --quiet || true
+  if [[ $(appearance_count "$(id -un)") -eq 0 ]]; then
+    cat <<'EOF'
+
+  Next: enroll your face (sit in front of the laptop, lid open):
+      omaface enroll              in a terminal
+      omaface settings            or the omaFace window (also in the app launcher)
+EOF
+  fi
+  cat <<'EOF'
+
+  Your password keeps working everywhere. Undo it all with: omaface uninstall
+EOF
+}
+
 cmd_uninstall() {
-  (( EUID == 0 )) && exec "$LIB/uninstall" "$@"
+  (( EUID != 0 )) || die "run uninstall as your user; it asks for root itself"
+  [[ -z ${1:-} || $1 == --keep-data ]] || die "usage: omaface uninstall [--keep-data]"
 
   echo "Handing the lock screen and polkit dialog back to Omarchy"
   omarchy plugin disable "$PLUGIN_ID" >/dev/null 2>&1 || true
@@ -604,29 +791,21 @@ cmd_uninstall() {
   local i
   for i in $(seq 1 30); do timeout 3 omarchy-shell lock status >/dev/null 2>&1 && break; sleep 0.5; done
 
-  local dest="$HOME/.config/omarchy/plugins/$PLUGIN_ID"
-  if [[ -d $dest ]]; then
-    local backup="$HOME/.local/share/omarchy-plugin-backups/$PLUGIN_ID-$(date +%Y%m%d-%H%M%S)"
-    mkdir -p "$(dirname "$backup")"
-    mv "$dest" "$backup"
+  if [[ -d $PLUGIN_DEST ]]; then
+    local backup="$PLUGIN_BACKUPS/$PLUGIN_ID-$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$PLUGIN_BACKUPS"
+    mv "$PLUGIN_DEST" "$backup"
     echo "Plugin moved to $backup"
   fi
   rm -f "$HOME/.local/share/applications/omaface.desktop" \
     "$HOME/.local/share/icons/hicolor/scalable/apps/omaface.svg" \
     "$HOME/.config/omarchy/hooks/post-update.d/omaface"
-  local hc="$HOME/.local/bin/omarchy-health-check"
-  if [[ -f $hc ]] && grep -q 'omaface doctor' "$hc"; then
-    python3 -I - "$hc" <<'PY'
-import re, sys
-path = sys.argv[1]
-text = open(path).read()
-text = re.sub(r'head_ "(?:Face ID|omaFace)[^"]*"\n.*?\nfi\n\n', '', text, flags=re.S)
-open(path, "w").write(text)
-PY
-  fi
 
   echo "Removing the system parts (root)"
-  if [[ -t 0 ]]; then sudo "$LIB/uninstall" "$@"; else pkexec "$LIB/uninstall" "$@"; fi
+  run_root _teardown "$@"
+  if packaged; then
+    echo "The omaface package is still installed; remove it with: sudo pacman -Rns omaface"
+  fi
 }
 
 case "${1:-status}" in
@@ -645,7 +824,19 @@ case "${1:-status}" in
   settings) cmd_settings ;;
   sync) cmd_sync ;;
   doctor) shift; cmd_doctor "$@" ;;
+  setup) cmd_setup ;;
   uninstall) shift; cmd_uninstall "$@" ;;
+  # The root halves of setup and uninstall (through run_root).
+  _setup-root)
+    (( EUID == 0 )) || die "internal command"
+    [[ ${2:-} =~ ^(yes|no)$ && ${3:-} =~ ^(yes|no)$ ]] || die "usage: omaface _setup-root <login> <webcam>"
+    exec "$LIB/setup-root" "$2" "$3" ;;
+  _teardown)
+    (( EUID == 0 )) || die "internal command"
+    [[ -z ${2:-} || $2 == --keep-data ]] || die "usage: omaface _teardown [--keep-data]"
+    # A git install also takes its files away; pacman does that for the package.
+    if [[ -x $LIB/uninstall ]]; then exec "$LIB/uninstall" ${2:+"$2"}; fi
+    exec "$LIB/teardown" ${2:+"$2"} ;;
   -h | --help | help) usage ;;
   *) usage >&2; exit 2 ;;
 esac

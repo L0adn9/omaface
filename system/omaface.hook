@@ -7,4 +7,4 @@ Target = opencv
 [Action]
 Description = Rebuilding the omaFace engine against the new OpenCV...
 When = PostTransaction
-Exec = /usr/local/lib/omaface/rebuild
+Exec = @PREFIX@/lib/omaface/rebuild

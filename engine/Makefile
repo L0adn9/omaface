@@ -2,6 +2,8 @@ CXX ?= g++
 CC ?= gcc
 CXXFLAGS ?= -O2 -pipe
 CFLAGS ?= -O2 -pipe
+# Where the models live: /usr/local for the git install, /usr for the package.
+PREFIX ?= /usr/local
 HARDEN = -fstack-protector-strong -D_FORTIFY_SOURCE=3 -fPIE -Wall -Wextra
 LDHARDEN = -pie -Wl,-z,relro,-z,now -Wl,--as-needed
 # Arch ships OpenCV 5; derivatives may still have 4 (4.5.4+ has the face API).
@@ -12,10 +14,11 @@ OPENCV_LIBS = -lopencv_objdetect -lopencv_dnn -lopencv_imgcodecs -lopencv_imgpro
 all: omaface-engine omaface-pam
 
 omaface-engine: omaface-engine.cpp
-	$(CXX) $(CXXFLAGS) $(HARDEN) -std=c++17 $(OPENCV_CFLAGS) -o $@ $< $(LDHARDEN) $(OPENCV_LIBS)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(HARDEN) -std=c++17 -DOMAFACE_MODEL_DIR='"$(PREFIX)/share/omaface/models"' \
+		$(OPENCV_CFLAGS) -o $@ $< $(LDFLAGS) $(LDHARDEN) $(OPENCV_LIBS)
 
 omaface-pam: omaface-pam.c
-	$(CC) $(CFLAGS) $(HARDEN) -std=c11 -o $@ $< $(LDHARDEN)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(HARDEN) -std=c11 -o $@ $< $(LDFLAGS) $(LDHARDEN)
 
 clean:
 	rm -f omaface-engine omaface-pam

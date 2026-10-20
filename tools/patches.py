@@ -212,12 +212,12 @@ LOCK_SERVICE = [
   // (webcam strikes otherwise stay until then).
   Process {
     id: faceResetProc
-    command: ["bash", "-c", "[[ -x /usr/local/bin/omaface ]] && /usr/local/bin/omaface reset"]
+    command: ["bash", "-c", "[[ -x @PREFIX@/bin/omaface ]] && @PREFIX@/bin/omaface reset"]
   }
 
   Process {
     id: faceCheckProc
-    command: ["bash", "-c", "[[ -f /etc/pam.d/omaface-lock ]] && [[ -x /usr/local/bin/omaface ]] && /usr/local/bin/omaface ready lock && echo yes || echo no"]
+    command: ["bash", "-c", "[[ -f /etc/pam.d/omaface-lock ]] && [[ -x @PREFIX@/bin/omaface ]] && @PREFIX@/bin/omaface ready lock && echo yes || echo no"]
     stdout: StdioCollector { id: faceCheckStdout; waitForEnd: true }
     onExited: {
       root.faceConfigured = String(faceCheckStdout.text || "").trim() === "yes"
@@ -425,7 +425,7 @@ POLKIT = [
   function chooseFace(choice) {
     if (faceChooseProc.running) return
     faceState = choice === "face" ? "scanning" : "idle"
-    faceChooseProc.command = ["/usr/local/bin/omaface", "choose", choice]
+    faceChooseProc.command = ["@PREFIX@/bin/omaface", "choose", choice]
     faceChooseProc.running = true
   }
 
@@ -479,7 +479,7 @@ POLKIT = [
 
   Process {
     id: faceReadyProc
-    command: ["bash", "-c", "[[ -x /usr/local/bin/omaface ]] && /usr/local/bin/omaface ready polkit && echo yes || echo no"]
+    command: ["bash", "-c", "[[ -x @PREFIX@/bin/omaface ]] && @PREFIX@/bin/omaface ready polkit && echo yes || echo no"]
     stdout: StdioCollector { id: faceReadyOut; waitForEnd: true }
     onExited: root.faceReady = String(faceReadyOut.text || "").trim() === "yes"
   }

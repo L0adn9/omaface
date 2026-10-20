@@ -1,0 +1,33 @@
+post_install() {
+  cat <<'MSG'
+==> omaFace is installed but not switched on. As your user (not root), run:
+      omaface setup
+    It puts omaFace above the password for sudo, polkit and the login screen
+    and hands Omarchy's lock screen to omaFace. Then add your face with:
+      omaface enroll
+MSG
+}
+
+post_upgrade() {
+  if grep -q omaface-pam /etc/pam.d/sudo 2>/dev/null; then
+    echo "==> omaFace updated. Rebuild the shell plugin as your user: omaface sync"
+  fi
+}
+
+pre_remove() {
+  # Nothing may point at the engine once it is gone: PAM, the login theme,
+  # the service. Enrolled faces and settings stay.
+  /usr/lib/omaface/teardown --keep-data >/dev/null 2>&1 || true
+}
+
+post_remove() {
+  cat <<'MSG'
+==> omaFace is out of PAM and the login screen; passwords work as before.
+    If you did not run `omaface uninstall` first, give the lock screen and
+    polkit dialog back to Omarchy as your user:
+      omarchy plugin disable io.github.l0adn9.omaface
+      omarchy plugin enable omarchy.lock
+      omarchy plugin enable omarchy.polkit
+    Enrolled faces are kept: sudo rm -rf /var/lib/omaface /etc/omaface
+MSG
+}

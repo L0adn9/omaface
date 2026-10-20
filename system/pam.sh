@@ -1,5 +1,5 @@
-# Where omaFace goes in each PAM stack, shared by install.sh (checks before
-# anything changes), install-root.sh (the edit) and omaface doctor.
+# Where omaFace goes in each PAM stack, shared by install.sh and omaface setup
+# (checks before anything changes), setup-root (the edit) and omaface doctor.
 #
 # The omaFace line sits directly above the line that asks for the password,
 # so whatever comes before it (Omarchy's fingerprint reader and its lid gate)
@@ -79,4 +79,43 @@ sddm_autologin_user() {
     }
     END { if (user != "") print user }
   ' /etc/sddm.conf.d/*.conf /etc/sddm.conf 2>/dev/null
+}
+
+# omaface_preflight: can omaFace be set up here? Says why not on stderr and
+# fails, before anything is changed. Sets OMAFACE_LOGIN to yes when the login
+# screen can have it too (SDDM is the display manager), else no.
+omaface_preflight() {
+  if ! command -v omarchy >/dev/null || ! command -v omarchy-shell >/dev/null; then
+    echo "this is for Omarchy 4 (omarchy and omarchy-shell not found)" >&2
+    return 1
+  fi
+  if [[ ! -f /usr/share/omarchy/shell/plugins/lock/Service.qml ]]; then
+    echo "Omarchy's shell lock screen was not found; omaFace needs Omarchy 4 or newer (omarchy update)" >&2
+    return 1
+  fi
+  [[ -f /usr/lib/security/pam_exec.so ]] || { echo "pam_exec.so not found (pam package)" >&2; return 1; }
+  # Every PAM stack gets one line above its password line; check they all
+  # have one before anything is touched.
+  if ! pam_anchor /etc/pam.d/sudo "${PAM_ANCHORS_SUDO[@]}" >/dev/null; then
+    echo "/etc/pam.d/sudo has a layout omaFace does not recognize; nothing was changed" >&2
+    return 1
+  fi
+  local polkit_file
+  polkit_file=$(polkit_pam_file) || { echo "polkit has no PAM configuration" >&2; return 1; }
+  if ! pam_anchor "$polkit_file" "${PAM_ANCHORS_POLKIT[@]}" >/dev/null; then
+    echo "$polkit_file has a layout omaFace does not recognize; nothing was changed" >&2
+    return 1
+  fi
+  # The login screen needs SDDM as the display manager. Without it the other
+  # three places still work and login stays off.
+  OMAFACE_LOGIN=no
+  if sddm_in_use && pam_anchor /etc/pam.d/sddm "${PAM_ANCHORS_SDDM[@]}" >/dev/null; then
+    OMAFACE_LOGIN=yes
+    if [[ -n $(sddm_autologin_user) ]]; then
+      echo "  note: SDDM signs you in automatically, so the login screen never shows."
+      echo "        omaFace is set up for it anyway and works if you turn autologin off."
+    fi
+  else
+    echo "  note: SDDM is not your login manager; omaFace will not be offered at login"
+  fi
 }

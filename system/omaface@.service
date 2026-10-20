@@ -5,7 +5,7 @@ Description=omaFace verification
 CollectMode=inactive-or-failed
 
 [Service]
-ExecStart=/usr/local/lib/omaface/omaface-engine serve
+ExecStart=@PREFIX@/lib/omaface/omaface-engine serve
 StandardInput=socket
 StandardOutput=socket
 StandardError=journal

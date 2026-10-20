@@ -92,7 +92,7 @@ Item {
   function run(args, okText) {
     if (actionProc.running || enrollProc.running) return
     actionProc.okText = okText || ""
-    actionProc.command = ["pkexec", "/usr/local/bin/omaface"].concat(args)
+    actionProc.command = ["pkexec", "@PREFIX@/bin/omaface"].concat(args)
     actionProc.running = true
   }
 
@@ -103,7 +103,7 @@ Item {
     enrollHint = "Waiting for authorization…"
     enrollPhase = "auth"
     view = "enroll"
-    var args = ["pkexec", "/usr/local/bin/omaface", "enroll", "--ui"]
+    var args = ["pkexec", "@PREFIX@/bin/omaface", "enroll", "--ui"]
     if (appearances.length > 0) args = args.concat(["--name", "Appearance " + (appearances.length + 1)])
     enrollProc.command = args
     enrollProc.stdinEnabled = true
@@ -231,7 +231,7 @@ Item {
 
   Process {
     id: statusProc
-    command: ["/usr/local/bin/omaface", "status", "--json"]
+    command: ["@PREFIX@/bin/omaface", "status", "--json"]
     stdout: StdioCollector { id: statusOut; waitForEnd: true }
     onExited: {
       try {
@@ -286,7 +286,7 @@ Item {
 
   Process {
     id: testProc
-    command: ["/usr/local/bin/omaface", "test", "--json"]
+    command: ["@PREFIX@/bin/omaface", "test", "--json"]
     stdout: SplitParser { onRead: function(line) { root.handleTestLine(line) } }
     onExited: function(exitCode) {
       if (root.testState === "scanning") {

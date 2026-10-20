@@ -3,8 +3,8 @@
 # binary only replaces the old one after it passes the self-test; if anything
 # fails, omaFace quietly falls back to the password until this is re-run.
 
-SRC=/usr/local/src/omaface/engine
-LIB=/usr/local/lib/omaface
+SRC=@PREFIX@/src/omaface/engine
+LIB=@PREFIX@/lib/omaface
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT

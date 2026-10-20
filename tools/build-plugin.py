@@ -2,7 +2,10 @@
 """Build the io.github.l0adn9.omaface shell plugin from Omarchy's current lock screen
 and polkit dialog plus the omaFace patches.
 
-    build-plugin.py <plugin-src-dir> <out-dir>
+    build-plugin.py --prefix <prefix> <plugin-src-dir> <out-dir>
+
+<prefix> is where omaFace is installed (/usr for the package, /usr/local
+for the git install); the plugin calls <prefix>/bin/omaface.
 
 Fails without writing <out-dir> when any patch anchor is missing or
 ambiguous, so an Omarchy update can never leave a half-patched lock screen.
@@ -29,10 +32,11 @@ def sha256(path):
 
 
 def main():
-    if len(sys.argv) != 3:
+    args = sys.argv[1:]
+    if len(args) != 4 or args[0] != "--prefix" or not os.path.isabs(args[1]):
         print(__doc__.strip(), file=sys.stderr)
         return 2
-    src, out = sys.argv[1], sys.argv[2]
+    prefix, src, out = args[1].rstrip("/") or "/", args[2], args[3]
     problems = []
     built = {}
     hashes = {}
@@ -55,9 +59,15 @@ def main():
             text = text.replace(old, new)
         built[target] = text
 
+    own = {}
     for name in OWN_FILES:
-        if not os.path.isfile(os.path.join(src, name)):
+        path = os.path.join(src, name)
+        if not os.path.isfile(path):
             problems.append(f"missing plugin source file {name}")
+            continue
+        own[name] = sha256(path)
+        with open(path, encoding="utf-8") as f:
+            built[name] = f.read()
 
     if problems:
         print("omaface: plugin build failed, nothing was changed:", file=sys.stderr)
@@ -71,11 +81,12 @@ def main():
     try:
         for target, text in built.items():
             with open(os.path.join(stage, target), "w", encoding="utf-8") as f:
-                f.write(text)
-        for name in OWN_FILES:
-            shutil.copy2(os.path.join(src, name), os.path.join(stage, name))
+                f.write(text.replace("@PREFIX@", prefix))
+        # What it was built from: Omarchy's files, and omaFace's own (an
+        # upgrade of omaFace changes these, an Omarchy update the others).
         with open(os.path.join(stage, "upstream.json"), "w", encoding="utf-8") as f:
-            json.dump({"upstream": UPSTREAM, "sha256": hashes}, f, indent=2, sort_keys=True)
+            json.dump({"upstream": UPSTREAM, "sha256": hashes, "source": os.path.abspath(src), "own": own},
+                      f, indent=2, sort_keys=True)
             f.write("\n")
         if os.path.exists(out):
             shutil.rmtree(out)

@@ -16,12 +16,29 @@ check when it knows you, and shakes when it does not.
   <img src="docs/omaface-mark.gif" alt="The omaFace mark: idle, scanning, a pixel check mark on success, a shake on failure" width="200">
 </p>
 
+As a package, built from this repository (the AUR listing follows once AUR
+registration reopens):
+
+```
+git clone https://github.com/L0adn9/omaface ~/.local/src/omaface
+cd ~/.local/src/omaface/packaging/aur && makepkg -si
+omaface setup
+```
+
+(Coming from a git install? `omaface uninstall --keep-data` first; your
+faces and settings carry over.)
+
+Or installed straight from git:
+
 ```
 git clone https://github.com/L0adn9/omaface ~/.local/src/omaface
 cd ~/.local/src/omaface && ./install.sh
 ```
 
-Then open **omaFace** from the app launcher (or run `omaface settings`) and
+The package only puts files in place. `omaface setup` (run as your user; the
+git installer runs it for you) is what switches omaFace on: one line above the
+password in sudo, polkit and the login screen, and the lock screen and polkit
+dialog handed to the omaFace plugin. Then open **omaFace** from the app launcher (or run `omaface settings`) and
 choose **Set up omaFace**.
 
 ## What you need
@@ -29,11 +46,11 @@ choose **Set up omaFace**.
 * **Omarchy 4** or newer (the Quickshell lock screen).
 * **A camera.** omaFace looks for an infrared (Windows Hello) camera first and
   uses it when there is one. A laptop without one uses its regular webcam, for
-  everything, with a head-turn check on every scan (see
+  everything, with liveness and attention checks on every scan (see
   [Laptops without an IR camera](#laptops-without-an-ir-camera)). This is
   automatic; you do not need to know which camera you have.
-* About 120 MB for OpenCV if it is not installed yet. The installer lets
-  pacman list what it adds and asks first.
+* About 120 MB for OpenCV if it is not installed yet. pacman lists what it
+  adds and asks first.
 
 ## How it looks
 
@@ -182,6 +199,7 @@ one, is always used instead.
 
 ```
 omaface                     status
+omaface setup               switch omaFace on for you (the git installer runs it)
 omaface settings            the omaFace window
 omaface enroll              add your face (up to 3 appearances, e.g. with glasses)
 omaface test                look at the camera and see the scores
@@ -194,13 +212,14 @@ omaface set rgb_fallback on|off
 omaface cameras             cameras on this machine and which one is used
 omaface emitter             check that the IR light comes on
 omaface doctor              check every part
+omaface sync                rebuild the shell plugin (after updates it happens by itself)
 omaface uninstall           put everything back the way Omarchy had it
 ```
 
 ## Troubleshooting
 
 * **No camera found**: `omaface cameras`. If your IR camera is listed but not
-  picked, set `device=/dev/videoN` in `/etc/omaface/config`.
+  picked: `omaface set device /dev/videoN`.
 * **"No face found" all the time with an IR camera**: `omaface emitter`. Many
   Lenovo, Dell and HP laptops keep the IR light off until it is switched on
   once: `omarchy pkg aur add linux-enable-ir-emitter`, then
@@ -217,35 +236,50 @@ omaface uninstall           put everything back the way Omarchy had it
 
 ## Updates
 
-* **OpenCV upgrade**: a pacman hook rebuilds the engine and swaps it in only
-  after it passes a self-test.
+* **OpenCV upgrade**: the git install has a pacman hook that rebuilds the
+  engine and swaps it in only after it passes a self-test. The package is
+  rebuilt like any AUR package; until then omaFace steps aside and the
+  password works, and `omaface doctor` says so.
 * **Omarchy update**: a post-update hook runs `omaface doctor --after-update`.
   If Omarchy changed its lock screen or polkit dialog, the plugin is rebuilt
   from the new files; if that cannot be done cleanly, the working copy stays.
   If the plugin ever fails to load, Omarchy's own lock screen and polkit
   dialog are switched back on, so you are never left without a lock.
-* **omaFace itself**: `git pull && ./install.sh`. Enrolled faces and settings
-  are kept.
+* **omaFace itself**: the package updates with the rest of the system, and
+  the plugin is rebuilt after the next `omarchy update` (or now: `omaface
+  sync`). From git: `git pull && ./install.sh`. Enrolled faces and settings
+  are kept either way.
 
 ## Files
 
+The package installs under `/usr`, the git install under `/usr/local`
+(written `<prefix>` here); the git install's units live in `/etc/systemd`.
+
 | Path | What |
 |------|------|
-| `/usr/local/lib/omaface/` | `omaface-engine`, `omaface-pam`, `rebuild`, `uninstall` |
-| `/usr/local/bin/omaface` | the command |
-| `/usr/local/share/omaface/` | models (checksummed), plugin sources and build tool |
-| `/usr/local/src/omaface/` | engine sources for the OpenCV rebuild hook |
+| `<prefix>/lib/omaface/` | `omaface-engine`, `omaface-pam`, setup and teardown (git: also `rebuild`, `uninstall`) |
+| `<prefix>/bin/omaface` | the command |
+| `<prefix>/share/omaface/` | models (checksummed), plugin sources and build tool, default settings |
+| `/usr/share/sddm/themes/omaface/` | the login theme |
+| `omaface.socket`, `omaface@.service` | the scanner |
+| `/usr/local/src/omaface/`, `/etc/pacman.d/hooks/omaface.hook` | git only: rebuilds the engine when OpenCV upgrades |
+
+`omaface setup` adds:
+
+| Path | What |
+|------|------|
 | `/etc/omaface/config` | places, attention, ask first, webcam, thresholds, timeouts |
 | `/var/lib/omaface/` | enrolled faces, PAM backups |
-| `/etc/systemd/system/omaface.socket`, `omaface@.service` | the scanner |
 | `/etc/pam.d/{sudo,polkit-1,sddm}` | one marked line each; `omaface-lock` |
-| `/usr/share/sddm/themes/omaface/`, `/etc/sddm.conf.d/20-omaface.conf` | login |
-| `/etc/pacman.d/hooks/omaface.hook` | rebuilds the engine when OpenCV upgrades |
+| `/etc/sddm.conf.d/20-omaface.conf` | selects the login theme once a face is enrolled |
 | `~/.config/omarchy/plugins/io.github.l0adn9.omaface/` | lock screen, polkit dialog, settings |
 | `~/.config/omarchy/hooks/post-update.d/omaface` | runs the doctor after updates |
 
-`omaface uninstall` removes all of it (`--keep-data` keeps enrolled faces) and
-puts PAM, the lock screen, polkit and the login screen back as they were.
+`omaface uninstall` takes all of that back out (`--keep-data` keeps enrolled
+faces) and puts PAM, the lock screen, polkit and the login screen back as they
+were. A git install's files go with it; the package is then removed with
+`sudo pacman -Rns omaface`. Removing the package without it still takes
+omaFace out of PAM and the login screen first.
 
 ## Credits
 
