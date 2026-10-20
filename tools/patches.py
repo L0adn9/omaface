@@ -363,7 +363,7 @@ LOCK_VIEW = [
       text: root.faceLive === "turn-left" ? "\u2190  Turn your head left"
         : root.faceLive === "turn-right" ? "Turn your head right  \u2192"
         : root.faceLive === "turn-back" ? "Face the camera again"
-        : root.faceState === "attention" ? "Open your eyes and look at the camera" : "Look at the camera"
+        : root.faceState === "attention" ? "Open your eyes and look at the screen" : "Look at the screen"
       color: Commons.Color.lock.text
       opacity: root.faceLive !== "" ? 1 : 0.7
       font.family: Style.font.family
@@ -560,7 +560,7 @@ POLKIT = [
         : root.faceLive === "turn-left" ? "\u2190  Turn your head left"
         : root.faceLive === "turn-right" ? "Turn your head right  \u2192"
         : root.faceLive === "turn-back" ? "Face the camera again"
-        : "Look at the camera"
+        : "Look at the screen"
       color: root.foreground
       opacity: 0.7
       font.family: root.fontFamily

@@ -140,7 +140,7 @@ Item {
   function startTest() {
     if (testProc.running) return
     testState = "scanning"
-    testText = "Look at the camera…"
+    testText = "Look at the screen…"
     view = "test"
     testProc.running = true
   }
@@ -453,7 +453,7 @@ Item {
             SettingRow {
               width: parent.width
               title: "Require attention"
-              detail: root.webcam ? "Eyes open and on the screen, not on a phone or elsewhere" : "Eyes open and looking at the camera"
+              detail: "Eyes open and on the screen, not on a phone or elsewhere"
               checked: root.status.attention !== false
               busy: actionProc.running
               interactive: root.status.installed === true && !actionProc.running

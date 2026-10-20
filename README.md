@@ -1,6 +1,6 @@
 # omaFace
 
-Face unlock for [Omarchy](https://omarchy.org) 4, made by the community. Glance at the camera to unlock
+Face unlock for [Omarchy](https://omarchy.org) 4, made by the community. Look at the screen to unlock
 the lock screen, sign in at the login screen, answer `sudo`, or approve system
 prompts. Your password keeps working everywhere, always.
 
@@ -96,21 +96,21 @@ password. (`omaface set confirm off` scans right away instead.)
 
 ### Require attention
 
-On by default with an IR camera. omaFace only unlocks when **both eyes are
-open and looking at the camera**, so it does not open for someone asleep,
-looking at their phone, or turned away.
+On by default. omaFace only unlocks when **both eyes are open and on the
+screen**, so it does not open for someone asleep, looking at their phone, or
+turned away.
 
-It uses the IR light itself. The light sits beside the lens, so an eye looking
-into the camera reflects it straight back off the retina and the whole pupil
-glows (the same effect as red-eye in a flash photo). Closed, lowered or averted
-eyes show no glow. The head's angle, compared with how it sat when you
-enrolled, catches looking up or away.
+Two small models look at every frame that matches, on the IR camera and the
+webcam alike: Google's MediaPipe eye model checks that both eyelids are open,
+and a gaze model checks where the eyes point, against where they pointed at
+the screen when you enrolled. Your head's angle is checked too.
 
-* Glance at the camera; the lock screen says so while it scans.
-* The glow only shows within a few degrees of the camera, so looking at the
-  middle or bottom of the screen usually does not count.
-* Eyes closed, looking at the keyboard, squinting, or looking to the side do
-  not unlock. A miss never counts toward the lockout.
+* Anywhere on the screen counts, down to its bottom edge; you do not need to
+  look into the camera.
+* Eyes closed, eyes on your phone or your lap, or the head turned away do not
+  unlock. A miss never counts toward the lockout.
+* Eyes turned far to the side while the face still points at the screen are
+  not always caught on the IR camera; turning the head is.
 * Some glasses throw glare over the eyes. If omaFace recognizes you
   (`omaface test` says so) but never unlocks, turn attention off in Settings.
 
@@ -126,11 +126,8 @@ the same frames, with nothing for you to do:
   Silent-Face, trained to tell live faces from prints and screens) score every
   frame. A photo or a screen may fool them on a lucky frame, so it takes a run
   of about eight good frames in a row (a third of a second).
-* **Are you paying attention.** With Require attention on, a gaze model
-  checks where your eyes point, against where they pointed at the screen when
-  you enrolled, and Google's MediaPipe eye model checks the eyelids are open:
-  eyes closed, eyes on your phone or your lap, or the head turned away do not
-  unlock; anywhere on the screen does, down to its bottom edge.
+* **Are you paying attention**, the same check as on the IR camera (see
+  [Require attention](#require-attention)).
 * **Is it you**, with a stricter match threshold than the IR camera.
 
 Measured on a laptop webcam: the user unlocked in about 0.4 seconds; eyes
@@ -202,7 +199,7 @@ omaface                     status
 omaface setup               switch omaFace on for you (the git installer runs it)
 omaface settings            the omaFace window
 omaface enroll              add your face (up to 3 appearances, e.g. with glasses)
-omaface test                look at the camera and see the scores
+omaface test                look at the screen and see the scores
 omaface rename <N> <name>   rename an appearance
 omaface remove <N|all>      remove one, or all
 omaface enable|disable lock login sudo polkit
@@ -224,8 +221,9 @@ omaface uninstall           put everything back the way Omarchy had it
   Lenovo, Dell and HP laptops keep the IR light off until it is switched on
   once: `omarchy pkg aur add linux-enable-ir-emitter`, then
   `sudo linux-enable-ir-emitter configure`.
-* **Recognized but never unlocks**: look into the camera; if it still fails,
-  `omaface test` says whether it saw your eyes. Try `omaface set attention off`.
+* **Recognized but never unlocks**: `omaface test` says why for every frame
+  (eyes closed, looking away, head turned). Re-enrolling records where your
+  eyes point at the screen; `omaface set attention off` turns the check off.
 * **Lock screen misbehaving**: `omarchy plugin disable io.github.l0adn9.omaface` (brings
   back `omarchy.lock`), `omarchy plugin enable omarchy.polkit`, then
   `omarchy restart shell`. The same commands work from a TTY (Ctrl+Alt+F3).

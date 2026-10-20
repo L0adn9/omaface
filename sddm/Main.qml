@@ -157,7 +157,7 @@ Rectangle {
           : root.faceLive === "turn-left" ? "\u2190  turn your head left"
           : root.faceLive === "turn-right" ? "turn your head right  \u2192"
           : root.faceLive === "turn-back" ? "face the camera again"
-          : "look at the camera"
+          : "look at the screen"
         color: "#9ece6a"
         opacity: root.faceLive !== "" ? 1 : 0.6
         font.family: "JetBrainsMono Nerd Font"

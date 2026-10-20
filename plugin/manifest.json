@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.l0adn9.omaface",
   "name": "omaFace",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "author": "L0adn9",
   "description": "Face unlock with the IR camera for the lock screen, login screen, sudo and system prompts, with an eyes-open, looking-at-the-camera check. Omarchy's lock screen and polkit dialog with a omaFace flow beside the password.",
   "kinds": [

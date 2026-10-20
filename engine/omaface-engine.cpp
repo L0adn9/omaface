@@ -18,6 +18,7 @@
 #include <opencv2/imgproc.hpp>
 #include <opencv2/objdetect/face.hpp>
 
+#include <linux/uvcvideo.h>
 #include <linux/videodev2.h>
 #include <systemd/sd-login.h>
 #include <poll.h>
@@ -329,7 +330,17 @@ class Camera {
       return false;
     }
     streaming_ = true;
+    // Until a face is found, the middle of the frame, where faces sit.
+    if (ir_) meter(cv::Rect(width_ / 4, height_ / 5, width_ / 2, height_ * 3 / 5));
     return true;
+  }
+
+  // Keep the exposure metered on the face as it moves; a region that still
+  // mostly covers it is left alone.
+  void followFace(const cv::Rect& face) {
+    if (!ir_ || !meterable_) return;
+    cv::Rect overlap = face & metered_;
+    if (overlap.area() < 0.6 * face.area() || metered_.area() > 3 * face.area()) meter(face);
   }
 
   // Returns false on timeout or error. `out` is always greyscale; `colour`,
@@ -382,6 +393,38 @@ class Camera {
 
   uint32_t width() const { return width_; }
   bool ir() const { return ir_; }
+
+ private:
+  // UVC 1.5 cameras, many IR modules among them, meter auto-exposure on a
+  // region of interest. Left as it powers up, one metered a 1x1 spot in the
+  // dark top-left corner and blew a face at arm's length out to white, with
+  // no features to find; Windows Hello points the region at the face. The
+  // camera keeps the setting after it closes, so the next scan starts
+  // exposed for the face too. Cameras without the control just ignore this.
+  void meter(cv::Rect r) {
+    r &= cv::Rect(0, 0, int(width_), int(height_));
+    if (r.area() < 64) return;
+    v4l2_rect rect{r.x, r.y, uint32_t(r.width), uint32_t(r.height)};
+    v4l2_ext_control c{};
+    c.id = V4L2_CID_UVC_REGION_OF_INTEREST_RECT;
+    c.size = sizeof rect;
+    c.p_rect = &rect;
+    v4l2_ext_controls cs{};
+    cs.which = V4L2_CTRL_WHICH_CUR_VAL;
+    cs.count = 1;
+    cs.controls = &c;
+    if (!xioctl(fd_, VIDIOC_S_EXT_CTRLS, &cs)) { meterable_ = false; return; }
+    metered_ = r;
+    // The region only steers auto-exposure once this bit is on (and the
+    // camera refuses it while the region is still its 1x1 default).
+    v4l2_control autoCtrl{V4L2_CID_UVC_REGION_OF_INTEREST_AUTO, V4L2_UVC_REGION_OF_INTEREST_AUTO_EXPOSURE};
+    if (!meteringOn_) meteringOn_ = xioctl(fd_, VIDIOC_S_CTRL, &autoCtrl);
+  }
+
+  bool meterable_ = true, meteringOn_ = false;
+  cv::Rect metered_;
+
+ public:
 
   void close() {
     if (fd_ < 0) return;
@@ -503,12 +546,10 @@ struct Appearance {
   std::string name;
   std::string created;
   cv::Mat features;  // N x 128, rows L2-normalised
-  float eyeRing = 0; // the eyes as enrollment saw them (0 = not measured)
-  float eyeArea = 0;
   float headYaw = 0;  // head pose while looking straight at the screen
   float headPitch = 0;
   std::string kind = "ir";  // the camera it was enrolled with: "ir" or "rgb"
-  float gazeYaw = 0;        // webcam: gaze while looking at the screen, degrees
+  float gazeYaw = 0;        // gaze while looking at the screen, degrees
   float gazePitch = 0;
   bool hasGaze = false;
 };
@@ -528,8 +569,6 @@ std::vector<Appearance> loadGallery(const std::string& user) {
       (*it)["name"] >> a.name;
       (*it)["created"] >> a.created;
       (*it)["features"] >> a.features;
-      (*it)["eye_ring"] >> a.eyeRing;
-      (*it)["eye_area"] >> a.eyeArea;
       (*it)["head_yaw"] >> a.headYaw;
       (*it)["head_pitch"] >> a.headPitch;
       cv::FileNode gaze = (*it)["gaze"];
@@ -571,8 +610,7 @@ bool saveGallery(const std::string& user, const std::vector<Appearance>& gallery
     fs << "version" << 1;
     fs << "appearances" << "[";
     for (auto& a : gallery)
-      fs << "{" << "name" << a.name << "created" << a.created << "kind" << a.kind << "eye_ring" << a.eyeRing
-         << "eye_area" << a.eyeArea << "head_yaw" << a.headYaw << "head_pitch" << a.headPitch
+      fs << "{" << "name" << a.name << "created" << a.created << "kind" << a.kind << "head_yaw" << a.headYaw << "head_pitch" << a.headPitch
          << "gaze" << "[" << a.gazeYaw << a.gazePitch << "]"
          << "features" << a.features << "}";
     fs << "]";
@@ -606,94 +644,124 @@ double bestScore(const std::vector<Appearance>& gallery, const cv::Mat& feat, si
 
 // ------------------------------------------------------------------ attention
 
-// omaFace should not open for a face that is asleep or looking elsewhere.
-// The IR light sits right beside the lens, so an eye pointed at the camera
-// sends the light straight back off the retina: the whole pupil glows, like
-// red-eye in a flash photo. The glow only shows within a few degrees of the
-// camera (measured: strong looking into it, mostly gone at the middle of the
-// screen), so this asks for a glance at the camera. A closed or downcast eye
-// shows no glow, and an eye turned away keeps at most a tiny corneal glint. Measured on both eyes in a patch normalised to the
-// distance between them, so face size and head tilt do not matter.
-
-struct EyeReading {
-  float ring = 0;   // how much the brightest blob outshines the ring around it
-  float area = 0;   // its size, in a patch where the eyes are 100 px apart
-  float offset = 0; // how far it sits from the eye landmark, same units
-};
-
-EyeReading readEye(const cv::Mat& grey, cv::Point2f eye, double angle, double scale) {
-  // Map the eye to the middle of a 60x40 patch, eye line level, eyes 100 px apart.
-  double al = scale * std::cos(angle), be = scale * std::sin(angle);
-  cv::Matx23d M(al, be, (1 - al) * eye.x - be * eye.y + 30 - eye.x,
-                -be, al, be * eye.x + (1 - al) * eye.y + 20 - eye.y);
-  cv::Mat patch;
-  cv::warpAffine(grey, patch, M, cv::Size(60, 40), cv::INTER_LINEAR, cv::BORDER_REPLICATE);
-  const cv::Rect core(10, 6, 40, 28);
-  cv::Mat c = patch(core);
-  double mx;
-  cv::Point mxl;
-  cv::minMaxLoc(c, nullptr, &mx, nullptr, &mxl);
-  std::vector<uchar> v(c.begin<uchar>(), c.end<uchar>());
-  std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
-  double med = v[v.size() / 2];
-  cv::Mat labels;
-  cv::connectedComponents(c >= std::max(med + 0.6 * (mx - med), med + 25.0), labels, 8);
-  cv::Mat blob = labels == labels.at<int>(mxl);
-  EyeReading r;
-  r.area = cv::countNonZero(blob);
-  cv::Mat grown, ring;
-  cv::dilate(blob, grown, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(7, 7)));
-  ring = grown & ~blob;
-  double inside = cv::mean(c, blob)[0];
-  r.ring = cv::countNonZero(ring) ? float(inside - cv::mean(c, ring)[0]) : 0.f;
-  double sx = 0, sy = 0;
-  for (int y = 0; y < blob.rows; y++)
-    for (int x = 0; x < blob.cols; x++)
-      if (blob.at<uchar>(y, x)) { sx += x; sy += y; }
-  float cx = r.area ? sx / r.area : mxl.x, cy = r.area ? sy / r.area : mxl.y;
-  r.offset = std::max(std::fabs(cx - (30 - core.x)), std::fabs(cy - (20 - core.y)));
-  return r;
-}
-
-// Both eyes, YuNet's right eye (image left) first.
-void readEyes(const cv::Mat& grey, const Face& f, EyeReading& right, EyeReading& left) {
-  const float* p = f.row.ptr<float>();
-  cv::Point2f re(p[4], p[5]), le(p[6], p[7]);
-  cv::Point2f d = le - re;
-  double iod = std::max(1.0f, std::hypot(d.x, d.y));
-  double angle = std::atan2(d.y, d.x);
-  right = readEye(grey, re, angle, 100.0 / iod);
-  left = readEye(grey, le, angle, 100.0 / iod);
-}
-
 cv::Point2f headPose(const Face& f);
 
-// "ok", or why not: "head" (turned away) or "eyes" (closed, or looking away).
-// An appearance enrolled with a baseline scales the cut-offs to that person
-// and camera (some IR modules give a dark pupil and only a corneal glint);
-// without one, the defaults were measured on a bright-pupil camera.
+// omaFace should not open for a face that is asleep or looking elsewhere. Two
+// models judge every matching frame, on the IR camera and the webcam alike:
+// MediaPipe's eye landmarks (are both eyelids open) and a Gaze360 gaze model
+// (where the eyes point), with the head turned toward the screen.
 //
-// The glow also shows looking a little above the camera. Tilting the head
-// back to look up gives that away: the pitch drops more than 0.1 below how
-// the head sat at enrollment, while posture and lid angle move it by about
-// 0.05 from day to day.
-std::string attentionCheck(const cv::Mat& grey, const Face& f, const Appearance& a) {
-  cv::Point2f pose = headPose(f);
-  bool havePose = a.headPitch > 0;
-  if (std::fabs(pose.x - (havePose ? a.headYaw : 0.f)) > 0.2f) return "head";
-  if (havePose && pose.y < a.headPitch - 0.09f) return "head";
-  float ringMin = 40, areaMin = 20, areaMax = 250;
-  if (a.eyeRing > 0 && a.eyeArea > 0) {
-    ringMin = std::clamp(a.eyeRing * 0.45f, 25.0f, 60.0f);
-    areaMin = std::clamp(a.eyeArea * 0.3f, 3.0f, 20.0f);
-    areaMax = std::max(250.0f, a.eyeArea * 4);
+// Gaze is relative to the gaze measured at enrollment. On a laptop webcam,
+// looking at the screen stayed within about 16 degrees down (its bottom edge)
+// and 10 up (the camera); a phone read 18-61 degrees down depending on how it
+// was held, and a monitor above the laptop 20-32 up. Hence 20 down and 14 up:
+// a phone held right under the screen's edge is, to any camera, the screen.
+//
+// Eyelids, as height over width of the eye contour: on the webcam 0.05-0.17
+// closed and 0.28-0.34 on the screen, so 0.18. On the IR camera (grey,
+// lit from beside the lens) 0.11-0.20 closed or looking down at a phone and
+// 0.26-0.37 on the screen, so 0.22. Blinks dip lower and only restart the run.
+//
+// (Before, the IR camera looked for the pupil glowing in its light, which
+// only shows looking almost straight into the lens and fades in daylight: it
+// asked for a glance at the camera, not the screen.)
+class Attention {
+ public:
+  static constexpr float kEyesOpenWebcam = 0.18f, kEyesOpenIr = 0.22f;
+  static constexpr float kGazeDown = 20, kGazeUp = 14, kGazeSide = 25;
+
+  bool load(std::string& err) {
+    try {
+      iris_ = cv::dnn::readNet(kIrisModel);
+      gaze_ = cv::dnn::readNet(kGazeModel);
+    } catch (const cv::Exception& e) {
+      err = std::string("attention models: ") + e.what();
+      return false;
+    }
+    if (iris_.empty() || gaze_.empty()) { err = "attention models missing"; return false; }
+    return true;
   }
-  EyeReading r, l;
-  readEyes(grey, f, r, l);
-  for (auto& e : {r, l})
-    if (e.ring < ringMin || e.area < areaMin || e.area > areaMax || e.offset > 10) return "eyes";
-  return "ok";
-}
+
+  static float eyesOpenAt(bool ir) { return ir ? kEyesOpenIr : kEyesOpenWebcam; }
+
+  // "ok", "head" (turned away), "eyes" (closed) or "away" (eyes on
+  // something other than the screen: a phone, a lap, another room).
+  std::string check(const cv::Mat& bgr, const Face& f, const Appearance& a, bool ir) {
+    float facing = a.headPitch > 0 ? a.headYaw : 0.f;
+    if (std::fabs(headPose(f).x - facing) > 0.2f) return "head";
+    lastEyes = eyesOpen(bgr, f);
+    if (lastEyes < eyesOpenAt(ir)) return "eyes";
+    cv::Point2f g = gaze(bgr, f);
+    float dy = g.x - (a.hasGaze ? a.gazeYaw : 0.f), dp = g.y - (a.hasGaze ? a.gazePitch : 0.f);
+    lastGaze = {dy, dp};
+    return (dp < -kGazeDown || dp > kGazeUp || std::fabs(dy) > kGazeSide) ? "away" : "ok";
+  }
+
+  // Gaze in degrees (yaw, pitch; pitch up is positive) from the face crop,
+  // as the model was trained: RGB 448x448, ImageNet normalisation, 90 bins
+  // of 4 degrees from -180, read as the expected value.
+  cv::Point2f gaze(const cv::Mat& bgr, const Face& f) {
+    const float* p = f.row.ptr<float>();
+    cv::Rect box = cv::Rect(int(p[0]), int(p[1]), int(p[2]), int(p[3])) & cv::Rect(0, 0, bgr.cols, bgr.rows);
+    if (box.width < 8 || box.height < 8) return {0, 0};
+    cv::Mat rgb;
+    cv::cvtColor(bgr(box), rgb, cv::COLOR_BGR2RGB);
+    cv::resize(rgb, rgb, cv::Size(448, 448));
+    rgb.convertTo(rgb, CV_32F, 1 / 255.0);
+    cv::subtract(rgb, cv::Scalar(0.485, 0.456, 0.406), rgb);
+    cv::divide(rgb, cv::Scalar(0.229, 0.224, 0.225), rgb);
+    gaze_.setInput(cv::dnn::blobFromImage(rgb));
+    std::vector<cv::Mat> outs;
+    gaze_.forward(outs, std::vector<cv::String>{"yaw", "pitch"});
+    float angles[2];
+    for (int k = 0; k < 2; k++) {
+      cv::Mat logits = outs[k].reshape(1, 1), e;
+      double top;
+      cv::minMaxLoc(logits, nullptr, &top);
+      cv::exp(logits - top, e);
+      double sum = cv::sum(e)[0], expected = 0;
+      for (int i = 0; i < e.cols; i++) expected += e.at<float>(0, i) * i;
+      angles[k] = float(expected / sum * 4 - 180);
+    }
+    return {angles[0], angles[1]};
+  }
+
+  // The less open eye: eyelid height over width, from the eye contour.
+  float eyesOpen(const cv::Mat& bgr, const Face& f) {
+    const float* p = f.row.ptr<float>();
+    cv::Point2f re(p[4], p[5]), le(p[6], p[7]), d = le - re;
+    double iod = std::max(1.0f, std::hypot(d.x, d.y)), angle = std::atan2(d.y, d.x);
+    return std::min(eyeOpen(bgr, re, angle, iod, false), eyeOpen(bgr, le, angle, iod, true));
+  }
+
+  // The last frame judged, gaze relative to enrollment (degrees), for the
+  // self-test.
+  cv::Point2f lastGaze{0, 0};
+  float lastEyes = 0;
+
+ private:
+  // A square eye crop about one eye-spacing wide, eye line level, the left
+  // eye mirrored (the model sees every eye the same way round), RGB 0-1.
+  float eyeOpen(const cv::Mat& bgr, cv::Point2f eye, double angle, double iod, bool mirror) {
+    double s = 64.0 / iod, al = s * std::cos(angle), be = s * std::sin(angle);
+    cv::Matx23d M(al, be, (1 - al) * eye.x - be * eye.y + 32 - eye.x,
+                  -be, al, be * eye.x + (1 - al) * eye.y + 32 - eye.y);
+    cv::Mat patch;
+    cv::warpAffine(bgr, patch, M, cv::Size(64, 64), cv::INTER_LINEAR, cv::BORDER_REPLICATE);
+    if (mirror) cv::flip(patch, patch, 1);
+    iris_.setInput(cv::dnn::blobFromImage(patch, 1 / 255.0, cv::Size(64, 64), cv::Scalar(), true));
+    cv::Mat contour = iris_.forward("output_eyes_contours_and_brows").reshape(1, 71);
+    float minX = 1e9f, maxX = -1e9f, minY = 1e9f, maxY = -1e9f;
+    for (int k = 0; k < 16; k++) {  // the first 16 points outline the eyelids
+      float x = contour.at<float>(k, 0), y = contour.at<float>(k, 1);
+      minX = std::min(minX, x); maxX = std::max(maxX, x);
+      minY = std::min(minY, y); maxY = std::max(maxY, y);
+    }
+    return (maxY - minY) / std::max(1e-3f, maxX - minX);
+  }
+
+  cv::dnn::Net iris_, gaze_;
+};
 
 // ------------------------------------------------------------------ system checks
 
@@ -977,97 +1045,33 @@ std::string headTurnChallenge(Camera& cam, FaceModels& models, const std::vector
 // ------------------------------------------------------------------ webcam checks
 
 // A regular webcam sees what eyes see, so a photo or a phone screen showing
-// the face looks like the face. These run on the same frames as recognition,
-// with nothing for the person to do:
-//   live      two anti-spoofing models (Silent-Face MiniFASNet V2 and V1SE,
-//             trained to tell live faces from prints and screens), averaged
-//   attention both eyelids open (MediaPipe's eye landmarks) and the head
-//             turned toward the screen
+// the face looks like the face. Two anti-spoofing models (Silent-Face
+// MiniFASNet V2 and V1SE, trained to tell live faces from prints and
+// screens), averaged, run on the same frames as recognition, with nothing
+// for the person to do. (An IR camera needs none: a print or a screen does
+// not look like skin in its light.)
 // Measured on a laptop webcam: live faces scored 0.99-1.00 on V1SE and
 // 0.78-0.98 on V2; a photo and a video on a phone swung between 0 and 0.98
 // from frame to frame, so a run of good frames is required.
-//
-// Attention is where the eyes point (a Gaze360 gaze model) and that they are
-// open. Relative to the gaze measured at enrollment, looking at the screen
-// stayed within about 16 degrees down (its bottom edge) and 10 up (the
-// camera); a phone read 18-61 degrees down depending on how it was held, and
-// a monitor above the laptop 20-32 up. Hence 20 down and 14 up: a phone held
-// right under the screen's edge is, to any camera, the screen. Eyelids read
-// 0.05-0.17 closed (never more, across sessions and light) and 0.28-0.34
-// looking at the screen (blinks dip lower and only restart the run), so 0.18;
-// the very bottom edge of the screen (about 0.19) can take a moment longer.
-class WebcamChecks {
+class Liveness {
  public:
   static constexpr float kLive = 0.85f;
-  static constexpr float kEyesOpen = 0.18f;
-  static constexpr float kGazeDown = 20, kGazeUp = 14, kGazeSide = 25;
 
   bool load(std::string& err) {
     try {
       spoofA_ = cv::dnn::readNet(kSpoofModelA);
       spoofB_ = cv::dnn::readNet(kSpoofModelB);
-      iris_ = cv::dnn::readNet(kIrisModel);
-      gaze_ = cv::dnn::readNet(kGazeModel);
     } catch (const cv::Exception& e) {
       err = std::string("webcam models: ") + e.what();
       return false;
     }
-    return !spoofA_.empty() && !spoofB_.empty() && !iris_.empty() && !gaze_.empty();
+    if (spoofA_.empty() || spoofB_.empty()) { err = "webcam models missing"; return false; }
+    return true;
   }
 
   // 0-1: how sure the anti-spoofing models are that this is a live face.
   float live(const cv::Mat& bgr, const Face& f) {
     return 0.5f * (liveScore(spoofA_, crop(bgr, f, 2.7)) + liveScore(spoofB_, crop(bgr, f, 4.0)));
-  }
-
-  // "ok", "head" (turned away), "eyes" (closed) or "away" (eyes on
-  // something other than the screen: a phone, a lap, another room).
-  std::string attention(const cv::Mat& bgr, const Face& f, const Appearance& a) {
-    float facing = a.headPitch > 0 ? a.headYaw : 0.f;
-    if (std::fabs(headPose(f).x - facing) > 0.2f) return "head";
-    lastEyes = eyesOpen(bgr, f);
-    if (lastEyes < kEyesOpen) return "eyes";
-    cv::Point2f g = gaze(bgr, f);
-    float dy = g.x - (a.hasGaze ? a.gazeYaw : 0.f), dp = g.y - (a.hasGaze ? a.gazePitch : 0.f);
-    lastGaze = {dy, dp};
-    return (dp < -kGazeDown || dp > kGazeUp || std::fabs(dy) > kGazeSide) ? "away" : "ok";
-  }
-
-  // Gaze in degrees (yaw, pitch; pitch up is positive) from the face crop,
-  // as the model was trained: RGB 448x448, ImageNet normalisation, 90 bins
-  // of 4 degrees from -180, read as the expected value.
-  cv::Point2f gaze(const cv::Mat& bgr, const Face& f) {
-    const float* p = f.row.ptr<float>();
-    cv::Rect box = cv::Rect(int(p[0]), int(p[1]), int(p[2]), int(p[3])) & cv::Rect(0, 0, bgr.cols, bgr.rows);
-    if (box.width < 8 || box.height < 8) return {0, 0};
-    cv::Mat rgb;
-    cv::cvtColor(bgr(box), rgb, cv::COLOR_BGR2RGB);
-    cv::resize(rgb, rgb, cv::Size(448, 448));
-    rgb.convertTo(rgb, CV_32F, 1 / 255.0);
-    cv::subtract(rgb, cv::Scalar(0.485, 0.456, 0.406), rgb);
-    cv::divide(rgb, cv::Scalar(0.229, 0.224, 0.225), rgb);
-    gaze_.setInput(cv::dnn::blobFromImage(rgb));
-    std::vector<cv::Mat> outs;
-    gaze_.forward(outs, std::vector<cv::String>{"yaw", "pitch"});
-    float angles[2];
-    for (int k = 0; k < 2; k++) {
-      cv::Mat logits = outs[k].reshape(1, 1), e;
-      double top;
-      cv::minMaxLoc(logits, nullptr, &top);
-      cv::exp(logits - top, e);
-      double sum = cv::sum(e)[0], expected = 0;
-      for (int i = 0; i < e.cols; i++) expected += e.at<float>(0, i) * i;
-      angles[k] = float(expected / sum * 4 - 180);
-    }
-    return {angles[0], angles[1]};
-  }
-
-  // The less open eye: eyelid height over width, from the eye contour.
-  float eyesOpen(const cv::Mat& bgr, const Face& f) {
-    const float* p = f.row.ptr<float>();
-    cv::Point2f re(p[4], p[5]), le(p[6], p[7]), d = le - re;
-    double iod = std::max(1.0f, std::hypot(d.x, d.y)), angle = std::atan2(d.y, d.x);
-    return std::min(eyeOpen(bgr, re, angle, iod, false), eyeOpen(bgr, le, angle, iod, true));
   }
 
  private:
@@ -1094,32 +1098,7 @@ class WebcamChecks {
     return float(e.at<float>(0, 1) / cv::sum(e)[0]);
   }
 
-  // A square eye crop about one eye-spacing wide, eye line level, the left
-  // eye mirrored (the model sees every eye the same way round), RGB 0-1.
-  float eyeOpen(const cv::Mat& bgr, cv::Point2f eye, double angle, double iod, bool mirror) {
-    double s = 64.0 / iod, al = s * std::cos(angle), be = s * std::sin(angle);
-    cv::Matx23d M(al, be, (1 - al) * eye.x - be * eye.y + 32 - eye.x,
-                  -be, al, be * eye.x + (1 - al) * eye.y + 32 - eye.y);
-    cv::Mat patch;
-    cv::warpAffine(bgr, patch, M, cv::Size(64, 64), cv::INTER_LINEAR, cv::BORDER_REPLICATE);
-    if (mirror) cv::flip(patch, patch, 1);
-    iris_.setInput(cv::dnn::blobFromImage(patch, 1 / 255.0, cv::Size(64, 64), cv::Scalar(), true));
-    cv::Mat contour = iris_.forward("output_eyes_contours_and_brows").reshape(1, 71);
-    float minX = 1e9f, maxX = -1e9f, minY = 1e9f, maxY = -1e9f;
-    for (int k = 0; k < 16; k++) {  // the first 16 points outline the eyelids
-      float x = contour.at<float>(k, 0), y = contour.at<float>(k, 1);
-      minX = std::min(minX, x); maxX = std::max(maxX, x);
-      minY = std::min(minY, y); maxY = std::max(maxY, y);
-    }
-    return (maxY - minY) / std::max(1e-3f, maxX - minX);
-  }
-
-  cv::dnn::Net spoofA_, spoofB_, iris_, gaze_;
-
- public:
-  // The last gaze judged, relative to enrollment (degrees), for the self-test.
-  cv::Point2f lastGaze{0, 0};
-  float lastEyes = 0;
+  cv::dnn::Net spoofA_, spoofB_;
 };
 
 std::string choicePath(uid_t uid) { return std::string(kRunDir) + "/choice-" + std::to_string(uid); }
@@ -1223,8 +1202,8 @@ int serve() {
 
   // Which camera decides the rules. The IR camera when there is one; when
   // there is none, the regular webcam (rgb_fallback), everywhere, with the
-  // head-turn check on every scan, sudo and system prompts always waiting
-  // for the person to ask, and sticky strikes. Appearances only match the
+  // anti-spoofing check on every scan, sudo and system prompts always
+  // waiting for the person to ask, and sticky strikes. Appearances only match the
   // kind of camera they were enrolled with.
   CameraInfo info;
   bool haveCamera = findCamera(cfg, info);
@@ -1281,17 +1260,22 @@ int serve() {
     return finish("unavailable camera");
   }
   const int minFace = minFaceFor(cfg, cam);
-  WebcamChecks webcam;
-  if (rgb && !webcam.load(err)) { fprintf(stderr, "%s\n", err.c_str()); return finish("error models"); }
+  // Fail closed: without its models a check would quietly pass everything.
+  Attention attention;
+  if (cfg.attention && !attention.load(err)) { fprintf(stderr, "%s\n", err.c_str()); return finish("error models"); }
+  Liveness liveness;
+  if (rgb && !liveness.load(err)) { fprintf(stderr, "%s\n", err.c_str()); return finish("error models"); }
 
   writeStatus(key, "scanning", seq);
   sendLine("STATUS scanning");
 
   auto start = Clock::now();
   int matches = 0, rejected = 0, inattentive = 0, notLive = 0;
-  // IR: two matching frames in a row. Webcam: a run of eight (~0.3 s), since
-  // a photo or a screen can pass the anti-spoofing models on a lucky frame.
-  const int needed = rgb ? 8 : cfg.matchFrames;
+  // IR: a few matching frames in a row (three when attention is on, about
+  // 0.4 s, so one eyelid reading near the line cannot open it). Webcam: a
+  // run of eight, since a photo or a screen can pass the anti-spoofing
+  // models on a lucky frame.
+  const int needed = rgb ? 8 : cfg.attention ? std::max(cfg.matchFrames, 3) : cfg.matchFrames;
   bool sawFace = false;
   std::string lastStatus = "scanning";
   cv::Mat grey, bgr;
@@ -1314,7 +1298,9 @@ int serve() {
     if (!cam.grab(grey, 500, &bgr)) continue;
     if (unusable(cam, darkFilter, grey)) continue;
     Face face;
-    if (!models.detect(bgr, face) || face.width < minFace) {
+    bool found = models.detect(bgr, face);
+    if (found) cam.followFace(cv::Rect(faceBox(face)));
+    if (!found || face.width < minFace) {
       matches = 0;
       if (lastStatus != "noface") { sendLine("STATUS noface"); lastStatus = "noface"; }
       continue;
@@ -1330,16 +1316,16 @@ int serve() {
     double score = bestScore(gallery, models.feature(bgr, face), &which);
     // Attention and liveness only matter for a face that matched (and are
     // always shown by the self-test).
-    std::string attention = "off";
+    std::string attentive = "off";
     float live = -1;
     if (score >= threshold || test) {
-      if (cfg.attention) attention = rgb ? webcam.attention(bgr, face, gallery[which]) : attentionCheck(grey, face, gallery[which]);
-      if (rgb) live = webcam.live(bgr, face);
+      if (cfg.attention) attentive = attention.check(bgr, face, gallery[which], !rgb);
+      if (rgb) live = liveness.live(bgr, face);
     }
     if (test) {
       char b[160];
       snprintf(b, sizeof b, "SCORE %.3f width %.0f attention %s live %.2f gaze %.0f %.0f eyes %.2f", score, face.width,
-               attention.c_str(), live, webcam.lastGaze.x, webcam.lastGaze.y, webcam.lastEyes);
+               attentive.c_str(), live, attention.lastGaze.x, attention.lastGaze.y, attention.lastEyes);
       sendLine(b);
     }
 
@@ -1347,13 +1333,13 @@ int serve() {
       matches = 0;
       rejected++;
       if (lastStatus != "nomatch") { sendLine("STATUS nomatch"); lastStatus = "nomatch"; }
-    } else if (attention != "off" && attention != "ok") {
+    } else if (attentive != "off" && attentive != "ok") {
       // Your face, but asleep or looking elsewhere: not a match, and not a
       // stranger either, so it never counts toward the lockout.
       matches = 0;
       inattentive++;
       if (lastStatus != "attention") { sendLine("STATUS attention"); lastStatus = "attention"; }
-    } else if (rgb && live < WebcamChecks::kLive) {
+    } else if (rgb && live < Liveness::kLive) {
       matches = 0;
       notLive++;
       if (lastStatus != "notlive") { sendLine("STATUS notlive"); lastStatus = "notlive"; }
@@ -1587,33 +1573,23 @@ int enroll(const std::string& user, const std::string& name, bool ui) {
   bool haveCenter = false;
   cv::Point2f center(0, 0);
   std::vector<cv::Point2f> centerSamples;
-  // The eyes as the straight-ahead samples see them: this person's baseline
-  // for the attention check. Glare (some glasses) can hide them; after a few
-  // seconds enrollment goes on without, and the defaults apply.
-  std::vector<float> eyeRings, eyeAreas;
+  // Where this person's eyes point looking at the screen: the baseline for
+  // the attention check. The straight-ahead samples wait for open eyes;
+  // some glasses hide them in glare, so after a few seconds enrollment goes
+  // on without, and the scan measures from straight ahead instead.
+  Attention attention;
+  const bool measureEyes = attention.load(err);
+  std::vector<float> gazeYaws, gazePitches;
   bool frontalSeen = false;
   auto frontalStart = Clock::now();
-  // A webcam has no pupil glow; it measures the eyelids instead (the
-  // person's own "looking at the screen" for the attention check).
-  WebcamChecks webcam;
-  const bool webcamEyes = !cam.ir() && access(kGazeModel, R_OK) == 0 && webcam.load(err);
-  std::vector<float> gazeYaws, gazePitches;
-  auto eyesOpenNow = [&](const cv::Mat& frame, const cv::Mat& colour, const Face& f) {
-    if (!cam.ir()) {
-      if (webcamEyes) {
-        cv::Point2f g = webcam.gaze(colour, f);
-        gazeYaws.push_back(g.x);
-        gazePitches.push_back(g.y);
-      }
-      return true;
-    }
-    EyeReading r, l;
-    readEyes(frame, f, r, l);
+  auto eyesOpenNow = [&](const cv::Mat& colour, const Face& f) {
+    if (!measureEyes) return true;
     if (!frontalSeen) { frontalSeen = true; frontalStart = Clock::now(); }
-    bool open = std::min(r.ring, l.ring) >= 25 && std::min(r.area, l.area) >= 3 && std::max(r.offset, l.offset) <= 10;
+    bool open = attention.eyesOpen(colour, f) >= Attention::eyesOpenAt(cam.ir());
     if (open) {
-      eyeRings.push_back(std::min(r.ring, l.ring));
-      eyeAreas.push_back(std::min(r.area, l.area));
+      cv::Point2f g = attention.gaze(colour, f);
+      gazeYaws.push_back(g.x);
+      gazePitches.push_back(g.y);
     }
     return open || secondsSince(frontalStart) > 8;
   };
@@ -1636,6 +1612,7 @@ int enroll(const std::string& user, const std::string& name, bool ui) {
     bool got = models.detect(bgr, face, &count);
     cv::Rect focus(0, 0, grey.cols, grey.rows);
     if (got) {
+      cam.followFace(cv::Rect(faceBox(face)));
       const float* p = face.row.ptr<float>();
       float cx = p[0] + p[2] / 2, cy = p[1] + p[3] / 2, s = std::max(p[2], p[3]) * 1.9f;
       focus = cv::Rect(int(cx - s / 2), int(cy - s * 0.42f * 1.25f), int(s), int(s * 0.62f * 1.25f));
@@ -1647,7 +1624,7 @@ int enroll(const std::string& user, const std::string& name, bool ui) {
     else if (face.score < 0.88f) hint = "Hold still";
     else {
       cv::Point2f pose = headPose(face);
-      if (!haveCenter && !eyesOpenNow(grey, bgr, face)) {
+      if (!haveCenter && !eyesOpenNow(bgr, face)) {
         hint = "Open your eyes and look at the screen";
       } else if (!haveCenter) {
         centerSamples.push_back(pose);
@@ -1665,7 +1642,7 @@ int enroll(const std::string& user, const std::string& name, bool ui) {
         float mag = std::hypot(d.x, d.y);
         if (mag < 0.07f) {
           hint = "Slowly move your head in a circle";
-          if (frontal.size() < 8 && eyesOpenNow(grey, bgr, face)) frontal.push_back(models.feature(bgr, face));
+          if (frontal.size() < 8 && eyesOpenNow(bgr, face)) frontal.push_back(models.feature(bgr, face));
         } else if (mag > 0.75f) {
           hint = "Not so far";
         } else {
@@ -1713,14 +1690,6 @@ int enroll(const std::string& user, const std::string& name, bool ui) {
   if (a.name.empty()) a.name = gallery.empty() ? "Face" : "Appearance " + std::to_string(gallery.size() + 1);
   a.created = nowIso();
   a.kind = cam.ir() ? "ir" : "rgb";
-  if (eyeRings.size() >= 3) {
-    auto median = [](std::vector<float> v) {
-      std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
-      return v[v.size() / 2];
-    };
-    a.eyeRing = median(eyeRings);
-    a.eyeArea = median(eyeAreas);
-  }
   a.headYaw = center.x;
   a.headPitch = center.y;
   if (gazeYaws.size() >= 3) {
@@ -1740,7 +1709,7 @@ int enroll(const std::string& user, const std::string& name, bool ui) {
   writeFailures(pw->pw_uid, Failures{});
 
   emit("{\"type\":\"done\",\"samples\":" + std::to_string(a.features.rows) + ",\"appearances\":" +
-           std::to_string(gallery.size()) + ",\"eyes\":" + (a.eyeRing > 0 ? "true" : "false") + "}",
+           std::to_string(gallery.size()) + ",\"eyes\":" + (a.hasGaze ? "true" : "false") + "}",
        "omaFace: enrolled \"" + a.name + "\" (" + std::to_string(a.features.rows) + " samples).");
   return 0;
 }
@@ -1869,17 +1838,16 @@ int selftest() {
   std::copy(pts, pts + 15, p);
   cv::Mat feat = models.feature(bgr, face);
   if (feat.cols != kFeatureSize) { fprintf(stderr, "unexpected feature size %d\n", feat.cols); return 1; }
-  // The webcam models too, when installed: a broken OpenCV must not leave a
-  // webcam-only laptop with checks that silently do nothing.
-  if (access(kGazeModel, R_OK) == 0) {
-    WebcamChecks webcam;
-    if (!webcam.load(err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
-    float live = webcam.live(bgr, face), open = webcam.eyesOpen(bgr, face);
-    cv::Point2f g = webcam.gaze(bgr, face);
-    if (!(live >= 0 && live <= 1) || !(open >= 0 && open < 10) || !(std::fabs(g.x) <= 180 && std::fabs(g.y) <= 180)) {
-      fprintf(stderr, "webcam models gave nonsense (live %f, eyes %f, gaze %f %f)\n", live, open, g.x, g.y);
-      return 1;
-    }
+  // The attention and anti-spoofing models too: a broken OpenCV must not
+  // leave checks that quietly do nothing (a scan refuses to run without them).
+  Attention attention;
+  Liveness liveness;
+  if (!attention.load(err) || !liveness.load(err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
+  float live = liveness.live(bgr, face), open = attention.eyesOpen(bgr, face);
+  cv::Point2f g = attention.gaze(bgr, face);
+  if (!(live >= 0 && live <= 1) || !(open >= 0 && open < 10) || !(std::fabs(g.x) <= 180 && std::fabs(g.y) <= 180)) {
+    fprintf(stderr, "models gave nonsense (live %f, eyes %f, gaze %f %f)\n", live, open, g.x, g.y);
+    return 1;
   }
   printf("ok\n");
   return 0;

@@ -41,7 +41,7 @@ Usage: omaface <command>
   cameras                    list cameras and which one omaFace uses
   emitter                    check that the IR light comes on
   enroll [--name NAME]       add your face (or an alternate appearance)
-  test                       look at the camera and see if you are recognized
+  test                       look at the screen and see if you are recognized
   rename <N> <name>          rename appearance N (see status)
   remove <N|all>             remove appearance N (see status) or all of them
   enable  <place...|all>     use omaFace for: lock login sudo polkit
@@ -180,7 +180,7 @@ cmd_status() {
   done
   if login_supported && [[ -n $(sddm_autologin_user) ]]; then echo "  (SDDM signs you in automatically, so the login screen does not show)"; fi
   printf '  %-12s %s\n' ask-first "$([[ $(conf_get confirm on) == off ]] && echo "off (sudo and system prompts scan right away)" || echo "on (sudo and system prompts wait for Enter or a click)")"
-  printf '  %-12s %s\n' attention "$([[ $(conf_get attention on) == off ]] && echo "off (any open or closed eyes)" || echo "on (eyes open, looking at the camera)")"
+  printf '  %-12s %s\n' attention "$([[ $(conf_get attention on) == off ]] && echo "off (any open or closed eyes)" || echo "on (eyes open, on the screen)")"
   if locked_out "$user"; then echo "  paused after too many failed scans (use your password once to resume)"; fi
   return 0
 }
@@ -345,11 +345,11 @@ s.sendall(f"VERIFY {user} omaface-test\n".encode())
 best, buf = None, b""
 messages = {"fail": "Not recognized", "timeout": "No face found", "locked-out": "Paused after too many attempts",
             "busy": "Camera busy", "disabled": "omaFace is off",
-            "attention": "Recognized, but your eyes were closed or you were not looking at the camera"}
+            "attention": "Recognized, but your eyes were closed or not on the screen"}
 moves = {"turn-left": "<- turn your head LEFT", "turn-right": "turn your head RIGHT ->", "turn-back": "face the camera again"}
 liveness = {"spoof": "it did not look like a live face (a photo or a screen?)", "wrong": "moved the wrong way", "slow": "did not follow in time", "early": "moved before being asked",
             "lost": "the face left the camera or was swapped", "identity": "a different face turned back"}
-eyes = {"ok": "paying attention", "eyes": "eyes closed or not looking at the camera",
+eyes = {"ok": "paying attention", "eyes": "eyes closed",
         "away": "looking away from the screen", "head": "head turned or tilted away", "off": "attention off"}
 seen_attention = set()
 def out(obj, text):

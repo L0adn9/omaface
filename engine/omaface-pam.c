@@ -212,10 +212,10 @@ int main(void) {
         else if (!strcmp(buf, "STATUS turn-right")) say("turn your head to the right…", 0);
         else say("now face the camera again…", 0);
       } else if (!strcmp(buf, "STATUS scanning")) {
-        say("looking at the camera…  \033[2m(any key for your password)\033[0m", 0);
+        say("look at the screen…  \033[2m(any key for your password)\033[0m", 0);
       }
       else if (!strcmp(buf, "STATUS attention") && !said_attention) {
-        say("look at the camera with your eyes open…", 0);
+        say("open your eyes and look at the screen…", 0);
         said_attention = 1;
       } else if (!strcmp(buf, "STATUS nomatch") && !said_nomatch) {
         say("not recognized yet…", 0);
@@ -225,7 +225,7 @@ int main(void) {
         ok = !strcmp(result, "ok");
         if (ok) say("\033[32mrecognized\033[0m", 1);
         else if (!strcmp(result, "fail")) say("not recognized", 1);
-        else if (!strcmp(result, "attention")) say("eyes closed or not looking at the camera", 1);
+        else if (!strcmp(result, "attention")) say("eyes closed or not on the screen", 1);
         else if (!strcmp(result, "timeout")) say("no face found", 1);
         else if (!strcmp(result, "locked-out")) say("too many attempts, use your password", 1);
         else if (!strcmp(result, "timeout choose")) say("no choice made, using your password", 1);

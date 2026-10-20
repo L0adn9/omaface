@@ -1,7 +1,7 @@
 # Maintainer: L0adn9 <70851700+L0adn9@users.noreply.github.com>
 
 pkgname=omaface
-pkgver=1.2.0
+pkgver=1.2.1
 pkgrel=1
 pkgdesc='Face unlock for Omarchy: lock screen, login, sudo and polkit, with an IR camera or a regular webcam'
 arch=('x86_64')

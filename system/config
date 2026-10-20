@@ -14,8 +14,8 @@ polkit=on
 confirm=on
 timeout_choose=30
 
-# Require attention: only unlock when your eyes are open and looking at the
-# camera (checked with the IR light's reflection in your pupils).
+# Require attention: only unlock when your eyes are open and on the screen
+# (an eye model and a gaze model look at every matching frame).
 attention=on
 
 # Matching. Higher threshold = stricter. A match needs this many lit IR
