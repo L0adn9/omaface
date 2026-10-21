@@ -671,6 +671,7 @@ Item {
           Text {
             width: parent.width
             horizontalAlignment: Text.AlignHCenter
+            wrapMode: Text.WordWrap
             textFormat: Text.PlainText
             text: root.testText
             color: root.foreground
