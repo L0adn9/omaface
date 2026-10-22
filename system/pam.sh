@@ -86,17 +86,11 @@ sddm_autologin_user() {
 # screen can have it too (SDDM is the display manager), else no.
 omaface_preflight() {
   if ! command -v omarchy >/dev/null || ! command -v omarchy-shell >/dev/null; then
-    echo "this is for Omarchy 4.5 (omarchy and omarchy-shell not found)" >&2
+    echo "this is for Omarchy 4 (omarchy and omarchy-shell not found)" >&2
     return 1
   fi
   if [[ ! -f /usr/share/omarchy/shell/plugins/lock/Service.qml ]]; then
-    echo "Omarchy's shell lock screen was not found; omaFace needs Omarchy 4.5 or newer (omarchy update)" >&2
-    return 1
-  fi
-  # 4.5 replaced IpcHandler with ShellIpc for shell targets; the plugin's
-  # build patches the new files and cannot be used with the old ones.
-  if [[ ! -f /usr/share/omarchy/shell/Commons/ShellIpc.qml ]]; then
-    echo "omaFace needs Omarchy 4.5 or newer for its shell IPC (omarchy update)" >&2
+    echo "Omarchy's shell lock screen was not found; omaFace needs Omarchy 4 or newer (omarchy update)" >&2
     return 1
   fi
   [[ -f /usr/lib/security/pam_exec.so ]] || { echo "pam_exec.so not found (pam package)" >&2; return 1; }

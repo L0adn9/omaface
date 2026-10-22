@@ -498,22 +498,35 @@ cmd_sync() {
   return 1
 }
 
-# Omarchy 4.5 keeps plugin enablement in its registry rather than in
-# shell.json's disabledPlugins alone; ask the registry when it is available.
-plugin_list() { timeout 5 omarchy plugin list --json 2>/dev/null; }
+# Omarchy 4.5 keeps plugin enablement in its registry; older releases only
+# record the stock handover in shell.json, so fall back to that.
+plugin_registry() {
+  local out
+  out=$(timeout 5 omarchy plugin list --json 2>/dev/null) || return 1
+  jq -e 'type == "array" and any(.[]; has("enabled"))' <<<"$out" >/dev/null 2>&1 || return 1
+  printf '%s\n' "$out"
+}
 
 plugin_enabled() {
   local out
-  out=$(plugin_list) || return 1
-  jq -e --arg id "$PLUGIN_ID" 'type == "array" and any(.[]; .id == $id and .enabled)' <<<"$out" >/dev/null 2>&1
+  if out=$(plugin_registry); then
+    jq -e --arg id "$PLUGIN_ID" 'any(.[]; .id == $id and .enabled)' <<<"$out" >/dev/null 2>&1
+  else
+    jq -e --arg id "$PLUGIN_ID" '(.disabledPlugins // []) | index($id) | not' \
+      "$HOME/.config/omarchy/shell.json" >/dev/null 2>&1
+  fi
 }
 
 stock_handed_over() {
   local out
-  out=$(plugin_list) || return 1
-  jq -e 'type == "array"
-    and any(.[]; .id == "omarchy.lock" and (.enabled | not))
-    and any(.[]; .id == "omarchy.polkit" and (.enabled | not))' <<<"$out" >/dev/null 2>&1
+  if out=$(plugin_registry); then
+    jq -e 'type == "array"
+      and any(.[]; .id == "omarchy.lock" and (.enabled | not))
+      and any(.[]; .id == "omarchy.polkit" and (.enabled | not))' <<<"$out" >/dev/null 2>&1
+  else
+    jq -e '(.disabledPlugins // []) | (index("omarchy.lock") != null and index("omarchy.polkit") != null)' \
+      "$HOME/.config/omarchy/shell.json" >/dev/null 2>&1
+  fi
 }
 
 plugin_live() {
@@ -636,30 +649,15 @@ cmd_doctor() {
 
   local plugin_dir=$PLUGIN_DEST
   if [[ -f $plugin_dir/manifest.json ]]; then ok "shell plugin installed"; else bad "shell plugin missing: omaface setup"; fi
-  local plugins_json=""
-  if command -v omarchy >/dev/null 2>&1; then
-    plugins_json=$(plugin_list || true)
-  fi
-  if jq -e 'type == "array" and any(.[]; has("enabled"))' <<<"$plugins_json" >/dev/null 2>&1; then
-    if jq -e --arg id "$PLUGIN_ID" 'any(.[]; .id == $id and .enabled)' <<<"$plugins_json" >/dev/null; then
-      ok "omaFace plugin enabled"
-    else
-      bad "omaFace plugin is disabled: omaface setup"
-    fi
-    if jq -e 'any(.[]; .id == "omarchy.lock" and (.enabled | not))
-      and any(.[]; .id == "omarchy.polkit" and (.enabled | not))' <<<"$plugins_json" >/dev/null; then
-      ok "stock lock + polkit plugins handed over"
-    else
-      bad "omarchy.lock / omarchy.polkit still enabled next to omaFace: omaface setup"
-    fi
+  if plugin_enabled; then
+    ok "omaFace plugin enabled"
   else
-    # Omarchy before 4.5 only recorded the handover in shell.json.
-    local shell_json="$HOME/.config/omarchy/shell.json"
-    if jq -e '(.disabledPlugins // []) | (index("omarchy.lock") != null and index("omarchy.polkit") != null)' "$shell_json" >/dev/null 2>&1; then
-      ok "stock lock + polkit plugins handed over"
-    else
-      bad "omarchy.lock / omarchy.polkit still enabled next to omaFace: omaface setup"
-    fi
+    bad "omaFace plugin is disabled: omaface setup"
+  fi
+  if stock_handed_over; then
+    ok "stock lock + polkit plugins handed over"
+  else
+    bad "omarchy.lock / omarchy.polkit still enabled next to omaFace: omaface setup"
   fi
   local live=1
   if [[ $mode == --after-update ]]; then wait_plugin_live || live=0; else plugin_live || live=0; fi

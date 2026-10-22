@@ -5,10 +5,30 @@ appear exactly once, otherwise the build stops and the installed plugin is
 left alone (see build-plugin.py). Keep snippets small so upstream changes
 elsewhere in the files never conflict.
 
-The anchors target Omarchy 4.5, which renamed the shell's IpcHandler to
-ShellIpc and split fingerprint state into FingerprintModel.js. On older files
-the anchors do not match, so setup stops before replacing a working plugin.
+Omarchy 4.5 changed three anchors in lock/Service.qml and added two files that
+the lock service imports. LOCK_SERVICE_45 carries those variants; build-plugin
+picks the file set that matches the installed Omarchy.
 """
+
+
+def _replace(patches, *variants):
+    """Return patches with 4.0 entries replaced by their version variant."""
+    result = list(patches)
+    for old, replacement in variants:
+        for index, patch in enumerate(result):
+            if patch[0] == old:
+                result[index] = replacement
+                break
+        else:
+            raise ValueError(f"no patch entry for anchor: {old!r}")
+    return result
+
+
+def _shell_ipc(patches):
+    """The 4.5 IPC patch is the 4.0 one with ShellIpc instead of IpcHandler."""
+    old, new = next(p for p in patches if p[0].startswith("  IpcHandler {\n"))
+    return old.replace("IpcHandler", "ShellIpc"), new.replace("IpcHandler", "ShellIpc")
+
 
 LOCK_SERVICE = [
     # State for the third authentication flow.
@@ -30,19 +50,14 @@ LOCK_SERVICE = [
 """,
     ),
     (
-        "    fingerprintRetryTimer.stop()\n    fingerprintReachTimer.stop()\n"
-        "    fingerprintResumeTimer.stop()\n    if (passwordPam.active) passwordPam.abort()\n"
-        "    if (fingerprintPam.active) fingerprintPam.abort()\n",
+        "    fingerprintRetryTimer.stop()\n    if (passwordPam.active) passwordPam.abort()\n",
         """    fingerprintRetryTimer.stop()
-    fingerprintReachTimer.stop()
-    fingerprintResumeTimer.stop()
     faceSuccessTimer.stop()
     faceIdleTimer.stop()
     faceFailures = 0
     faceState = "idle"
     if (facePam.active) facePam.abort()
     if (passwordPam.active) passwordPam.abort()
-    if (fingerprintPam.active) fingerprintPam.abort()
 """,
     ),
     (
@@ -239,14 +254,8 @@ LOCK_SERVICE = [
 """,
     ),
     (
-        "  Component.onCompleted: {\n    knownScreenCount = realScreenCount()\n"
-        "    refreshBackground()\n    refreshFingerprintStatus()\n",
-        """  Component.onCompleted: {
-    knownScreenCount = realScreenCount()
-    refreshBackground()
-    refreshFingerprintStatus()
-    refreshFaceStatus()
-""",
+        "  Component.onCompleted: {\n    refreshBackground()\n    refreshFingerprintStatus()\n",
+        "  Component.onCompleted: {\n    refreshBackground()\n    refreshFingerprintStatus()\n    refreshFaceStatus()\n",
     ),
     (
         "        fingerprint: root.fingerprintConfigured,\n",
@@ -259,7 +268,7 @@ LOCK_SERVICE = [
     # The polkit dialog lives in this service too, so one plugin owns every
     # password prompt in the shell; omarchy.polkit stays disabled meanwhile.
     (
-        "  ShellIpc {\n    target: \"lock\"\n",
+        "  IpcHandler {\n    target: \"lock\"\n",
         """  Polkit {
     id: polkitDialog
   }
@@ -272,7 +281,7 @@ LOCK_SERVICE = [
     onLoaded: item.closed.connect(function() { faceSettings.active = false })
   }
 
-  ShellIpc {
+  IpcHandler {
     target: "omaface"
 
     function status(): string {
@@ -303,7 +312,7 @@ LOCK_SERVICE = [
     }
   }
 
-  ShellIpc {
+  IpcHandler {
     target: "lock"
 """,
     ),
@@ -316,6 +325,50 @@ LOCK_SERVICE = [
 """,
     ),
 ]
+
+# Omarchy 4.5 moved the lock service's reset and Component.onCompleted blocks
+# and replaced IpcHandler with ShellIpc. Keep the 4.0 anchors above and derive
+# the 4.5 variants, so the shared patches stay defined once.
+LOCK_SERVICE_45 = _replace(
+    LOCK_SERVICE,
+    (
+        "    fingerprintRetryTimer.stop()\n    if (passwordPam.active) passwordPam.abort()\n",
+        (
+            "    fingerprintRetryTimer.stop()\n    fingerprintReachTimer.stop()\n"
+            "    fingerprintResumeTimer.stop()\n    if (passwordPam.active) passwordPam.abort()\n"
+            "    if (fingerprintPam.active) fingerprintPam.abort()\n",
+            """    fingerprintRetryTimer.stop()
+    fingerprintReachTimer.stop()
+    fingerprintResumeTimer.stop()
+    faceSuccessTimer.stop()
+    faceIdleTimer.stop()
+    faceFailures = 0
+    faceState = "idle"
+    if (facePam.active) facePam.abort()
+    if (passwordPam.active) passwordPam.abort()
+    if (fingerprintPam.active) fingerprintPam.abort()
+""",
+        ),
+    ),
+    (
+        "  Component.onCompleted: {\n    refreshBackground()\n    refreshFingerprintStatus()\n",
+        (
+            "  Component.onCompleted: {\n    knownScreenCount = realScreenCount()\n"
+            "    refreshBackground()\n    refreshFingerprintStatus()\n",
+            """  Component.onCompleted: {
+    knownScreenCount = realScreenCount()
+    refreshBackground()
+    refreshFingerprintStatus()
+    refreshFaceStatus()
+""",
+        ),
+    ),
+    (
+        "  IpcHandler {\n    target: \"lock\"\n",
+        _shell_ipc(LOCK_SERVICE),
+    ),
+)
+
 
 LOCK_VIEW = [
     (
@@ -598,11 +651,22 @@ POLKIT = [
 ]
 
 # (upstream path relative to the shell plugins dir, file name in the plugin, patches)
-FILES = [
+FILES_40 = [
     ("lock/Service.qml", "Service.qml", LOCK_SERVICE),
+    ("lock/LockView.qml", "LockView.qml", LOCK_VIEW),
+    ("polkit/PolkitAgent.qml", "Polkit.qml", POLKIT),
+    ("polkit/PolkitModel.js", "PolkitModel.js", []),
+]
+
+# Omarchy 4.5's lock service imports these; they do not exist on 4.0.
+FILES_45 = [
+    ("lock/Service.qml", "Service.qml", LOCK_SERVICE_45),
     ("lock/LockView.qml", "LockView.qml", LOCK_VIEW),
     ("lock/FingerprintModel.js", "FingerprintModel.js", []),
     ("lock/LockFeedSurface.qml", "LockFeedSurface.qml", []),
     ("polkit/PolkitAgent.qml", "Polkit.qml", POLKIT),
     ("polkit/PolkitModel.js", "PolkitModel.js", []),
 ]
+
+# build-plugin.py tries each set and uses the first whose anchors all match.
+FILE_SETS = [("4.5", FILES_45), ("4.0", FILES_40)]

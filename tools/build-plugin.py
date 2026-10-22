@@ -7,8 +7,10 @@ and polkit dialog plus the omaFace patches.
 <prefix> is where omaFace is installed (/usr for the package, /usr/local
 for the git install); the plugin calls <prefix>/bin/omaface.
 
-Fails without writing <out-dir> when any patch anchor is missing or
-ambiguous, so an Omarchy update can never leave a half-patched lock screen.
+Omarchy 4.0 and 4.5 need different anchors; the file set whose anchors all
+match the installed Omarchy is used. Fails without writing <out-dir> when no
+set matches or a patch anchor is missing or ambiguous, so an Omarchy update
+can never leave a half-patched lock screen.
 """
 
 import hashlib
@@ -31,17 +33,12 @@ def sha256(path):
         return hashlib.sha256(f.read()).hexdigest()
 
 
-def main():
-    args = sys.argv[1:]
-    if len(args) != 4 or args[0] != "--prefix" or not os.path.isabs(args[1]):
-        print(__doc__.strip(), file=sys.stderr)
-        return 2
-    prefix, src, out = args[1].rstrip("/") or "/", args[2], args[3]
+def patch_files(files):
+    """Apply one anchor set; return (problems, built files, upstream hashes)."""
     problems = []
     built = {}
     hashes = {}
-
-    for upstream_rel, target, file_patches in patches.FILES:
+    for upstream_rel, target, file_patches in files:
         path = os.path.join(UPSTREAM, upstream_rel)
         try:
             with open(path, encoding="utf-8") as f:
@@ -58,8 +55,19 @@ def main():
                 continue
             text = text.replace(old, new)
         built[target] = text
+    return problems, built, hashes
+
+
+def main():
+    args = sys.argv[1:]
+    if len(args) != 4 or args[0] != "--prefix" or not os.path.isabs(args[1]):
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    prefix, src, out = args[1].rstrip("/") or "/", args[2], args[3]
 
     own = {}
+    own_text = {}
+    problems = []
     for name in OWN_FILES:
         path = os.path.join(src, name)
         if not os.path.isfile(path):
@@ -67,13 +75,33 @@ def main():
             continue
         own[name] = sha256(path)
         with open(path, encoding="utf-8") as f:
-            built[name] = f.read()
-
+            own_text[name] = f.read()
     if problems:
         print("omaface: plugin build failed, nothing was changed:", file=sys.stderr)
         for p in problems:
             print(f"  - {p}", file=sys.stderr)
         return 1
+
+    selected = None
+    failures = []
+    for label, files in patches.FILE_SETS:
+        problems, built, hashes = patch_files(files)
+        if not problems:
+            selected = (label, built, hashes)
+            break
+        failures.append((label, problems))
+
+    if selected is None:
+        print("omaface: plugin build failed, nothing was changed:", file=sys.stderr)
+        print(f"  no omaFace patch set matches the shell sources in {UPSTREAM}", file=sys.stderr)
+        for label, problems in failures:
+            print(f"  Omarchy {label} anchors:", file=sys.stderr)
+            for p in problems:
+                print(f"    - {p}", file=sys.stderr)
+        return 1
+
+    label, built, hashes = selected
+    built.update(own_text)
 
     parent = os.path.dirname(os.path.abspath(out)) or "."
     os.makedirs(parent, exist_ok=True)
@@ -95,7 +123,7 @@ def main():
     except BaseException:
         shutil.rmtree(stage, ignore_errors=True)
         raise
-    print(f"omaface: plugin built in {out}")
+    print(f"omaface: plugin built in {out} (Omarchy {label} lock screen)")
     return 0
 
 

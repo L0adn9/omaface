@@ -1,6 +1,6 @@
 # omaFace
 
-Face unlock for [Omarchy](https://omarchy.org) 4.5, made by the community. Look at the screen to unlock
+Face unlock for [Omarchy](https://omarchy.org) 4, made by the community. Look at the screen to unlock
 the lock screen, sign in at the login screen, answer `sudo`, or approve system
 prompts. Your password keeps working everywhere, always.
 
@@ -43,7 +43,8 @@ choose **Set up omaFace**.
 
 ## What you need
 
-* **Omarchy 4.5** or newer (the Quickshell lock screen and shell IPC).
+* **Omarchy 4** or newer (the Quickshell lock screen). Both the 4.0 and 4.5
+  shell plugin APIs are supported.
 * **A camera.** omaFace looks for an infrared (Windows Hello) camera first and
   uses it when there is one. A laptop without one uses its regular webcam, for
   everything, with liveness and attention checks on every scan (see
