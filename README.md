@@ -1,6 +1,6 @@
 # omaFace
 
-Face unlock for [Omarchy](https://omarchy.org) 4, made by the community. Look at the screen to unlock
+Face unlock for [Omarchy](https://omarchy.org) 4.5, made by the community. Look at the screen to unlock
 the lock screen, sign in at the login screen, answer `sudo`, or approve system
 prompts. Your password keeps working everywhere, always.
 
@@ -43,7 +43,7 @@ choose **Set up omaFace**.
 
 ## What you need
 
-* **Omarchy 4** or newer (the Quickshell lock screen).
+* **Omarchy 4.5** or newer (the Quickshell lock screen and shell IPC).
 * **A camera.** omaFace looks for an infrared (Windows Hello) camera first and
   uses it when there is one. A laptop without one uses its regular webcam, for
   everything, with liveness and attention checks on every scan (see
@@ -247,7 +247,8 @@ say, which is what it takes to make omaFace work on more laptops.
   If Omarchy changed its lock screen or polkit dialog, the plugin is rebuilt
   from the new files; if that cannot be done cleanly, the working copy stays.
   If the plugin ever fails to load, Omarchy's own lock screen and polkit
-  dialog are switched back on, so you are never left without a lock.
+  dialog are switched back on, so you are never left without a lock. A later
+  `omaface sync` rebuilds the plugin and puts the handover back.
 * **omaFace itself**: the package updates with the rest of the system, and
   the plugin is rebuilt after the next `omarchy update` (or now: `omaface
   sync`). From git: `git pull && ./install.sh`. Enrolled faces and settings

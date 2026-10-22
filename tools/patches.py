@@ -4,6 +4,10 @@ Each patch replaces one exact snippet of the upstream file. Every `old` must
 appear exactly once, otherwise the build stops and the installed plugin is
 left alone (see build-plugin.py). Keep snippets small so upstream changes
 elsewhere in the files never conflict.
+
+The anchors target Omarchy 4.5, which renamed the shell's IpcHandler to
+ShellIpc and split fingerprint state into FingerprintModel.js. On older files
+the anchors do not match, so setup stops before replacing a working plugin.
 """
 
 LOCK_SERVICE = [
@@ -26,14 +30,19 @@ LOCK_SERVICE = [
 """,
     ),
     (
-        "    fingerprintRetryTimer.stop()\n    if (passwordPam.active) passwordPam.abort()\n",
+        "    fingerprintRetryTimer.stop()\n    fingerprintReachTimer.stop()\n"
+        "    fingerprintResumeTimer.stop()\n    if (passwordPam.active) passwordPam.abort()\n"
+        "    if (fingerprintPam.active) fingerprintPam.abort()\n",
         """    fingerprintRetryTimer.stop()
+    fingerprintReachTimer.stop()
+    fingerprintResumeTimer.stop()
     faceSuccessTimer.stop()
     faceIdleTimer.stop()
     faceFailures = 0
     faceState = "idle"
     if (facePam.active) facePam.abort()
     if (passwordPam.active) passwordPam.abort()
+    if (fingerprintPam.active) fingerprintPam.abort()
 """,
     ),
     (
@@ -230,8 +239,14 @@ LOCK_SERVICE = [
 """,
     ),
     (
-        "  Component.onCompleted: {\n    refreshBackground()\n    refreshFingerprintStatus()\n",
-        "  Component.onCompleted: {\n    refreshBackground()\n    refreshFingerprintStatus()\n    refreshFaceStatus()\n",
+        "  Component.onCompleted: {\n    knownScreenCount = realScreenCount()\n"
+        "    refreshBackground()\n    refreshFingerprintStatus()\n",
+        """  Component.onCompleted: {
+    knownScreenCount = realScreenCount()
+    refreshBackground()
+    refreshFingerprintStatus()
+    refreshFaceStatus()
+""",
     ),
     (
         "        fingerprint: root.fingerprintConfigured,\n",
@@ -244,7 +259,7 @@ LOCK_SERVICE = [
     # The polkit dialog lives in this service too, so one plugin owns every
     # password prompt in the shell; omarchy.polkit stays disabled meanwhile.
     (
-        "  IpcHandler {\n    target: \"lock\"\n",
+        "  ShellIpc {\n    target: \"lock\"\n",
         """  Polkit {
     id: polkitDialog
   }
@@ -257,7 +272,7 @@ LOCK_SERVICE = [
     onLoaded: item.closed.connect(function() { faceSettings.active = false })
   }
 
-  IpcHandler {
+  ShellIpc {
     target: "omaface"
 
     function status(): string {
@@ -288,7 +303,7 @@ LOCK_SERVICE = [
     }
   }
 
-  IpcHandler {
+  ShellIpc {
     target: "lock"
 """,
     ),
@@ -586,6 +601,8 @@ POLKIT = [
 FILES = [
     ("lock/Service.qml", "Service.qml", LOCK_SERVICE),
     ("lock/LockView.qml", "LockView.qml", LOCK_VIEW),
+    ("lock/FingerprintModel.js", "FingerprintModel.js", []),
+    ("lock/LockFeedSurface.qml", "LockFeedSurface.qml", []),
     ("polkit/PolkitAgent.qml", "Polkit.qml", POLKIT),
     ("polkit/PolkitModel.js", "PolkitModel.js", []),
 ]
