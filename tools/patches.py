@@ -26,7 +26,10 @@ def _replace(patches, *variants):
 
 def _shell_ipc(patches):
     """The 4.5 IPC patch is the 4.0 one with ShellIpc instead of IpcHandler."""
-    old, new = next(p for p in patches if p[0].startswith("  IpcHandler {\n"))
+    matches = [p for p in patches if p[0].startswith("  IpcHandler {\n")]
+    if len(matches) != 1:
+        raise ValueError(f"expected one IpcHandler anchor, found {len(matches)}")
+    old, new = matches[0]
     return old.replace("IpcHandler", "ShellIpc"), new.replace("IpcHandler", "ShellIpc")
 
 
