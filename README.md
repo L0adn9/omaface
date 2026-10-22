@@ -56,7 +56,7 @@ choose **Set up omaFace**.
 
 <table>
   <tr>
-    <td width="50%"><img src="docs/system-prompt.png" alt="A system prompt offering omaFace: Enter or click for omaFace, type for password"></td>
+    <td width="50%"><img src="docs/system-prompt.png" alt="The system prompt for changing omaFace settings, offering omaFace: Enter or click for omaFace, type for password"></td>
     <td width="50%"><img src="docs/sudo.png" alt="sudo in a terminal: Enter to use your face, Esc or any other key for your password"></td>
   </tr>
   <tr>
@@ -65,11 +65,11 @@ choose **Set up omaFace**.
   </tr>
   <tr>
     <td><img src="docs/settings.png" alt="The omaFace settings window: places, attention, ask first, appearances"></td>
-    <td><img src="docs/enroll.png" alt="Enrollment: a ring of ticks fills as the head moves in a circle around a braille preview"><br><br><img src="docs/lock-webcam.png" alt="Webcam mode on the lock screen: turn your head left"></td>
+    <td><img src="docs/enroll.png" alt="Enrollment: a ring of ticks fills as the head moves in a circle around a braille preview"><br><br><img src="docs/lock-screen-scan.png" alt="The lock screen while omaFace scans: Look at the screen, above the password field"></td>
   </tr>
   <tr>
     <td><sub>Settings: where omaFace is used, attention, ask first, appearances.</sub></td>
-    <td><sub>Enrolling (the preview is braille, drawn here), and webcam mode's optional head-turn check.</sub></td>
+    <td><sub>Enrolling (the preview is braille, drawn here), and the lock screen while it scans.</sub></td>
   </tr>
 </table>
 
