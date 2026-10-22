@@ -5,7 +5,7 @@ the lock screen, sign in at the login screen, answer `sudo`, or approve system
 prompts. Your password keeps working everywhere, always.
 
 <p align="center">
-  <img src="docs/lock-screen.png" alt="The Omarchy lock screen with the omaFace mark scanning above the password field" width="760">
+  <img src="docs/demo.gif" alt="omaFace in use: the lock screen opens when you look at it, sudo asks first and then recognizes you, and changing an omaFace setting brings up the system prompt, which accepts your face too" width="720">
 </p>
 
 It looks and moves like the rest of Omarchy: the lock screen and polkit dialog

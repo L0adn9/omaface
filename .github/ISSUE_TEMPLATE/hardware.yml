@@ -1,0 +1,71 @@
+name: Camera or laptop report
+description: omaFace does not find your camera, does not recognize you, or works (tell us which laptop)
+title: "[Laptop] "
+labels: ["hardware"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for trying omaFace. Every laptop's camera is a little different, so these reports are how it gets better on yours.
+        Nothing here asks for images of your face. Please do not attach camera pictures or anything from `/var/lib/omaface`.
+  - type: dropdown
+    id: result
+    attributes:
+      label: What happened?
+      options:
+        - It works (just reporting my laptop)
+        - No camera found
+        - The IR light stays off
+        - It finds the camera but never recognizes me
+        - It recognizes me but is slow
+        - Something else
+    validations:
+      required: true
+  - type: input
+    id: laptop
+    attributes:
+      label: Laptop model
+      placeholder: e.g. Lenovo ThinkPad X1 Carbon Gen 11
+    validations:
+      required: true
+  - type: dropdown
+    id: camera
+    attributes:
+      label: Camera
+      options:
+        - IR (Windows Hello) camera
+        - Regular webcam only
+        - Not sure
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Omarchy and omaFace versions
+      description: "`omarchy version`, and git install or package"
+      placeholder: e.g. Omarchy 4.0.5, omaFace 1.2.1 from git
+  - type: textarea
+    id: cameras
+    attributes:
+      label: Output of `omaface cameras`
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `omaface doctor`
+      description: It shows your username; replace it if you like.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: test
+    attributes:
+      label: Output of `omaface test` while looking at the screen (if it finds the camera)
+      render: text
+  - type: textarea
+    id: details
+    attributes:
+      label: Anything else
+      description: Glasses, lighting, what you tried, which place (lock screen, sudo, login, system prompts).
