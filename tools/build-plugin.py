@@ -41,8 +41,11 @@ def main():
     built = {}
     hashes = {}
 
-    for upstream_rel, target, file_patches in patches.FILES:
+    for upstream_rel, target, file_patches, *rest in patches.FILES:
+        optional = bool(rest and rest[0])
         path = os.path.join(UPSTREAM, upstream_rel)
+        if optional and not os.path.exists(path):
+            continue
         try:
             with open(path, encoding="utf-8") as f:
                 text = f.read()
@@ -50,13 +53,17 @@ def main():
             problems.append(f"{upstream_rel}: cannot read upstream ({e.strerror})")
             continue
         hashes[upstream_rel] = sha256(path)
-        for i, (old, new) in enumerate(file_patches, 1):
-            count = text.count(old)
-            if count != 1:
-                first = old.strip().splitlines()[0][:70]
-                problems.append(f"{upstream_rel} patch {i}: anchor found {count}x: {first!r}")
+        for i, patch in enumerate(file_patches, 1):
+            # One (old, new) pair, or alternatives for different Omarchy
+            # versions: the first whose anchor appears exactly once wins.
+            alternatives = patch if isinstance(patch, list) else [patch]
+            match = next(((old, new) for old, new in alternatives if text.count(old) == 1), None)
+            if match is None:
+                for old, _ in alternatives:
+                    first = old.strip().splitlines()[0][:70]
+                    problems.append(f"{upstream_rel} patch {i}: anchor found {text.count(old)}x: {first!r}")
                 continue
-            text = text.replace(old, new)
+            text = text.replace(*match)
         built[target] = text
 
     own = {}

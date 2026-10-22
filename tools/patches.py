@@ -4,7 +4,68 @@ Each patch replaces one exact snippet of the upstream file. Every `old` must
 appear exactly once, otherwise the build stops and the installed plugin is
 left alone (see build-plugin.py). Keep snippets small so upstream changes
 elsewhere in the files never conflict.
+
+Where Omarchy versions differ, a patch is a list of (old, new) alternatives,
+newest first; the build uses the one whose `old` appears exactly once.
 """
+
+# Omarchy 4.0: the lock IPC handler, with omaFace's polkit dialog, settings
+# and IPC added in front of it.
+LOCK_IPC = (
+    "  IpcHandler {\n    target: \"lock\"\n",
+    """  Polkit {
+    id: polkitDialog
+  }
+
+  // Settings exist only while open (omarchy-shell omaface settings).
+  Loader {
+    id: faceSettings
+    active: false
+    source: "Settings.qml"
+    onLoaded: item.closed.connect(function() { faceSettings.active = false })
+  }
+
+  IpcHandler {
+    target: "omaface"
+
+    function status(): string {
+      return JSON.stringify({
+        plugin: "io.github.l0adn9.omaface",
+        lock: true,
+        polkitRegistered: polkitDialog.agentRegistered,
+        face: root.faceConfigured,
+        faceState: root.faceState
+      })
+    }
+
+    function refresh(): string {
+      root.refreshFaceStatus()
+      polkitDialog.refreshFace()
+      return "ok"
+    }
+
+    function settings(): string {
+      if (!faceSettings.active) {
+        faceSettings.active = true
+        return "open"
+      }
+      // Through dismiss(), so a running enrollment releases the camera first.
+      if (faceSettings.item) faceSettings.item.dismiss()
+      else faceSettings.active = false
+      return "closed"
+    }
+  }
+
+  IpcHandler {
+    target: "lock"
+""",
+)
+
+
+def _shell_ipc(patch):
+    old, new = patch
+    return old.replace("IpcHandler {", "ShellIpc {"), new.replace("IpcHandler {", "ShellIpc {")
+
 
 LOCK_SERVICE = [
     # State for the third authentication flow.
@@ -25,9 +86,23 @@ LOCK_SERVICE = [
   property string faceLive: ""
 """,
     ),
-    (
-        "    fingerprintRetryTimer.stop()\n    if (passwordPam.active) passwordPam.abort()\n",
-        """    fingerprintRetryTimer.stop()
+    [
+        # Omarchy 4.5: more fingerprint timers are stopped first.
+        (
+            "    if (passwordPam.active) passwordPam.abort()\n    if (fingerprintPam.active) fingerprintPam.abort()\n  }\n",
+            """    faceSuccessTimer.stop()
+    faceIdleTimer.stop()
+    faceFailures = 0
+    faceState = "idle"
+    if (facePam.active) facePam.abort()
+    if (passwordPam.active) passwordPam.abort()
+    if (fingerprintPam.active) fingerprintPam.abort()
+  }
+""",
+        ),
+        (
+            "    fingerprintRetryTimer.stop()\n    if (passwordPam.active) passwordPam.abort()\n",
+            """    fingerprintRetryTimer.stop()
     faceSuccessTimer.stop()
     faceIdleTimer.stop()
     faceFailures = 0
@@ -35,7 +110,8 @@ LOCK_SERVICE = [
     if (facePam.active) facePam.abort()
     if (passwordPam.active) passwordPam.abort()
 """,
-    ),
+        ),
+    ],
     (
         "    lockRequested = true\n    armBlankTimer()\n",
         "    lockRequested = true\n    faceLockedAt = Date.now()\n    armBlankTimer()\n",
@@ -229,10 +305,17 @@ LOCK_SERVICE = [
     id: fingerprintRetryTimer
 """,
     ),
-    (
-        "  Component.onCompleted: {\n    refreshBackground()\n    refreshFingerprintStatus()\n",
-        "  Component.onCompleted: {\n    refreshBackground()\n    refreshFingerprintStatus()\n    refreshFaceStatus()\n",
-    ),
+    [
+        # Omarchy 4.5: also checks for a stranded lock, after the refreshes.
+        (
+            "    refreshBackground()\n    refreshFingerprintStatus()\n    checkStrandedLock()\n",
+            "    refreshBackground()\n    refreshFingerprintStatus()\n    refreshFaceStatus()\n    checkStrandedLock()\n",
+        ),
+        (
+            "  Component.onCompleted: {\n    refreshBackground()\n    refreshFingerprintStatus()\n",
+            "  Component.onCompleted: {\n    refreshBackground()\n    refreshFingerprintStatus()\n    refreshFaceStatus()\n",
+        ),
+    ],
     (
         "        fingerprint: root.fingerprintConfigured,\n",
         "        fingerprint: root.fingerprintConfigured,\n        face: root.faceConfigured,\n        faceState: root.faceState,\n        faceFailures: root.faceFailures,\n",
@@ -243,55 +326,9 @@ LOCK_SERVICE = [
     ),
     # The polkit dialog lives in this service too, so one plugin owns every
     # password prompt in the shell; omarchy.polkit stays disabled meanwhile.
-    (
-        "  IpcHandler {\n    target: \"lock\"\n",
-        """  Polkit {
-    id: polkitDialog
-  }
-
-  // Settings exist only while open (omarchy-shell omaface settings).
-  Loader {
-    id: faceSettings
-    active: false
-    source: "Settings.qml"
-    onLoaded: item.closed.connect(function() { faceSettings.active = false })
-  }
-
-  IpcHandler {
-    target: "omaface"
-
-    function status(): string {
-      return JSON.stringify({
-        plugin: "io.github.l0adn9.omaface",
-        lock: true,
-        polkitRegistered: polkitDialog.agentRegistered,
-        face: root.faceConfigured,
-        faceState: root.faceState
-      })
-    }
-
-    function refresh(): string {
-      root.refreshFaceStatus()
-      polkitDialog.refreshFace()
-      return "ok"
-    }
-
-    function settings(): string {
-      if (!faceSettings.active) {
-        faceSettings.active = true
-        return "open"
-      }
-      // Through dismiss(), so a running enrollment releases the camera first.
-      if (faceSettings.item) faceSettings.item.dismiss()
-      else faceSettings.active = false
-      return "closed"
-    }
-  }
-
-  IpcHandler {
-    target: "lock"
-""",
-    ),
+    # Omarchy 4.5 answers omarchy-shell through ShellIpc (an IpcHandler it
+    # also registers), so the omaface handler has to be one there too.
+    [_shell_ipc(LOCK_IPC), LOCK_IPC],
     (
         "      if (result === PamResult.Success) root.finishUnlock()\n      else root.handlePasswordFailure()\n",
         """      if (result === PamResult.Success) {
@@ -582,10 +619,14 @@ POLKIT = [
     ),
 ]
 
-# (upstream path relative to the shell plugins dir, file name in the plugin, patches)
+# (upstream path relative to the shell plugins dir, file name in the plugin,
+# patches[, optional]); an optional file is copied only when Omarchy has it.
 FILES = [
     ("lock/Service.qml", "Service.qml", LOCK_SERVICE),
     ("lock/LockView.qml", "LockView.qml", LOCK_VIEW),
+    # Omarchy 4.5
+    ("lock/FingerprintModel.js", "FingerprintModel.js", [], True),
+    ("lock/LockFeedSurface.qml", "LockFeedSurface.qml", [], True),
     ("polkit/PolkitAgent.qml", "Polkit.qml", POLKIT),
     ("polkit/PolkitModel.js", "PolkitModel.js", []),
 ]
