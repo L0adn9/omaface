@@ -232,6 +232,11 @@ omaface uninstall           put everything back the way Omarchy had it
   broken one.
 * `omaface doctor` checks every part and names the fix.
 
+Doesn't work on your laptop, or works and you want to say so? [Open a camera
+report](https://github.com/L0adn9/omaface/issues/new?template=hardware.yml).
+It asks for your laptop model and what `omaface cameras` and `omaface doctor`
+say, which is what it takes to make omaFace work on more laptops.
+
 ## Updates
 
 * **OpenCV upgrade**: the git install has a pacman hook that rebuilds the
