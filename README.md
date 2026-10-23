@@ -43,7 +43,8 @@ choose **Set up omaFace**.
 
 ## What you need
 
-* **Omarchy 4** or newer (the Quickshell lock screen).
+* **Omarchy 4** or newer (the Quickshell lock screen). Both the 4.0 and 4.5
+  shell plugin APIs are supported.
 * **A camera.** omaFace looks for an infrared (Windows Hello) camera first and
   uses it when there is one. A laptop without one uses its regular webcam, for
   everything, with liveness and attention checks on every scan (see
@@ -247,7 +248,8 @@ say, which is what it takes to make omaFace work on more laptops.
   If Omarchy changed its lock screen or polkit dialog, the plugin is rebuilt
   from the new files; if that cannot be done cleanly, the working copy stays.
   If the plugin ever fails to load, Omarchy's own lock screen and polkit
-  dialog are switched back on, so you are never left without a lock.
+  dialog are switched back on, so you are never left without a lock. A later
+  `omaface sync` rebuilds the plugin and puts the handover back.
 * **omaFace itself**: the package updates with the rest of the system, and
   the plugin is rebuilt after the next `omarchy update` (or now: `omaface
   sync`). From git: `git pull && ./install.sh`. Enrolled faces and settings
