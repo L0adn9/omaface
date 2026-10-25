@@ -41,13 +41,16 @@ Usage: omaface <command>
   cameras                    list cameras and which one omaFace uses
   emitter                    check that the IR light comes on
   enroll [--name NAME]       add your face (or an alternate appearance)
-  test                       look at the screen and see if you are recognized
+  test [key=value...]        look at the screen and see if you are recognized;
+                             with values, test them once without saving
+  advanced [--json]          current calibration values, defaults and bounds
+  apply <revision> <k=v...>  save advanced settings together (authorization required)
   rename <N> <name>          rename appearance N (see status)
   remove <N|all>             remove appearance N (see status) or all of them
   enable  <place...|all>     use omaFace for: lock login sudo polkit
   disable <place...|all>     stop using omaFace there (password only)
-  set <key> <value>          attention on|off, confirm on|off, head_turns on|off, threshold, match_frames,
-                             timeout_{sudo,polkit,lock,login,choose}
+  set <key> <value>          attention, confirm, head_turns, threshold[_rgb], match_frames[_rgb],
+                             liveness_threshold, min_face_width, timeout_{sudo,polkit,lock,login,choose,test}
   settings                   open the omaFace settings window
   doctor                     check every part of the installation
   sync                       rebuild the shell plugin after an Omarchy update
@@ -98,11 +101,16 @@ conf_get() {
   echo "${value:-$fallback}"
 }
 
-conf_set() {
+conf_set() (
   local key=$1 value=$2 tmp
+  # Share the writer lock with an atomic advanced-settings Apply.
+  install -d -m0755 /etc/omaface
+  exec {lock_fd}>/etc/omaface/.config.lock
+  flock -x "$lock_fd"
   # Before setup (choosing the camera when none was found) there is none yet.
   [[ -f $CONF ]] || install -Dm0644 "$SHARE/config" "$CONF"
   tmp=$(mktemp /etc/omaface/.config.XXXXXX)
+  trap 'rm -f "$tmp"' EXIT
   if grep -qE "^[[:space:]]*$key[[:space:]]*=" "$CONF"; then
     sed "s|^[[:space:]]*$key[[:space:]]*=.*|$key=$value|" "$CONF" >"$tmp"
   else
@@ -111,7 +119,7 @@ conf_set() {
   fi
   chmod 0644 "$tmp"
   mv "$tmp" "$CONF"
-}
+)
 
 is_on() { [[ $(conf_get "$1" off) =~ ^(on|yes|true|1)$ ]]; }
 
@@ -309,105 +317,77 @@ cmd_toggle() {
 }
 
 cmd_set() {
-  local key=${1:-} value=${2:-}
+  [[ $# == 2 ]] || die "usage: omaface set <key> <value>"
+  local key=$1 value=$2 numeric=0
   case "$key" in
-    threshold) [[ $value =~ ^0\.[3-9][0-9]*$ ]] || die "threshold must be between 0.30 and 0.99" ;;
-    match_frames) [[ $value =~ ^[1-5]$ ]] || die "match_frames must be 1-5" ;;
-    timeout_sudo | timeout_polkit | timeout_lock | timeout_login)
-      [[ $value =~ ^([1-9]|1[0-5])$ ]] || die "$key must be 1-15 seconds" ;;
-    min_face_width) [[ $value =~ ^[0-9]{2,3}$ ]] || die "min_face_width must be 30-300" ;;
+    threshold | threshold_rgb | match_frames | match_frames_rgb | liveness_threshold | min_face_width | \
+    timeout_sudo | timeout_polkit | timeout_lock | timeout_login | timeout_choose | timeout_test)
+      numeric=1
+      "$LIB/omaface-engine" validate-settings "$key=$value" || return 1 ;;
     attention | confirm | rgb_fallback | head_turns) [[ $value == on || $value == off ]] || die "$key must be on or off" ;;
-    threshold_rgb) [[ $value =~ ^0\.[3-9][0-9]*$ ]] || die "threshold_rgb must be between 0.30 and 0.99" ;;
-    timeout_choose) [[ $value =~ ^([5-9]|[1-9][0-9]|1[01][0-9]|120)$ ]] || die "timeout_choose must be 5-120 seconds" ;;
     device) [[ $value == auto || $value =~ ^/dev/(video[0-9]+|v4l/by-(id|path)/[A-Za-z0-9._:-]+)$ ]] || die "device must be auto or a /dev/video path" ;;
     *) die "unknown setting '$key'" ;;
   esac
   as_root set "$@"
-  conf_set "$key" "$value"
+  if (( numeric )); then
+    "$LIB/omaface-engine" apply-settings - "$key=$value" >/dev/null || return 1
+  else
+    conf_set "$key" "$value"
+  fi
   echo "$key=$value"
+}
+
+cmd_advanced() {
+  [[ $# == 0 || ( $# == 1 && $1 == --json ) ]] || die "usage: omaface advanced [--json]"
+  local settings
+  settings=$("$LIB/omaface-engine" config) || die "calibration is unavailable; update omaFace"
+  if [[ ${1:-} == --json ]]; then
+    printf '%s\n' "$settings"
+  else
+    printf '%s\n' "$settings" | python3 -I -c '
+import json, sys
+config = json.load(sys.stdin)
+print("Advanced calibration (system-wide)")
+for key, value in config["values"].items():
+    bounds = config["bounds"][key]
+    default, minimum, maximum = config["defaults"][key], bounds["min"], bounds["max"]
+    print(f"  {key:<22} {value!s:<6} default {default}  ({minimum}–{maximum})")
+print("Test a value without saving it: omaface test liveness_threshold=0.80")
+print("Lower thresholds or fewer frames weaken authentication.")
+'
+  fi
+}
+
+cmd_apply() {
+  [[ $# -ge 2 ]] || die "usage: omaface apply <revision> <key=value...>"
+  local revision=$1
+  shift
+  [[ $revision != - && $revision != *[!A-Za-z0-9._:-]* && -n $revision ]] || die "invalid settings revision"
+  "$LIB/omaface-engine" validate-settings "$@" || return 1
+  as_root apply "$revision" "$@"
+  exec "$LIB/omaface-engine" apply-settings "$revision" "$@"
 }
 
 # Self-check through the real socket. Never authenticates anything: the
 # engine treats omaface-test as a dry run and the caller only sees scores.
+# key=value arguments test unsaved settings for this one scan.
 cmd_test() {
-  local json=0
-  [[ ${1:-} == --json ]] && json=1
+  local json=() settings=() arg
+  for arg in "$@"; do
+    case "$arg" in
+      --json) json=(--json) ;;
+      *=*) settings+=("$arg") ;;
+      *) die "usage: omaface test [--json] [key=value...]" ;;
+    esac
+  done
+  if (( ${#settings[@]} )); then
+    "$LIB/omaface-engine" validate-settings "${settings[@]}" || exit 1
+  fi
   socket_active || die "service not running (omaface doctor)"
   # exec: stopping the test (Esc in the settings window) must reach the client
   # holding the socket, or the engine keeps scanning until its timeout.
-  exec python3 -I - "$(id -un)" "$json" <<'PY'
-import json, socket, sys
-user, as_json = sys.argv[1], sys.argv[2] == "1"
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-s.settimeout(20)
-s.connect("/run/omaface.sock")
-s.sendall(f"VERIFY {user} omaface-test\n".encode())
-best, buf = None, b""
-messages = {"fail": "Not recognized", "timeout": "No face found", "locked-out": "Paused after too many attempts",
-            "busy": "Camera busy", "disabled": "omaFace is off",
-            "attention": "Recognized, but your eyes were closed or not on the screen"}
-moves = {"turn-left": "<- turn your head LEFT", "turn-right": "turn your head RIGHT ->", "turn-back": "face the camera again"}
-liveness = {"spoof": "it did not look like a live face (a photo or a screen?)", "wrong": "moved the wrong way", "slow": "did not follow in time", "early": "moved before being asked",
-            "lost": "the face left the camera or was swapped", "identity": "a different face turned back"}
-eyes = {"ok": "paying attention", "eyes": "eyes closed",
-        "away": "looking away from the screen", "head": "head turned or tilted away", "off": "attention off"}
-seen_attention = set()
-def out(obj, text):
-    print(json.dumps(obj) if as_json else text, flush=True)
-if not as_json:
-    print("Look at the screen…", flush=True)
-while True:
-    try:
-        chunk = s.recv(4096)
-    except socket.timeout:
-        break
-    if not chunk:
-        break
-    buf += chunk
-    while b"\n" in buf:
-        line, buf = buf.split(b"\n", 1)
-        parts = line.decode(errors="replace").split()
-        if not parts:
-            continue
-        if parts[0] == "STATUS":
-            if as_json:
-                out({"type": "status", "state": parts[1]}, "")
-            elif parts[1] in moves:
-                print(f"  {moves[parts[1]]}", flush=True)
-        elif parts[0] == "SCORE":
-            score = float(parts[1])
-            best = score if best is None else max(best, score)
-            attention = parts[5] if len(parts) > 5 and parts[4] == "attention" else "off"
-            live = float(parts[7]) if len(parts) > 7 and parts[6] == "live" else -1.0
-            seen_attention.add(attention)
-            if not as_json:
-                real = f"   real face {live:.2f}" if live >= 0 else ""
-                print(f"  score {score:.3f}   {eyes.get(attention, attention)}{real}", flush=True)
-            else:
-                out({"type": "score", "score": score, "attention": attention, "live": live}, "")
-        elif parts[0] == "RESULT":
-            result = parts[1]
-            detail = " ".join(parts[2:])
-            message = messages.get(result, (result + " " + detail).strip())
-            if result == "fail" and detail == "liveness spoof":
-                message = "Recognized, but it did not look like a live face (a photo or a screen?)"
-            elif result == "fail" and detail.startswith("liveness"):
-                message = "Recognized, but the head-turn check failed: " + liveness.get(detail.split()[-1], detail)
-            elif result == "timeout" and detail in ("unsettled", "crowd"):
-                message = {"unsettled": "Recognized, but you did not face the camera long enough to be asked",
-                           "crowd": "More than one face in view"}[detail]
-            if result == "unavailable" and detail.startswith("not-enrolled"):
-                message = "Camera works, but no face is enrolled yet" if "no-face-seen" not in detail \
-                    else "No face enrolled yet (and none seen by the camera)"
-            elif result == "unavailable":
-                message = {"lid-closed": "Lid is closed", "camera": "Camera unavailable",
-                           "no-camera": "No IR camera found"}.get(detail, message)
-            out({"type": "result", "result": result, "score": best, "message": message,
-                 "attention": sorted(seen_attention)},
-                ("Recognized" if result == "ok" else message) + (f"  (best {best:.3f})" if best is not None else ""))
-            sys.exit(0 if result == "ok" else 1)
-sys.exit(1)
-PY
+  exec python3 -I "$SHARE/tools/test-client.py" --user "$(id -un)" --duration "$(conf_get timeout_test 8)" \
+    "${json[@]}" "${settings[@]}"
 }
 
 cmd_settings() {
@@ -875,6 +855,8 @@ case "${1:-status}" in
   ready) shift; cmd_ready "$@" ;;
   enroll | add) shift; cmd_enroll "$@" ;;
   test) shift; cmd_test "$@" ;;
+  advanced) shift; cmd_advanced "$@" ;;
+  apply) shift; cmd_apply "$@" ;;
   cameras) cmd_cameras ;;
   choose) shift; cmd_choose "$@" ;;
   reset) cmd_reset ;;
