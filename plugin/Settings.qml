@@ -29,6 +29,32 @@ Item {
 
   property string testState: "idle"
   property string testText: ""
+
+  property var advancedMetadata: ({})
+  property var advancedSaved: ({})
+  property var advancedDraft: ({})
+  property string advancedRevision: ""
+  property bool advancedLoaded: false
+  property bool advancedLoading: false
+  property bool advancedConflict: false
+  property bool advancedApplying: false
+  property string advancedError: ""
+  property string advancedNotice: ""
+  // One self-test scan with the draft values (omaface test key=value...).
+  // idle | running | stopping | done
+  property string draftTestState: "idle"
+  // Whose scan duration the test uses: lock, sudo, polkit or login.
+  property string draftTestPlace: "lock"
+  property var draftTestRequire: ({})
+  property var draftTestFrame: ({})
+  property var draftTestResult: ({})
+  property string draftTestStatus: ""
+  property string draftTestAfterStop: ""
+  readonly property var testableKeys: ["threshold", "threshold_rgb", "match_frames", "match_frames_rgb", "liveness_threshold", "min_face_width"]
+  readonly property var advancedKeys: testableKeys.concat(["timeout_test", "timeout_sudo", "timeout_polkit", "timeout_lock", "timeout_login", "timeout_choose"])
+  readonly property bool advancedDirty: Object.keys(advancedSaved).some(function(key) {
+    return advancedDraft[key] !== advancedSaved[key]
+  })
   // Set while the window waits for the camera to be released before it goes.
   property bool closing: false
   // Index of the appearance whose name is being edited, or -1.
@@ -41,7 +67,7 @@ Item {
   property color errorColor: Commons.Color.urgent
   property var borderSpec: Border.surfaceSpec("menu", "border", Commons.Color.menu.border, Math.max(1, Style.space(2)))
   readonly property int pad: Style.spacing.panelPadding
-  readonly property int cardWidth: Math.min(Style.space(380), panel.width - Style.gapsOut * 2)
+  readonly property int cardWidth: Math.min(Style.space(view === "advanced" ? 740 : 380), panel.width - Style.gapsOut * 2)
   // Opened from the keyboard or the launcher, so it belongs on the monitor
   // Hyprland has focused (as Omarchy's own panels do); picked once, so it
   // does not follow focus around while it is open.
@@ -90,10 +116,174 @@ Item {
   }
 
   function run(args, okText) {
-    if (actionProc.running || enrollProc.running) return
+    if (actionProc.running || enrollProc.running) return false
     actionProc.okText = okText || ""
     actionProc.command = ["pkexec", "@PREFIX@/bin/omaface"].concat(args)
     actionProc.running = true
+    return true
+  }
+
+  function copyValues(values) { return JSON.parse(JSON.stringify(values || {})) }
+
+  function validAdvanced(metadata) {
+    if (!metadata || metadata.version !== 1 || typeof metadata.revision !== "string" || !metadata.revision || !metadata.values || !metadata.defaults || !metadata.bounds) return false
+    return advancedKeys.every(function(key) {
+      var value = metadata.values[key], fallback = metadata.defaults[key], bound = metadata.bounds[key]
+      return typeof value === "number" && isFinite(value) && typeof fallback === "number" && isFinite(fallback)
+        && bound && typeof bound.min === "number" && isFinite(bound.min) && typeof bound.max === "number" && isFinite(bound.max)
+        && typeof bound.step === "number" && isFinite(bound.step) && bound.step > 0 && bound.max > bound.min
+        && value >= bound.min && value <= bound.max && fallback >= bound.min && fallback <= bound.max
+        && typeof bound.integer === "boolean" && (!bound.integer || (Math.floor(value) === value && Math.floor(fallback) === fallback))
+    })
+  }
+
+  function acceptAdvanced(metadata, applied) {
+    if (!validAdvanced(metadata)) {
+      advancedError = "Invalid settings metadata. Draft retained; Apply is unavailable."
+      advancedLoaded = false
+      return false
+    }
+    var hadDraft = advancedRevision !== "" && Object.keys(advancedDraft).length > 0
+    var changedElsewhere = hadDraft && metadata.revision !== advancedRevision
+    var preserveDraft = hadDraft && advancedDirty && !applied
+    advancedMetadata = metadata
+    advancedSaved = copyValues(metadata.values)
+    advancedLoaded = true
+    if (!preserveDraft) {
+      advancedDraft = copyValues(metadata.values)
+      advancedRevision = metadata.revision
+      advancedConflict = false
+    } else if (changedElsewhere) {
+      advancedConflict = true
+      advancedNotice = "Saved settings changed elsewhere. Your draft was retained."
+    }
+    if (applied) advancedNotice = "Saved system-wide · Authentication now uses the applied requirements"
+    clearDraftTest()
+    return true
+  }
+
+  function refreshAdvanced(preserveError) {
+    if (advancedProc.running || advancedApplying) return
+    advancedProc.preserveError = preserveError === true
+    advancedLoading = true
+    advancedProc.running = true
+  }
+
+  function openAdvanced() {
+    if (actionProc.running || enrollProc.running) return
+    if (testProc.running) testProc.running = false
+    // A result describes the moment it was taken, not a later visit.
+    clearDraftTest()
+    view = "advanced"
+    refreshAdvanced()
+    Qt.callLater(function() { calibrationView.forceActiveFocus() })
+  }
+
+  function clearDraftTest() {
+    if (draftTestState === "running" || draftTestState === "stopping") return
+    draftTestState = "idle"
+    draftTestRequire = ({})
+    draftTestFrame = ({})
+    draftTestResult = ({})
+    draftTestStatus = ""
+  }
+
+  function editAdvanced(key, value) {
+    var bounds = advancedMetadata.bounds && advancedMetadata.bounds[key]
+    if (advancedApplying || draftTestProc.running || !bounds || typeof value !== "number" || !isFinite(value) || value < bounds.min || value > bounds.max || (bounds.integer && Math.floor(value) !== value) || advancedDraft[key] === value) return
+    var draft = copyValues(advancedDraft)
+    draft[key] = value
+    advancedDraft = draft
+    advancedNotice = "Unsaved draft · Authentication is unchanged"
+    clearDraftTest()
+  }
+
+  function resetAdvancedDraft() {
+    if (!advancedLoaded || advancedApplying || draftTestProc.running) return
+    advancedDraft = copyValues(advancedMetadata.defaults)
+    advancedNotice = "Project defaults restored to the draft only · Nothing saved"
+    clearDraftTest()
+  }
+
+  function revertAdvancedDraft() {
+    if (!advancedLoaded || advancedApplying || draftTestProc.running) return
+    advancedDraft = copyValues(advancedSaved)
+    advancedRevision = advancedMetadata.revision
+    advancedConflict = false
+    advancedError = ""
+    advancedNotice = "Draft reverted to the latest saved settings"
+    clearDraftTest()
+  }
+
+  function startDraftTest() {
+    if (!advancedLoaded || draftTestProc.running || testProc.running || actionProc.running || enrollProc.running || advancedApplying) return
+    var command = ["@PREFIX@/bin/omaface", "test", "--json"]
+    testableKeys.forEach(function(key) { command.push(key + "=" + String(advancedDraft[key])) })
+    // The test lasts as long as a real scan at the chosen place.
+    command.push("timeout_test=" + String(advancedDraft["timeout_" + draftTestPlace]))
+    clearDraftTest()
+    advancedError = ""
+    draftTestState = "running"
+    draftTestProc.command = command
+    draftTestProc.running = true
+  }
+
+  // Stop the test and wait for the client to exit: it exits once the engine
+  // has closed the socket, that is, once the camera is free again. Then do
+  // what was asked: close, apply or back.
+  function stopDraftTest(after) {
+    if (after) draftTestAfterStop = after
+    if (!draftTestProc.running) { finishDraftTestStop(); return }
+    if (draftTestState !== "stopping") {
+      draftTestState = "stopping"
+      draftTestProc.signal(15)
+      draftTestKill.restart()
+    }
+  }
+
+  function finishDraftTestStop() {
+    var next = draftTestAfterStop
+    draftTestAfterStop = ""
+    if (next === "close") { root.closed(); return }
+    if (next === "apply") { applyAdvancedNow(); return }
+    if (next === "back") {
+      view = "main"
+      refresh()
+      Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+    }
+  }
+
+  function handleDraftTestLine(line) {
+    var ev
+    try { ev = JSON.parse(line) } catch (error) { return }
+    if (ev.type === "require") draftTestRequire = ev
+    else if (ev.type === "status") draftTestStatus = String(ev.state || "")
+    else if (ev.type === "score") draftTestFrame = ev
+    else if (ev.type === "result") {
+      draftTestResult = ev
+      if (draftTestState === "running") draftTestState = "done"
+    } else if (ev.type === "error") advancedError = String(ev.message || "Test failed")
+  }
+
+  function applyAdvanced() {
+    if (!advancedLoaded || !advancedDirty || advancedConflict || advancedApplying || advancedLoading) return
+    advancedApplying = true
+    advancedError = ""
+    // Apply asks for authorization, which may scan a face: free the camera first.
+    stopDraftTest("apply")
+  }
+
+  function applyAdvancedNow() {
+    var args = ["apply", advancedRevision]
+    Object.keys(advancedSaved).forEach(function(key) {
+      if (advancedDraft[key] !== advancedSaved[key]) args.push(key + "=" + String(advancedDraft[key]))
+    })
+    actionProc.advancedApply = true
+    if (!run(args, "")) {
+      actionProc.advancedApply = false
+      advancedApplying = false
+      advancedError = "Another action is running. Draft retained."
+    }
   }
 
   function startEnroll() {
@@ -146,6 +336,11 @@ Item {
   }
 
   function back() {
+    if (view === "advanced") {
+      if (advancedApplying) return
+      stopDraftTest("back")
+      return
+    }
     if (view === "enroll" && enrollProc.running) {
       stopEnroll()
       enrollPhase = "idle"
@@ -161,6 +356,12 @@ Item {
   }
 
   function dismiss() {
+    if (advancedApplying) return
+    if (draftTestProc.running) {
+      closing = true
+      stopDraftTest("close")
+      return
+    }
     if (testProc.running) testProc.running = false
     if (enrollProc.running) {
       // Hide now, but stay alive until the engine has let go of the camera.
@@ -245,10 +446,85 @@ Item {
   }
 
   Process {
+    id: advancedProc
+    property bool preserveError: false
+    command: ["@PREFIX@/bin/omaface", "advanced", "--json"]
+    stdout: StdioCollector { id: advancedOut; waitForEnd: true }
+    stderr: StdioCollector { id: advancedErr; waitForEnd: true }
+    onExited: function(exitCode) {
+      root.advancedLoading = false
+      if (exitCode !== 0) {
+        root.advancedLoaded = false
+        root.advancedError = String(advancedErr.text || "").trim().split("\n").pop() || "Cannot load advanced settings. Draft retained."
+        return
+      }
+      try {
+        if (root.acceptAdvanced(JSON.parse(String(advancedOut.text || "{}")), false) && !preserveError) root.advancedError = ""
+      } catch (error) {
+        root.advancedLoaded = false
+        root.advancedError = "Cannot read advanced settings. Draft retained."
+      }
+    }
+  }
+
+  Timer {
+    id: draftTestKill
+    interval: 5000
+    // The client confirms the release within 3 s of SIGTERM; past that, kill
+    // it. The socket closes with it and the engine stops on disconnect.
+    onTriggered: if (draftTestProc.running) draftTestProc.signal(9)
+  }
+
+  Process {
+    id: draftTestProc
+    stdout: SplitParser { onRead: function(line) { root.handleDraftTestLine(line) } }
+    stderr: StdioCollector { id: draftTestErr; waitForEnd: true }
+    onExited: function(exitCode) {
+      draftTestKill.stop()
+      var stopping = root.draftTestState === "stopping"
+      if (root.draftTestResult.type === "result") root.draftTestState = "done"
+      else {
+        root.draftTestState = "idle"
+        if (!stopping && !root.advancedError)
+          root.advancedError = String(draftTestErr.text || "").trim().split("\n").pop() || "The test ended without a result."
+        // Exit 0 after a stop means the client saw the engine let go.
+        if (stopping && exitCode !== 0 && root.draftTestAfterStop === "apply") {
+          root.draftTestAfterStop = ""
+          root.advancedApplying = false
+          root.advancedError = "The camera release was not confirmed. Draft retained; nothing was applied."
+        }
+      }
+      root.finishDraftTestStop()
+    }
+  }
+
+  Process {
     id: actionProc
     property string okText: ""
+    property bool advancedApply: false
+    stdout: StdioCollector { id: actionOut; waitForEnd: true }
     stderr: StdioCollector { id: actionErr; waitForEnd: true }
     onExited: function(exitCode) {
+      if (advancedApply) {
+        advancedApply = false
+        root.advancedApplying = false
+        if (exitCode === 0) {
+          try { root.acceptAdvanced(JSON.parse(String(actionOut.text || "{}")), true) }
+          catch (error) {
+            root.advancedLoaded = false
+            root.advancedError = "Apply finished, but saved-settings readback failed. Draft retained; refresh saved settings."
+          }
+        } else if (exitCode === 126 || exitCode === 127) {
+          root.advancedNotice = "Authorization cancelled · Draft retained · Nothing saved"
+        } else {
+          root.advancedError = String(actionErr.text || "").trim().split("\n").pop() || "Apply failed. Draft retained."
+          root.advancedNotice = "Draft retained · Refresh saved settings to check for a conflict"
+          root.refreshAdvanced(true)
+        }
+        root.refresh()
+        Qt.callLater(function() { calibrationView.forceActiveFocus() })
+        return
+      }
       // 126/127: the authorization dialog was dismissed.
       if (exitCode === 0) { if (okText) root.say(okText, false) }
       else if (exitCode === 126 || exitCode === 127) root.say("Not changed", false)
@@ -350,8 +626,47 @@ Item {
         anchors.right: parent.right
         anchors.top: parent.top
         anchors.margins: root.pad
-        implicitHeight: root.view === "main" ? mainView.implicitHeight
+        implicitHeight: root.view === "advanced" ? calibrationView.implicitHeight : root.view === "main" ? mainView.implicitHeight
           : (root.view === "enroll" ? enrollView.implicitHeight : testView.implicitHeight)
+        height: implicitHeight
+
+        Calibration {
+          id: calibrationView
+          visible: root.view === "advanced"
+          width: parent.width
+          height: implicitHeight
+          draft: root.advancedDraft
+          saved: root.advancedSaved
+          metadata: root.advancedMetadata
+          testState: root.draftTestState
+          testPlace: root.draftTestPlace
+          require: root.draftTestRequire
+          frame: root.draftTestFrame
+          result: root.draftTestResult
+          testStatus: root.draftTestStatus
+          cameraKind: root.status.cameraKind || ""
+          dirty: root.advancedDirty
+          conflicted: root.advancedConflict
+          applying: root.advancedApplying
+          loading: root.advancedLoading
+          error: root.advancedError
+          notice: root.advancedNotice
+          canStart: root.advancedLoaded && !draftTestProc.running && !testProc.running && !actionProc.running && !enrollProc.running
+          canApply: root.advancedLoaded && !actionProc.running && !enrollProc.running
+          foreground: root.foreground
+          background: root.background
+          accent: root.accent
+          fontFamily: root.fontFamily
+          onValueEdited: function(key, next) { root.editAdvanced(key, next) }
+          onTestRequested: root.startDraftTest()
+          onStopRequested: root.stopDraftTest("")
+          onPlaceSelected: function(place) { if (!draftTestProc.running) root.draftTestPlace = place }
+          onApplyRequested: root.applyAdvanced()
+          onDefaultsRequested: root.resetAdvancedDraft()
+          onRevertRequested: root.revertAdvancedDraft()
+          onRefreshRequested: root.refreshAdvanced()
+          onBackRequested: root.back()
+        }
 
         // ---------------------------------------------------------- main
         Column {
@@ -576,27 +891,41 @@ Item {
 
           PanelSeparator { foreground: root.foreground }
 
-          // Test on the left; messages, or the Esc hint, on the right.
+          // Test and Advanced; messages, or the Esc hint, on the right.
           Item {
             width: parent.width
-            height: Math.max(testButton.implicitHeight, footerText.implicitHeight)
+            height: Math.max(footerButtons.implicitHeight, footerText.implicitHeight)
 
-            Button {
-              id: testButton
+            Row {
+              id: footerButtons
               anchors.left: parent.left
               anchors.verticalCenter: parent.verticalCenter
-              text: "Test"
-              bordered: true
-              visible: root.appearances.length > 0
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              onClicked: root.startTest()
+              spacing: Style.space(8)
+              Button {
+                id: testButton
+                text: "Test"
+                bordered: true
+                visible: root.appearances.length > 0
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                onClicked: root.startTest()
+              }
+              Button {
+                text: "Advanced"
+                bordered: true
+                focusable: true
+                foreground: root.foreground
+                accent: root.accent
+                fontFamily: root.fontFamily
+                enabled: root.status.installed === true && !actionProc.running
+                onClicked: root.openAdvanced()
+              }
             }
 
             Text {
               id: footerText
-              anchors.left: testButton.visible ? testButton.right : parent.left
-              anchors.leftMargin: testButton.visible ? Style.space(14) : 0
+              anchors.left: footerButtons.right
+              anchors.leftMargin: Style.space(14)
               anchors.right: parent.right
               anchors.verticalCenter: parent.verticalCenter
               horizontalAlignment: Text.AlignRight
@@ -689,6 +1018,15 @@ Item {
               foreground: root.foreground
               fontFamily: root.fontFamily
               onClicked: root.startTest()
+            }
+            Button {
+              text: "Advanced"
+              bordered: true
+              focusable: true
+              foreground: root.foreground
+              accent: root.accent
+              fontFamily: root.fontFamily
+              onClicked: root.openAdvanced()
             }
             Button {
               text: "Back"

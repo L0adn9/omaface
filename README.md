@@ -201,6 +201,8 @@ omaface setup               switch omaFace on for you (the git installer runs it
 omaface settings            the omaFace window
 omaface enroll              add your face (up to 3 appearances, e.g. with glasses)
 omaface test                look at the screen and see the scores
+omaface test key=value...   the same with unsaved settings (see Advanced calibration)
+omaface advanced            the advanced settings, their defaults and ranges
 omaface rename <N> <name>   rename an appearance
 omaface remove <N|all>      remove one, or all
 omaface enable|disable lock login sudo polkit
@@ -214,6 +216,67 @@ omaface sync                rebuild the shell plugin (after updates it happens b
 omaface uninstall           put everything back the way Omarchy had it
 ```
 
+## Advanced calibration
+
+Settings → **Advanced calibration** lets you change how strict face unlock is, and
+try a change before saving it.
+
+<img src="docs/calibration-accepted.png" width="560" alt="Advanced calibration after a test: a large Accepted result, each requirement ticked with the best score reached, the requirement and scan-time controls on the right">
+
+Edit the requirements, choose where the change should work (**Lock**, **sudo**,
+**Prompts** or **Login**, each with its own scan time), then press **Test**. That
+runs one real scan with the draft values: the same checks as that prompt,
+including attention and the head-turn challenge when they are on, for as long as
+that prompt would look. It ends with **Accepted** or **Not accepted** and the
+reason, and each requirement is marked met (✓) or not (✗) next to the best score
+reached. A test never unlocks anything, adds no lockout strikes, writes no status
+and saves no images. Stop, Back and closing Settings end it and free the camera.
+
+The scores are model scores, not probabilities that a face is genuine. The webcam
+liveness score is the mean of the two MiniFASNet models; IR cameras have no
+liveness model, so IR shows only identity and frames.
+
+**Apply** asks for authorization and saves the changed settings together. Settings
+are system-wide: they affect all users and enabled lock, login, sudo and polkit
+scans from the next request. **Reset** (to defaults) and **Revert** (to the saved
+settings) only change the draft until Apply is used. A concurrent configuration
+change rejects Apply rather than overwriting another change.
+
+| Requirement | Default | Range |
+|-------------|---------|-------|
+| IR identity similarity | 0.50 | 0.30–0.95 |
+| Webcam identity similarity | 0.55 | 0.30–0.95 |
+| IR consecutive passing frames | 2 | 1–5; at least 3 with attention on |
+| Webcam consecutive passing frames | 8 | 3–30 |
+| Webcam liveness | 0.85 | 0.50–0.99 |
+| Minimum face width | 70 | 30–300, scaled from a 640-pixel-wide frame |
+| Scan time | sudo 4, polkit 5, lock/login 6 seconds | 1–15 seconds |
+| Time to choose omaFace at a sudo or polkit prompt | 30 seconds | 5–120 seconds |
+| `omaface test` duration (CLI only: `omaface set timeout_test`) | 8 seconds | 1–60 seconds |
+
+The ranges are technical limits, **not recommended safe levels**. A value below its
+default turns the panel's warning on and Apply into **Apply weaker settings**.
+Lower identity thresholds can accept another person; lower liveness thresholds can
+accept a photo or screen; fewer frames let a shorter false-positive streak pass.
+A test that accepts you shows only that you get in; it cannot show that a relaxed
+setting keeps others out. Try better front lighting and a centered face before
+relaxing requirements.
+
+The CLI has the same controls:
+
+```bash
+omaface advanced                 # values, defaults and bounds; no camera access
+omaface advanced --json          # metadata and revision for a batch Apply
+omaface test liveness_threshold=0.80 match_frames_rgb=6   # one scan with these, not saved
+omaface test --json timeout_test=4 threshold_rgb=0.6      # the same as JSON lines
+omaface set liveness_threshold 0.80                       # save one value
+```
+
+`omaface test` accepts `threshold`, `threshold_rgb`, `match_frames`,
+`match_frames_rgb`, `liveness_threshold`, `min_face_width` and `timeout_test`.
+Unsaved values reach the engine only on its self-test request, never on a real
+prompt.
+
 ## Troubleshooting
 
 * **No camera found**: `omaface cameras`. If your IR camera is listed but not
@@ -222,9 +285,11 @@ omaface uninstall           put everything back the way Omarchy had it
   Lenovo, Dell and HP laptops keep the IR light off until it is switched on
   once: `omarchy pkg aur add linux-enable-ir-emitter`, then
   `sudo linux-enable-ir-emitter configure`.
-* **Recognized but never unlocks**: `omaface test` says why for every frame
-  (eyes closed, looking away, head turned). Re-enrolling records where your
-  eyes point at the screen; `omaface set attention off` turns the check off.
+* **Recognized but never unlocks**: `omaface test` distinguishes attention and
+  liveness failures; an Advanced calibration test marks which requirement failed.
+  Identity and liveness are separate: lowering an identity threshold cannot fix
+  liveness. Try front lighting for a dim webcam. Re-enrolling records where your
+  eyes point at the screen; `omaface set attention off` turns that check off.
 * **Lock screen misbehaving**: `omarchy plugin disable io.github.l0adn9.omaface` (brings
   back `omarchy.lock`), `omarchy plugin enable omarchy.polkit`, then
   `omarchy restart shell`. The same commands work from a TTY (Ctrl+Alt+F3).

@@ -18,6 +18,9 @@
 #include <opencv2/imgproc.hpp>
 #include <opencv2/objdetect/face.hpp>
 
+#include "calibration.h"
+#include "config-settings.h"
+
 #include <linux/uvcvideo.h>
 #include <linux/videodev2.h>
 #include <systemd/sd-login.h>
@@ -88,25 +91,16 @@ double secondsSince(Clock::time_point start) {
 
 // ------------------------------------------------------------------ config
 
-struct Config {
+struct Config : omaface::Settings {
   std::string device = "auto";
   bool lock = true;
   bool login = false;
   bool sudo = true;
   bool polkit = true;
-  double threshold = 0.50;
-  int matchFrames = 2;
-  double timeoutSudo = 4.0;
-  double timeoutPolkit = 5.0;
-  double timeoutLock = 6.0;
-  double timeoutLogin = 6.0;
-  int minFaceWidth = 70;
   bool attention = true;
   bool confirm = true;          // sudo and polkit wait for the person to choose omaFace
-  double timeoutChoose = 30.0;
   bool rgbFallback = true;      // no IR camera: use the regular webcam
   bool headTurns = false;       // webcam: also ask for random head turns (strictest)
-  double thresholdRgb = 0.55;  // webcam genuine scores measured 0.78-0.88
 };
 
 bool parseBool(const std::string& v, bool fallback) {
@@ -115,45 +109,71 @@ bool parseBool(const std::string& v, bool fallback) {
   return fallback;
 }
 
-Config loadConfig() {
+Config configFrom(const omaface::ConfigDocument& document) {
   Config c;
-  std::ifstream in(kConfigPath);
-  std::string line;
+  static_cast<omaface::Settings&>(c) = omaface::numericSettings(document.text);
+  std::istringstream in(document.text);
+  std::string line, k, v;
   while (std::getline(in, line)) {
-    auto hash = line.find('#');
-    if (hash != std::string::npos) line.erase(hash);
-    auto eq = line.find('=');
-    if (eq == std::string::npos) continue;
-    auto trim = [](std::string s) {
-      s.erase(0, s.find_first_not_of(" \t"));
-      s.erase(s.find_last_not_of(" \t\r") + 1);
-      return s;
-    };
-    std::string k = trim(line.substr(0, eq)), v = trim(line.substr(eq + 1));
-    try {
-      if (k == "device") c.device = v;
-      else if (k == "lock") c.lock = parseBool(v, c.lock);
-      else if (k == "login") c.login = parseBool(v, c.login);
-      else if (k == "sudo") c.sudo = parseBool(v, c.sudo);
-      else if (k == "polkit") c.polkit = parseBool(v, c.polkit);
-      else if (k == "threshold") c.threshold = std::clamp(std::stod(v), 0.30, 0.95);
-      else if (k == "attention") c.attention = parseBool(v, true);
-      else if (k == "confirm") c.confirm = parseBool(v, true);
-      else if (k == "rgb_fallback") c.rgbFallback = parseBool(v, true);
-      else if (k == "head_turns") c.headTurns = parseBool(v, false);
-      else if (k == "threshold_rgb") c.thresholdRgb = std::clamp(std::stod(v), 0.30, 0.95);
-      else if (k == "timeout_choose") c.timeoutChoose = std::clamp(std::stod(v), 5.0, 120.0);
-      else if (k == "match_frames") c.matchFrames = std::clamp(std::stoi(v), 1, 5);
-      else if (k == "timeout_sudo") c.timeoutSudo = std::clamp(std::stod(v), 1.0, 15.0);
-      else if (k == "timeout_polkit") c.timeoutPolkit = std::clamp(std::stod(v), 1.0, 15.0);
-      else if (k == "timeout_lock") c.timeoutLock = std::clamp(std::stod(v), 1.0, 15.0);
-      else if (k == "timeout_login") c.timeoutLogin = std::clamp(std::stod(v), 1.0, 15.0);
-      else if (k == "min_face_width") c.minFaceWidth = std::clamp(std::stoi(v), 30, 300);
-    } catch (...) {
-      // A malformed value keeps the default rather than failing open or closed.
-    }
+    if (!omaface::configLine(line, k, v)) continue;
+    if (k == "device") c.device = v;
+    else if (k == "lock") c.lock = parseBool(v, c.lock);
+    else if (k == "login") c.login = parseBool(v, c.login);
+    else if (k == "sudo") c.sudo = parseBool(v, c.sudo);
+    else if (k == "polkit") c.polkit = parseBool(v, c.polkit);
+    else if (k == "attention") c.attention = parseBool(v, true);
+    else if (k == "confirm") c.confirm = parseBool(v, true);
+    else if (k == "rgb_fallback") c.rgbFallback = parseBool(v, true);
+    else if (k == "head_turns") c.headTurns = parseBool(v, false);
   }
   return c;
+}
+
+Config loadConfig() {
+  omaface::ConfigDocument document;
+  std::string error;
+  if (!omaface::readConfigDocument(kConfigPath, document, error)) {
+    fprintf(stderr, "omaface: %s; using defaults\n", error.c_str());
+    return Config{};
+  }
+  return configFrom(document);
+}
+
+std::string configJson(const omaface::ConfigDocument& document) {
+  Config cfg = configFrom(document);
+  return std::string("{\"version\":1,\"values\":") +
+         omaface::valuesJson(cfg) + ",\"defaults\":" + omaface::valuesJson(omaface::Settings{}) +
+         ",\"bounds\":" + omaface::boundsJson() + ",\"revision\":\"" + document.revision +
+         "\",\"attention\":" + (cfg.attention ? "true" : "false") +
+         ",\"headTurns\":" + (cfg.headTurns ? "true" : "false") + '}';
+}
+
+int showConfig() {
+  omaface::ConfigDocument document;
+  std::string error;
+  if (!omaface::readConfigDocument(kConfigPath, document, error)) {
+    fprintf(stderr, "omaface-engine: %s\n", error.c_str());
+    return 1;
+  }
+  printf("%s\n", configJson(document).c_str());
+  return 0;
+}
+
+int settingsCommand(const std::vector<std::string>& args, const std::string* revision = nullptr) {
+  std::vector<omaface::SettingChange> changes;
+  std::string error;
+  if (!omaface::assignments(args, false, changes, error)) {
+    fprintf(stderr, "omaface-engine: %s\n", error.c_str());
+    return 1;
+  }
+  if (!revision) return 0;
+  omaface::ConfigDocument readback;
+  if (!omaface::applySettings(kConfigPath, *revision, changes, readback, error)) {
+    fprintf(stderr, "omaface-engine: %s\n", error.c_str());
+    return 1;
+  }
+  printf("%s\n", configJson(readback).c_str());
+  return 0;
 }
 
 // ------------------------------------------------------------------ camera
@@ -452,7 +472,7 @@ class Camera {
 // min_face_width is set for a 640-pixel-wide camera; scale it so a face at
 // the same distance counts the same on a smaller or larger sensor.
 int minFaceFor(const Config& cfg, const Camera& cam) {
-  return std::max(30, int(cfg.minFaceWidth * (cam.width() ? cam.width() : 640) / 640.0));
+  return omaface::scaledMinFace(cfg.minFaceWidth, cam.width());
 }
 
 // The emitter lights every other frame. Unlit frames only carry ambient IR,
@@ -514,6 +534,8 @@ class FaceModels {
     detector_->detect(bgr, faces);
     if (count) *count = faces.rows;
     if (faces.rows < 1) return false;
+    if (faces.type() != CV_32F || faces.cols != 15 || !cv::checkRange(faces))
+      throw cv::Exception(cv::Error::StsError, "invalid face model output", "detect", __FILE__, __LINE__);
     int best = 0;
     for (int i = 1; i < faces.rows; i++)
       if (faces.at<float>(i, 2) > faces.at<float>(best, 2)) best = i;
@@ -530,7 +552,9 @@ class FaceModels {
     feat = feat.reshape(1, 1).clone();
     feat.convertTo(feat, CV_32F);
     double n = cv::norm(feat);
-    if (n > 0) feat /= n;
+    if (feat.cols != kFeatureSize || !cv::checkRange(feat) || !std::isfinite(n) || n <= 0)
+      throw cv::Exception(cv::Error::StsError, "invalid face feature", "feature", __FILE__, __LINE__);
+    feat /= n;
     return feat;
   }
 
@@ -580,7 +604,9 @@ std::vector<Appearance> loadGallery(const std::string& user) {
       std::string kind;
       (*it)["kind"] >> kind;
       if (kind == "rgb") a.kind = kind;
-      if (a.features.empty() || a.features.cols != kFeatureSize || a.features.type() != CV_32F) continue;
+      if (a.features.empty() || a.features.cols != kFeatureSize || a.features.type() != CV_32F ||
+          !cv::checkRange(a.features) || !std::isfinite(a.headYaw) || !std::isfinite(a.headPitch) ||
+          (a.hasGaze && (!std::isfinite(a.gazeYaw) || !std::isfinite(a.gazePitch)))) continue;
       out.push_back(a);
     }
   } catch (const cv::Exception&) {
@@ -629,9 +655,11 @@ bool saveGallery(const std::string& user, const std::vector<Appearance>& gallery
 }
 
 double bestScore(const std::vector<Appearance>& gallery, const cv::Mat& feat, size_t* which = nullptr) {
+  if (feat.type() != CV_32F || feat.cols != kFeatureSize || !cv::checkRange(feat)) return omaface::missing();
   double best = -1;
   for (size_t i = 0; i < gallery.size(); i++) {
     cv::Mat scores = gallery[i].features * feat.t();
+    if (!cv::checkRange(scores)) return omaface::missing();
     double mx;
     cv::minMaxLoc(scores, nullptr, &mx);
     if (mx > best) {
@@ -687,13 +715,19 @@ class Attention {
   // "ok", "head" (turned away), "eyes" (closed) or "away" (eyes on
   // something other than the screen: a phone, a lap, another room).
   std::string check(const cv::Mat& bgr, const Face& f, const Appearance& a, bool ir) {
+    lastEyes = std::numeric_limits<float>::quiet_NaN();
+    lastGaze = {std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::quiet_NaN()};
     float facing = a.headPitch > 0 ? a.headYaw : 0.f;
-    if (std::fabs(headPose(f).x - facing) > 0.2f) return "head";
+    cv::Point2f pose = headPose(f);
+    if (!std::isfinite(pose.x) || !std::isfinite(pose.y) || !std::isfinite(facing)) return "unavailable";
+    if (std::fabs(pose.x - facing) > 0.2f) return "head";
     lastEyes = eyesOpen(bgr, f);
+    if (!std::isfinite(lastEyes)) return "unavailable";
     if (lastEyes < eyesOpenAt(ir)) return "eyes";
     cv::Point2f g = gaze(bgr, f);
     float dy = g.x - (a.hasGaze ? a.gazeYaw : 0.f), dp = g.y - (a.hasGaze ? a.gazePitch : 0.f);
     lastGaze = {dy, dp};
+    if (!std::isfinite(dy) || !std::isfinite(dp)) return "unavailable";
     return (dp < -kGazeDown || dp > kGazeUp || std::fabs(dy) > kGazeSide) ? "away" : "ok";
   }
 
@@ -713,13 +747,16 @@ class Attention {
     gaze_.setInput(cv::dnn::blobFromImage(rgb));
     std::vector<cv::Mat> outs;
     gaze_.forward(outs, std::vector<cv::String>{"yaw", "pitch"});
+    if (outs.size() != 2) return {NAN, NAN};
     float angles[2];
     for (int k = 0; k < 2; k++) {
       cv::Mat logits = outs[k].reshape(1, 1), e;
+      if (logits.type() != CV_32F || logits.cols != 90 || !cv::checkRange(logits)) return {NAN, NAN};
       double top;
       cv::minMaxLoc(logits, nullptr, &top);
       cv::exp(logits - top, e);
       double sum = cv::sum(e)[0], expected = 0;
+      if (!std::isfinite(sum) || sum <= 0) return {NAN, NAN};
       for (int i = 0; i < e.cols; i++) expected += e.at<float>(0, i) * i;
       angles[k] = float(expected / sum * 4 - 180);
     }
@@ -731,7 +768,9 @@ class Attention {
     const float* p = f.row.ptr<float>();
     cv::Point2f re(p[4], p[5]), le(p[6], p[7]), d = le - re;
     double iod = std::max(1.0f, std::hypot(d.x, d.y)), angle = std::atan2(d.y, d.x);
-    return std::min(eyeOpen(bgr, re, angle, iod, false), eyeOpen(bgr, le, angle, iod, true));
+    float right = eyeOpen(bgr, re, angle, iod, false), left = eyeOpen(bgr, le, angle, iod, true);
+    if (!std::isfinite(right) || !std::isfinite(left)) return NAN;
+    return std::min(right, left);
   }
 
   // The last frame judged, gaze relative to enrollment (degrees), for the
@@ -751,6 +790,7 @@ class Attention {
     if (mirror) cv::flip(patch, patch, 1);
     iris_.setInput(cv::dnn::blobFromImage(patch, 1 / 255.0, cv::Size(64, 64), cv::Scalar(), true));
     cv::Mat contour = iris_.forward("output_eyes_contours_and_brows").reshape(1, 71);
+    if (contour.type() != CV_32F || contour.cols != 3 || !cv::checkRange(contour)) return NAN;
     float minX = 1e9f, maxX = -1e9f, minY = 1e9f, maxY = -1e9f;
     for (int k = 0; k < 16; k++) {  // the first 16 points outline the eyelids
       float x = contour.at<float>(k, 0), y = contour.at<float>(k, 1);
@@ -847,11 +887,6 @@ void writeStatus(const std::string& service, const std::string& state, long seq)
 
 // ------------------------------------------------------------------ serve
 
-struct Request {
-  std::string user;
-  std::string service;
-};
-
 bool readLine(int fd, std::string& line, int timeoutMs) {
   auto start = Clock::now();
   line.clear();
@@ -859,9 +894,12 @@ bool readLine(int fd, std::string& line, int timeoutMs) {
     int left = timeoutMs - int(secondsSince(start) * 1000);
     if (left <= 0) return false;
     pollfd p{fd, POLLIN, 0};
-    if (poll(&p, 1, left) <= 0) return false;
+    int ready = poll(&p, 1, left);
+    if (ready < 0 && errno == EINTR) continue;
+    if (ready <= 0) return false;
     char c;
-    ssize_t r = read(fd, &c, 1);
+    ssize_t r = recv(fd, &c, 1, MSG_DONTWAIT);
+    if (r < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
     if (r <= 0) return false;
     if (c == '\n') return true;
     line.push_back(c);
@@ -919,7 +957,7 @@ cv::Rect2f faceBox(const Face& f) {
 // "gone": the client left.
 std::string headTurnChallenge(Camera& cam, FaceModels& models, const std::vector<Appearance>& gallery,
                               double threshold, int minFace, const std::string& key,
-                              long seq, const Face& matched) {
+                              long seq, const Face& matched, bool test = false) {
   const float kTurn = 0.18f, kWrong = 0.25f, kCentre = 0.15f;
   const double kSettle = 5.0, kAnswer = 2.5, kTooFast = 0.15, kLost = 1.0;
   cv::Rect2f last = faceBox(matched);
@@ -1008,7 +1046,7 @@ std::string headTurnChallenge(Camera& cam, FaceModels& models, const std::vector
     }
 
     const char* ask = target == 0 ? "turn-back" : (target > 0 ? "turn-left" : "turn-right");
-    writeStatus(key, ask, seq);
+    if (!test) writeStatus(key, ask, seq);
     sendLine(std::string("STATUS ") + ask);
     auto asked = Clock::now();
     while (true) {
@@ -1037,8 +1075,9 @@ std::string headTurnChallenge(Camera& cam, FaceModels& models, const std::vector
   }
   // The sequence always ends facing the camera; the face that arrived there
   // must still be the enrolled one.
-  if (bestScore(gallery, models.feature(homeFrame, home)) < threshold) return "identity";
-  writeStatus(key, "scanning", seq);
+  double score = bestScore(gallery, models.feature(homeFrame, home));
+  if (!std::isfinite(score) || score < threshold) return "identity";
+  if (!test) writeStatus(key, "scanning", seq);
   return "ok";
 }
 
@@ -1055,8 +1094,6 @@ std::string headTurnChallenge(Camera& cam, FaceModels& models, const std::vector
 // from frame to frame, so a run of good frames is required.
 class Liveness {
  public:
-  static constexpr float kLive = 0.85f;
-
   bool load(std::string& err) {
     try {
       spoofA_ = cv::dnn::readNet(kSpoofModelA);
@@ -1069,9 +1106,19 @@ class Liveness {
     return true;
   }
 
-  // 0-1: how sure the anti-spoofing models are that this is a live face.
-  float live(const cv::Mat& bgr, const Face& f) {
-    return 0.5f * (liveScore(spoofA_, crop(bgr, f, 2.7)) + liveScore(spoofB_, crop(bgr, f, 4.0)));
+  // The mean and both model outputs, from one inference each on the usual crops.
+  struct Scores {
+    float mean = std::numeric_limits<float>::quiet_NaN();
+    float v2 = std::numeric_limits<float>::quiet_NaN();
+    float v1se = std::numeric_limits<float>::quiet_NaN();
+  };
+
+  Scores live(const cv::Mat& bgr, const Face& f) {
+    Scores out;
+    out.v2 = liveScore(spoofA_, crop(bgr, f, 2.7));
+    out.v1se = liveScore(spoofB_, crop(bgr, f, 4.0));
+    out.mean = 0.5f * (out.v2 + out.v1se);
+    return out;
   }
 
  private:
@@ -1092,10 +1139,14 @@ class Liveness {
   static float liveScore(cv::dnn::Net& net, const cv::Mat& face) {
     net.setInput(cv::dnn::blobFromImage(face, 1.0, cv::Size(80, 80), cv::Scalar(), false));
     cv::Mat logits = net.forward().reshape(1, 1), e;
+    if (logits.type() != CV_32F || logits.cols != 3 || !cv::checkRange(logits))
+      return std::numeric_limits<float>::quiet_NaN();
     double top;
     cv::minMaxLoc(logits, nullptr, &top);
     cv::exp(logits - top, e);
-    return float(e.at<float>(0, 1) / cv::sum(e)[0]);
+    double sum = cv::sum(e)[0];
+    if (!std::isfinite(sum) || sum <= 0) return std::numeric_limits<float>::quiet_NaN();
+    return float(e.at<float>(0, 1) / sum);
   }
 
   cv::dnn::Net spoofA_, spoofB_;
@@ -1165,16 +1216,16 @@ int choose(const std::string& choice) {
   return finish("ok");
 }
 
+extern volatile sig_atomic_t gStop;
+std::vector<std::string> brailleFrame(const cv::Mat& grey, const cv::Rect& focus, int cols, int rows);
+
 int serve() {
   std::string line;
-  if (!readLine(STDIN_FILENO, line, 3000)) return finish("error bad-request");
-  std::istringstream ss(line);
-  std::string verb;
-  Request req;
-  ss >> verb >> req.user >> req.service;
-  if (verb == "CHOOSE") return choose(req.user);
-  if (verb == "RESET") return resetStrikes();
-  if (verb != "VERIFY" || req.user.empty() || req.service.empty()) return finish("error bad-request");
+  bool complete = readLine(STDIN_FILENO, line, 3000);
+  omaface::Request req = omaface::request(line);
+  if (!complete || req.kind == omaface::RequestKind::Invalid) return finish("error bad-request");
+  if (req.kind == omaface::RequestKind::Choose) return choose(req.user);
+  if (req.kind == omaface::RequestKind::Reset) return resetStrikes();
 
   // The peer may only ask about itself, unless it is root (sudo, polkit).
   ucred cred{};
@@ -1186,6 +1237,10 @@ int serve() {
   if (cred.uid != 0 && cred.uid != uid) return finish("denied peer");
 
   Config cfg = loadConfig();
+  // TEST is the self-test with candidate settings for this scan only. They
+  // never reach a real prompt: the request maps to omaface-test below.
+  const bool candidate = req.kind == omaface::RequestKind::Test;
+  if (candidate) omaface::changeSettings(cfg, req.changes);
   std::string key;
   double timeout = 0;
   bool enabled = false, needsSession = false, needsSeat = false, test = false;
@@ -1193,7 +1248,7 @@ int serve() {
   else if (req.service == "polkit-1") { key = "polkit"; enabled = cfg.polkit; timeout = cfg.timeoutPolkit; needsSession = true; }
   else if (req.service == "sddm") { key = "login"; enabled = cfg.login; timeout = cfg.timeoutLogin; needsSeat = true; }
   else if (req.service == "omaface-lock") { key = "lock"; enabled = cfg.lock; timeout = cfg.timeoutLock; }
-  else if (req.service == "omaface-test") { key = "test"; enabled = true; timeout = 8.0; test = true; }
+  else if (req.service == "omaface-test") { key = "test"; enabled = true; timeout = cfg.timeoutTest; test = true; }
   else return finish("disabled unknown-service");
   // Only the lock screen and the self-test may be asked for by the user itself;
   // sudo, polkit and login requests must come from their root PAM stacks.
@@ -1218,28 +1273,32 @@ int serve() {
   // The self-test still runs the camera and models with nothing enrolled, so
   // a fresh install can be checked end to end before the first enrollment.
   if (gallery.empty() && !test) return finish("unavailable not-enrolled");
+  auto status = [&](const std::string& state, long generation) {
+    if (!test) writeStatus(key, state, generation);
+  };
   // The lock screen hides the omaFace mark while the camera cannot see you.
-  if (lidClosed()) { writeStatus(key, "unavailable", 0); return finish("unavailable lid-closed"); }
+  if (lidClosed()) { status("unavailable", 0); return finish("unavailable lid-closed"); }
   if (needsSession && !hasActiveLocalSession(uid)) return finish("unavailable no-local-session");
   if (needsSeat && !hasActiveLocalSession((uid_t)-1)) return finish("unavailable no-local-seat");
 
-  Failures fails = readFailures(uid);
+  Failures fails = test ? Failures{} : readFailures(uid);
   if (!test && fails.count >= lockoutAt) return finish("locked-out");
 
   long seq = (long)time(nullptr) * 1000 + getpid() % 1000;
-  unlink(choicePath(uid).c_str());  // a choice only counts for the prompt it was made in
+  if (!test) unlink(choicePath(uid).c_str());  // only the current prompt's choice counts
   // A webcam always asks first for sudo and system prompts, whatever the
   // confirm setting: looking at the screen must never approve them.
   if ((key == "sudo" || key == "polkit") && (cfg.confirm || rgb)) {
     std::string choice = awaitChoice(key, uid, seq, cfg.timeoutChoose);
     if (choice != "face") {
-      writeStatus(key, "idle", seq);
+      status("idle", seq);
       return finish(choice == "password" ? "declined" : (choice == "gone" ? "error client-gone" : "timeout choose"));
     }
   }
 
   mkdir(kRunDir, 0755);
-  int lockFd = ::open((std::string(kRunDir) + "/camera.lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+  omaface::FileDescriptor cameraLock(::open((std::string(kRunDir) + "/camera.lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600));
+  int lockFd = cameraLock.get();
   bool haveLock = false;
   for (int i = 0; i < 20 && lockFd >= 0; i++) {
     if (flock(lockFd, LOCK_EX | LOCK_NB) == 0) { haveLock = true; break; }
@@ -1247,7 +1306,7 @@ int serve() {
   }
   if (!haveLock) return finish("busy");
 
-  if (!haveCamera) { writeStatus(key, "unavailable", 0); return finish("unavailable no-camera"); }
+  if (!haveCamera) { status("unavailable", 0); return finish("unavailable no-camera"); }
 
   FaceModels models;
   std::string err;
@@ -1256,7 +1315,7 @@ int serve() {
   Camera cam;
   if (!cam.open(info, err)) {
     fprintf(stderr, "%s\n", err.c_str());
-    writeStatus(key, "unavailable", 0);
+    status("unavailable", 0);
     return finish("unavailable camera");
   }
   const int minFace = minFaceFor(cfg, cam);
@@ -1266,32 +1325,55 @@ int serve() {
   Liveness liveness;
   if (rgb && !liveness.load(err)) { fprintf(stderr, "%s\n", err.c_str()); return finish("error models"); }
 
-  writeStatus(key, "scanning", seq);
+  status("scanning", seq);
   sendLine("STATUS scanning");
 
   auto start = Clock::now();
-  int matches = 0, rejected = 0, inattentive = 0, notLive = 0;
-  // IR: a few matching frames in a row (three when attention is on, about
-  // 0.4 s, so one eyelid reading near the line cannot open it). Webcam: a
-  // run of eight, since a photo or a screen can pass the anti-spoofing
-  // models on a lucky frame.
-  const int needed = rgb ? 8 : cfg.attention ? std::max(cfg.matchFrames, 3) : cfg.matchFrames;
+  int rejected = 0, inattentive = 0, notLive = 0;
+  // IR keeps its attention floor of three; RGB defaults to eight lit frames.
+  const auto requirements = omaface::requirements(cfg, rgb, cfg.attention, cam.width());
+  const int needed = requirements.requiredFrames;
+  // The self-test reports what this scan requires, as the engine applies it
+  // (camera kind, attention floor, face width scaled to this camera).
+  if (test) {
+    char b[200];
+    snprintf(b, sizeof b, "REQUIRE camera %s threshold %.3f live %.3f min_width %d frames %d timeout %.0f",
+             rgb ? "webcam" : "ir", requirements.threshold, rgb ? requirements.liveThreshold : -1.0,
+             requirements.minWidth, needed, timeout);
+    sendLine(b);
+  }
+  omaface::Streak streak;
   bool sawFace = false;
   std::string lastStatus = "scanning";
   cv::Mat grey, bgr;
   DarkFrameFilter darkFilter;
+  // A TEST also gets a small mirrored braille frame per frame, so the camera
+  // is visible without exposing a video surface to the shell.
+  auto sendPreview = [&](bool found, const Face& face) {
+    if (!candidate) return;
+    cv::Rect focus(0, 0, grey.cols, grey.rows);
+    if (found && !face.row.empty()) {
+      const float* p = face.row.ptr<float>();
+      double s = std::max(p[2], p[3]) * 1.9;
+      double cx = p[0] + p[2] / 2.0, cy = p[1] + p[3] / 2.0;
+      focus = cv::Rect(int(cx - s / 2), int(cy - s * 0.52), int(s), int(s * 0.78));
+    }
+    std::string out = "PREVIEW";
+    for (const auto& row : brailleFrame(grey, focus, 30, 12)) out += " " + row;
+    sendLine(out);
+  };
   while (secondsSince(start) < timeout) {
-    if (clientGone()) { writeStatus(key, "idle", seq); return 1; }
+    if (gStop || clientGone()) { status("idle", seq); return 1; }
     // The dialog was dismissed, or the person started typing the password:
     // the camera turns off now, not when the scan would have timed out.
-    if (access(choicePath(uid).c_str(), F_OK) == 0) {
+    if (!test && access(choicePath(uid).c_str(), F_OK) == 0) {
       std::ifstream f(choicePath(uid));
       std::string choice;
       f >> choice;
       unlink(choicePath(uid).c_str());
       if (choice == "password") {
         cam.close();
-        writeStatus(key, "idle", seq);
+        status("idle", seq);
         return finish("declined");
       }
     }
@@ -1301,7 +1383,14 @@ int serve() {
     bool found = models.detect(bgr, face);
     if (found) cam.followFace(cv::Rect(faceBox(face)));
     if (!found || face.width < minFace) {
-      matches = 0;
+      omaface::Measurement measurement;
+      measurement.found = found;
+      measurement.width = found ? face.width : omaface::missing();
+      auto gate = streak.judge(requirements, measurement);
+      sendPreview(found, face);
+      if (test) sendLine("SCORE -1 width " + std::string(found ? omaface::number(face.width) : "-1") +
+                         " attention unavailable live -1 gaze 0 0 eyes 0 v2 -1 v1se -1 frames " +
+                         std::to_string(gate.frames) + " required " + std::to_string(needed) + " gate " + gate.gate);
       if (lastStatus != "noface") { sendLine("STATUS noface"); lastStatus = "noface"; }
       continue;
     }
@@ -1309,54 +1398,66 @@ int serve() {
     if (gallery.empty()) {
       if (lastStatus != "face") { sendLine("STATUS face"); lastStatus = "face"; }
       cam.close();
-      writeStatus(key, "idle", seq);
+      status("idle", seq);
       return finish("unavailable not-enrolled");
     }
     size_t which = 0;
     double score = bestScore(gallery, models.feature(bgr, face), &which);
     // Attention and liveness only matter for a face that matched (and are
     // always shown by the self-test).
-    std::string attentive = "off";
-    float live = -1;
+    omaface::Measurement measurement;
+    measurement.found = true;
+    measurement.width = face.width;
+    measurement.score = score;
+    measurement.attention = "off";
+    Liveness::Scores live;
     if (score >= threshold || test) {
-      if (cfg.attention) attentive = attention.check(bgr, face, gallery[which], !rgb);
+      if (cfg.attention) measurement.attention = attention.check(bgr, face, gallery[which], !rgb);
       if (rgb) live = liveness.live(bgr, face);
     }
+    measurement.live = live.mean;
+    measurement.liveV2 = live.v2;
+    measurement.liveV1SE = live.v1se;
+    auto gate = streak.judge(requirements, measurement);
+    sendPreview(true, face);
     if (test) {
-      char b[160];
-      snprintf(b, sizeof b, "SCORE %.3f width %.0f attention %s live %.2f gaze %.0f %.0f eyes %.2f", score, face.width,
-               attentive.c_str(), live, attention.lastGaze.x, attention.lastGaze.y, attention.lastEyes);
+      char b[320];
+      auto diagnostic = [](double v) { return std::isfinite(v) ? v : -1.0; };
+      snprintf(b, sizeof b, "SCORE %.3f width %.0f attention %s live %.2f gaze %.0f %.0f eyes %.2f v2 %.3f v1se %.3f frames %d required %d gate %s",
+               diagnostic(score), face.width, measurement.attention.c_str(), diagnostic(live.mean),
+               diagnostic(attention.lastGaze.x), diagnostic(attention.lastGaze.y), diagnostic(attention.lastEyes),
+               diagnostic(live.v2), diagnostic(live.v1se), gate.frames, needed, gate.gate.c_str());
       sendLine(b);
     }
 
-    if (score < threshold) {
-      matches = 0;
+    if (gate.gate == "models") {
+      cam.close();
+      status("unavailable", seq);
+      return finish("error models");
+    } else if (gate.gate == "nomatch") {
       rejected++;
       if (lastStatus != "nomatch") { sendLine("STATUS nomatch"); lastStatus = "nomatch"; }
-    } else if (attentive != "off" && attentive != "ok") {
-      // Your face, but asleep or looking elsewhere: not a match, and not a
-      // stranger either, so it never counts toward the lockout.
-      matches = 0;
+    } else if (gate.gate == "attention") {
+      // Your face, but asleep or looking elsewhere: no strike.
       inattentive++;
       if (lastStatus != "attention") { sendLine("STATUS attention"); lastStatus = "attention"; }
-    } else if (rgb && live < Liveness::kLive) {
-      matches = 0;
+    } else if (gate.gate == "notlive") {
       notLive++;
       if (lastStatus != "notlive") { sendLine("STATUS notlive"); lastStatus = "notlive"; }
-    } else if (++matches >= needed) {
+    } else if (gate.passed) {
       if (rgb && cfg.headTurns) {
-        std::string turns = headTurnChallenge(cam, models, gallery, threshold, minFace, key, seq, face);
-        if (turns == "gone") { writeStatus(key, "idle", seq); return 1; }
+        std::string turns = headTurnChallenge(cam, models, gallery, threshold, minFace, key, seq, face, test);
+        if (turns == "gone") { status("idle", seq); return 1; }
         if (turns == "unsettled" || turns == "crowd") {
           // Never faced the camera long enough to be asked, or someone
           // else came into view: no strike, just no unlock.
           cam.close();
-          writeStatus(key, "timeout", seq);
+          status("timeout", seq);
           return finish("timeout " + turns);
         }
         if (turns != "ok") {
           cam.close();
-          writeStatus(key, "failure", seq);
+          status("failure", seq);
           if (!test) {
             fails.count++;
             fails.last = time(nullptr);
@@ -1367,7 +1468,7 @@ int serve() {
         }
       }
       cam.close();
-      writeStatus(key, "success", seq);
+      status("success", seq);
       if (!test) writeFailures(uid, Failures{});
       return finish("ok");
     } else if (lastStatus != "face") {
@@ -1377,7 +1478,7 @@ int serve() {
   }
   cam.close();
   if (rgb && notLive >= needed && notLive > inattentive) {
-    writeStatus(key, "failure", seq);
+    status("failure", seq);
     if (!test) {
       fails.count++;
       fails.last = time(nullptr);
@@ -1387,13 +1488,13 @@ int serve() {
     return finish("fail liveness spoof");
   }
   if (inattentive > 0) {
-    writeStatus(key, "attention", seq);
+    status("attention", seq);
     return finish("attention");
   }
   // Only a face that was seen and rejected counts toward the lockout; nobody
   // in front of the camera is just a timeout.
   if (sawFace && rejected > 0) {
-    writeStatus(key, "failure", seq);
+    status("failure", seq);
     if (!test) {
       fails.count++;
       fails.last = time(nullptr);
@@ -1402,7 +1503,7 @@ int serve() {
     }
     return finish("fail");
   }
-  writeStatus(key, "timeout", seq);
+  status("timeout", seq);
   if (gallery.empty()) return finish("unavailable not-enrolled no-face-seen");
   return finish("timeout");
 }
@@ -1843,10 +1944,13 @@ int selftest() {
   Attention attention;
   Liveness liveness;
   if (!attention.load(err) || !liveness.load(err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
-  float live = liveness.live(bgr, face), open = attention.eyesOpen(bgr, face);
+  Liveness::Scores live = liveness.live(bgr, face);
+  float open = attention.eyesOpen(bgr, face);
   cv::Point2f g = attention.gaze(bgr, face);
-  if (!(live >= 0 && live <= 1) || !(open >= 0 && open < 10) || !(std::fabs(g.x) <= 180 && std::fabs(g.y) <= 180)) {
-    fprintf(stderr, "models gave nonsense (live %f, eyes %f, gaze %f %f)\n", live, open, g.x, g.y);
+  if (!(live.mean >= 0 && live.mean <= 1) || !(live.v2 >= 0 && live.v2 <= 1) ||
+      !(live.v1se >= 0 && live.v1se <= 1) || !(open >= 0 && open < 10) ||
+      !(std::fabs(g.x) <= 180 && std::fabs(g.y) <= 180)) {
+    fprintf(stderr, "models gave nonsense (live %f, eyes %f, gaze %f %f)\n", live.mean, open, g.x, g.y);
     return 1;
   }
   printf("ok\n");
@@ -1960,7 +2064,23 @@ int main(int argc, char** argv) {
   signal(SIGPIPE, SIG_IGN);
 
   std::string mode = argc > 1 ? argv[1] : "";
-  if (mode == "serve") return serve();
+  if (mode == "config" && argc == 2) return showConfig();
+  if (mode == "validate-settings") return settingsCommand({argv + 2, argv + argc});
+  if (mode == "apply-settings") {
+    if (argc < 3) { fprintf(stderr, "omaface-engine: missing config revision\n"); return 1; }
+    std::string revision = argv[2];
+    return settingsCommand({argv + 3, argv + argc}, &revision);
+  }
+  if (mode == "serve" && argc == 2) {
+    // The models throw on output they cannot judge. Answer instead of
+    // aborting, so PAM gets a result and no core dump is written.
+    try {
+      return serve();
+    } catch (const cv::Exception& e) {
+      fprintf(stderr, "omaface: %s\n", e.what());
+      return finish("error models");
+    }
+  }
   if (mode == "probe") return probe(argc > 2 && std::string(argv[2]) == "webcam");
   if (mode == "selftest") return selftest();
   if (mode == "list" && argc > 2) return listAppearances(argv[2]);
@@ -1982,7 +2102,8 @@ int main(int argc, char** argv) {
     return enroll(argv[2], name, ui);
   }
   fprintf(stderr,
-          "usage: omaface-engine serve | probe | cameras | emitter | selftest | list <user> | remove <user> <n|all> | rename <user> <n> <name> | enroll <user> [--name N] [--ui]\n"
+          "usage: omaface-engine config | validate-settings key=value... | apply-settings <revision|-> key=value...\n"
+          "       omaface-engine serve | probe | cameras | emitter | selftest | list <user> | remove <user> <n|all> | rename <user> <n> <name> | enroll <user> [--name N] [--ui]\n"
           "self-test goes through the socket: omaface test\n");
   return 2;
 }

@@ -49,6 +49,7 @@ install -d -m0755 "$SHARE/plugin" "$SHARE/tools" "$SHARE/hooks"
 install -m0644 "$REPO"/plugin/*.qml "$REPO/plugin/manifest.json" "$SHARE/plugin/"
 install -m0644 "$REPO/tools/patches.py" "$SHARE/tools/"
 install -m0755 "$REPO/tools/build-plugin.py" "$SHARE/tools/"
+install -m0755 "$REPO/tools/test-client.py" "$SHARE/tools/"
 install -m0755 "$REPO/hooks/post-update" "$SHARE/hooks/post-update"
 install -m0644 "$REPO/system/config" "$SHARE/config"
 # SDDM only looks in /usr/share. Selecting the theme is up to `omaface setup`.
