@@ -228,9 +228,10 @@ def scan(s, out, as_json, candidate):
                     value = finite(fields.get(key))
                     return value if value is not None and 0 <= value <= 1 else None
 
+                width = finite(fields.get("width"))
                 event = {"type": "score", "score": score if valid_score else None,
                          "attention": attention, "live": live,
-                         "width": finite(fields.get("width")), "liveV2": unit_score("v2"), "liveV1SE": unit_score("v1se"),
+                         "width": width if width is not None and width >= 0 else None, "liveV2": unit_score("v2"), "liveV1SE": unit_score("v1se"),
                          "frames": frames, "requiredFrames": finite(fields.get("required")), "gate": gate}
                 if preview is not None:
                     event["preview"] = preview
