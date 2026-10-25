@@ -99,6 +99,8 @@ class TestClient(unittest.TestCase):
         self.assertNotIn("preview", out[3])
         self.assertIsNone(out[3]["score"])
         self.assertIsNone(out[3]["live"])
+        # No face: no width either, rather than the engine's -1.
+        self.assertIsNone(out[3]["width"])
         final = out[-1]
         self.assertTrue(final["accepted"])
         self.assertEqual(final["score"], 0.74)
