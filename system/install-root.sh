@@ -41,7 +41,8 @@ rm -f "$PREFIX/share/omaface/sddm-upstream.sha256"
 echo "  OpenCV rebuild hook"
 rm -rf "$SRC/engine"
 install -d -m0755 "$SRC/engine" /etc/pacman.d/hooks
-install -m0644 "$REPO/engine/omaface-engine.cpp" "$REPO/engine/omaface-pam.c" "$REPO/engine/Makefile" "$SRC/engine/"
+install -m0644 "$REPO/engine/omaface-engine.cpp" "$REPO/engine/omaface-pam.c" "$REPO/engine/Makefile" \
+  "$REPO"/engine/*.h "$SRC/engine/"
 sed "s|@PREFIX@|$PREFIX|g" "$REPO/system/rebuild" >"$LIB/rebuild"
 chmod 0755 "$LIB/rebuild"
 sed "s|@PREFIX@|$PREFIX|g" "$REPO/system/omaface.hook" >/etc/pacman.d/hooks/omaface.hook

@@ -25,6 +25,8 @@ match_frames=2
 min_face_width=70
 
 # Seconds the camera looks before falling back to the password.
+# omaface test has its own duration; changing it does not extend a prompt.
+timeout_test=8
 timeout_sudo=4
 timeout_polkit=5
 timeout_lock=6
@@ -38,6 +40,12 @@ timeout_login=6
 rgb_fallback=on
 head_turns=off
 threshold_rgb=0.55
+
+# Advanced webcam calibration. Lower values weaken protection against photos
+# and screens. These defaults remain the baseline; Test cannot establish that
+# a relaxed value is safe. Changes apply to all users and enabled places.
+liveness_threshold=0.85
+match_frames_rgb=8
 
 # IR camera: auto picks the greyscale camera named "IR".
 device=auto

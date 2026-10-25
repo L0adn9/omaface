@@ -13,14 +13,17 @@ OPENCV_LIBS = -lopencv_objdetect -lopencv_dnn -lopencv_imgcodecs -lopencv_imgpro
 
 all: omaface-engine omaface-pam
 
-omaface-engine: omaface-engine.cpp
+omaface-engine: omaface-engine.cpp calibration.h config-settings.h
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(HARDEN) -std=c++17 -DOMAFACE_MODEL_DIR='"$(PREFIX)/share/omaface/models"' \
 		$(OPENCV_CFLAGS) -o $@ $< $(LDFLAGS) $(LDHARDEN) $(OPENCV_LIBS)
 
 omaface-pam: omaface-pam.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(HARDEN) -std=c11 -o $@ $< $(LDFLAGS) $(LDHARDEN)
 
+test:
+	python3 -I ../tests/test_calibration_engine.py
+
 clean:
 	rm -f omaface-engine omaface-pam
 
-.PHONY: all clean
+.PHONY: all test clean
