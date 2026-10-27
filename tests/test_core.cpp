@@ -3,6 +3,8 @@
 // real cameras (640x400 IR frames), kept as box and landmark numbers only.
 #include "omaface/core.hpp"
 
+#include <opencv2/core/utils/logger.hpp>
+
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -129,6 +131,181 @@ void galleryFile() {
   expect(back[0].hasGaze && back[0].gazeYaw == a.gazeYaw && back[0].gazePitch == a.gazePitch, "gaze survives");
   expect(back[0].features.rows == 25 && cv::norm(back[0].features, a.features) == 0, "features survive exactly");
   expect(readGallery("/nonexistent/faces.yml").empty(), "a missing file reads as empty");
+}
+
+// A face looking with the given head yaw and pitch (headPose units).
+Face posed(float yaw, float pitch = 0.5f, float w = 160) {
+  float x = 240, y = 100, h = w * 1.35f;
+  float eyeY = y + h * 0.35f, mouthY = eyeY + 100, eyeDist = 60, mid = x + w / 2;
+  return face(x, y, w, h, mid - eyeDist / 2, eyeY, mid + eyeDist / 2, eyeY, mid + yaw * eyeDist, eyeY + pitch * 100,
+              mid - 25, mouthY, mid + 25, mouthY);
+}
+
+// A person in front of the webcam during the head-turn check: answers each
+// question after `reaction` seconds by turning to the asked side (or the
+// opposite one when `contrary`), or never moves when `photo`.
+struct Person {
+  double reaction = 0.4;
+  bool contrary = false, photo = false;
+  float yaw0 = -0.06f;
+  int faces = 1;
+  double goneFrom = 1e9, goneTo = -1;  // no face in this time window
+  double crowdAt = -1;                 // a second face at this time
+};
+
+struct TurnRun {
+  std::string result;
+  std::vector<std::string> asked;
+};
+
+TurnRun turns(const Person& p, double identity = 0.8, const unsigned char* rnd = nullptr) {
+  // Settle pause 0.4 s; moves: left, back, left, back; holds 0.15 s.
+  const unsigned char fixed[9] = {0, 1, 0, 1, 0, 0, 0, 0, 0};
+  double t = 0;
+  HeadTurns h(posed(p.yaw0), rnd ? rnd : fixed, t, [&](const cv::Mat&, const Face&) { return identity; }, 0.6, 70);
+  TurnRun run;
+  float want = p.yaw0, yaw = p.yaw0;
+  double askedAt = -1;
+  for (int i = 0; i < 400; i++) {
+    std::string s = h.poll(t);
+    if (s == "turn-left" || s == "turn-right" || s == "turn-back") {
+      run.asked.push_back(s);
+      askedAt = t;
+      float side = s == "turn-left" ? 0.3f : s == "turn-right" ? -0.3f : 0.f;
+      want = p.yaw0 + (p.contrary ? -side : side);
+      continue;
+    }
+    if (!s.empty()) { run.result = s; return run; }
+    if (!p.photo && askedAt >= 0 && t - askedAt >= p.reaction) yaw = want;
+    bool gone = t >= p.goneFrom && t <= p.goneTo;
+    int count = std::fabs(t - p.crowdAt) < 0.03 ? 2 : p.faces;
+    s = h.frame(t, true, cv::Mat::zeros(400, 640, CV_8UC3), !gone, posed(yaw), count);
+    if (!s.empty()) { run.result = s; return run; }
+    t += 1.0 / 15;
+  }
+  run.result = "no result";
+  return run;
+}
+
+void headTurns() {
+  TurnRun ok = turns(Person{});
+  expectEq(ok.result, "ok", "a person following the moves passes");
+  expect(ok.asked == std::vector<std::string>{"turn-left", "turn-back", "turn-left", "turn-back"}, "moves follow the random bytes");
+  expectEq(turns(Person{}, 0.4).result, "identity", "a different face back at the camera fails");
+  Person photo;
+  photo.photo = true;
+  expectEq(turns(photo).result, "slow", "a photo never turns");
+  Person contrary;
+  contrary.contrary = true;
+  expectEq(turns(contrary).result, "wrong", "turning the other way fails");
+  Person eager;
+  eager.reaction = 0;
+  expectEq(turns(eager).result, "early", "answering before the question could be read fails");
+  Person crowd;
+  crowd.crowdAt = 0.8;
+  expectEq(turns(crowd).result, "crowd", "a second face stops the check");
+  Person gone;
+  gone.goneFrom = 0.6;
+  gone.goneTo = 5;
+  expectEq(turns(gone).result, "lost", "a face gone for a second is lost");
+  Person away;
+  away.yaw0 = -0.06f;
+  {
+    // Matched facing the camera, then never facing it again.
+    const unsigned char fixed[9] = {0, 1, 0, 1, 0, 0, 0, 0, 0};
+    double t = 0;
+    HeadTurns h(posed(-0.06f), fixed, t, [](const cv::Mat&, const Face&) { return 0.8; }, 0.6, 70);
+    std::string s;
+    for (int i = 0; i < 200 && s.empty(); i++, t += 1.0 / 15) {
+      s = h.poll(t);
+      if (s.empty()) s = h.frame(t, true, cv::Mat(), true, posed(0.35f), 1);
+    }
+    expectEq(s, "unsettled", "never facing the camera is unsettled");
+  }
+  {
+    // Moves right first: back, right, back.
+    const unsigned char right[9] = {255, 0, 0, 0, 0, 0, 0, 0, 0};
+    TurnRun r = turns(Person{}, 0.8, right);
+    expectEq(r.result, "ok", "right-first sequence passes");
+    expect(r.asked == std::vector<std::string>{"turn-right", "turn-back", "turn-right", "turn-back"}, "right-first moves");
+  }
+}
+
+// Fake sensors: every feature distinct, eyes open unless closedUntil.
+struct FakeSensors {
+  int n = 0;
+  double closedUntil = -1;
+  double now = 0;
+  Sensors make() {
+    Sensors s;
+    s.feature = [this](const cv::Mat&, const Face&) { return unit(1, float(n++)); };
+    s.eyesOpen = [this](const cv::Mat&, const Face&) { return now < closedUntil ? 0.1f : 0.3f; };
+    s.gaze = [](const cv::Mat&, const Face&) { return cv::Point2f(2, -3); };
+    return s;
+  }
+};
+
+void enrollment() {
+  cv::Mat frame = cv::Mat::zeros(400, 640, CV_8UC3);
+  {
+    FakeSensors fake;
+    Enrollment e(fake.make(), true, 70);
+    double t = 0;
+    for (int i = 0; i < 8; i++, t += 0.07) expectEq(e.add(frame, true, posed(0, 0.5f), 1, t).substr(0, 4), i < 5 ? "Look" : "Slow", "straight ahead");
+    // The head in a circle, all the way round, twice.
+    for (int i = 0; i < 96; i++, t += 0.07) {
+      double a = i * 2 * CV_PI / 48;
+      e.add(frame, true, posed(0.3f * float(std::sin(a)), 0.5f + 0.3f / 1.6f * float(std::cos(a))), 1, t);
+    }
+    expect(e.complete(), "a full circle completes enrollment");
+    expect(e.filledCount() == Enrollment::kSegments, "every segment filled");
+    Appearance a;
+    expectEq(e.result(a), "", "enrollment succeeds");
+    expect(a.kind == "ir" && a.hasGaze && a.gazeYaw == 2 && a.gazePitch == -3, "kind and gaze baseline recorded");
+    expect(std::fabs(a.headYaw) < 1e-5 && std::fabs(a.headPitch - 0.5f) < 1e-4, "head pose baseline is straight ahead");
+    expect(a.features.rows == int(e.frontalCount()) + Enrollment::kSegments, "frontal and angled samples kept");
+  }
+  {
+    FakeSensors fake;
+    Enrollment e(fake.make(), false, 70);
+    double t = 0;
+    for (int i = 0; i < 20; i++, t += 0.07) e.add(frame, true, posed(0, 0.5f), 1, t);
+    Appearance a;
+    expectEq(e.result(a), "not enough head movement captured, try again", "no head movement fails");
+    Enrollment none(fake.make(), false, 70);
+    expectEq(none.result(a), "could not see your face clearly, try again in better position", "no face fails");
+  }
+  {
+    FakeSensors fake;
+    Enrollment e(fake.make(), true, 70);
+    expectEq(e.add(frame, false, Face(), 0, 0), "Position your face in front of the camera", "no face hint");
+    expectEq(e.add(frame, true, posed(0), 2, 0), "Only one face, please", "two faces hint");
+    expectEq(e.add(frame, true, frontal(-5, 150), 1, 0), "Move into the middle of the view", "edge hint");
+    expectEq(e.add(frame, true, posed(0, 0.5f, 80), 1, 0), "Move a little closer", "small face hint");
+    Face blurry = posed(0);
+    blurry.score = 0.8f;
+    expectEq(e.add(frame, true, blurry, 1, 0), "Hold still", "unsteady face hint");
+  }
+  {
+    // A small nod: pitch moves less than yaw for the same head turn, so it
+    // counts 1.6 times; 0.1 of pitch is past the 0.12 needed to fill.
+    FakeSensors fake;
+    Enrollment e(fake.make(), true, 70);
+    for (int i = 0; i < 5; i++) e.add(frame, true, posed(0, 0.5f), 1, i * 0.07);
+    e.add(frame, true, posed(0, 0.6f), 1, 0.5);
+    expect(e.filledCount() == 1, "a small nod fills a segment");
+    e.add(frame, true, posed(0.1f, 0.5f), 1, 0.6);
+    expect(e.filledCount() == 1, "the same small turn sideways does not");
+  }
+  {
+    // Eyes hidden (glare on glasses): enrollment waits, then goes on after
+    // eight seconds without a gaze baseline.
+    FakeSensors fake;
+    fake.closedUntil = 100;
+    Enrollment e(fake.make(), true, 70);
+    expectEq(e.add(frame, true, posed(0), 1, 0.0), "Open your eyes and look at the screen", "waits for open eyes");
+    expectEq(e.add(frame, true, posed(0), 1, 8.5), "Look straight at the screen", "goes on after eight seconds");
+  }
 }
 
 struct Run {
@@ -271,9 +448,12 @@ void rules() {
 }  // namespace
 
 int main() {
+  cv::utils::logging::setLogLevel(cv::utils::logging::LOG_LEVEL_SILENT);
   geometry();
   matching();
   galleryFile();
+  headTurns();
+  enrollment();
   rules();
   if (failures) {
     printf("%d failed\n", failures);
