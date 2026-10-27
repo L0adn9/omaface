@@ -678,151 +678,41 @@ int finish(const std::string& result) {
 
 // ------------------------------------------------------------------ webcam liveness
 
-// A regular webcam cannot tell a face from a photo or a video of it, so the
-// webcam mode asks the head to follow a random sequence: three moves, each
-// to a random one of the two places it is not (from facing the camera: left
-// or right; from a side: the other side or back), then back to facing the
-// camera, where the face must still match. Each move is asked after a short
-// random pause and must be finished within two seconds, but not so fast that
-// it was anticipated.
-//
-// A real head turning moves the nose sideways against the eyes; a photo or a
-// screen tilted the same way keeps the nose between the eyes (it is flat),
-// so it never registers as a turn. A recording cannot follow a sequence it
-// does not know: a clip turning one way fails at the first other move, and a
-// blind guess at three moves is right one time in eight. Every frame must
-// keep showing the same single face. Measured on a laptop webcam: facing yaw
-// ~ -0.06, turned left ~ +0.25, turned right ~ -0.47.
-//
-// Returns "ok"; "unsettled" when the person never faced the camera long
-// enough to be asked (an ordinary timeout); or a failure that counts toward
-// the lockout: "wrong" (moved somewhere else), "slow" (asked, no answer),
-// "early" (answered before it could have been read), "lost" (face gone or
-// swapped), "identity" (the face back at the camera is not a match).
-// "gone": the client left.
+// The webcam's head-turn check (omaface-core's HeadTurns): the camera, the
+// prompts and the randomness are here, the rules in the core. Returns its
+// result, or "gone" when the client left.
 std::string headTurnChallenge(Camera& cam, FaceModels& models, const std::vector<Appearance>& gallery,
                               double threshold, int minFace, const std::string& key,
                               long seq, const Face& matched) {
-  const float kTurn = 0.18f, kWrong = 0.25f, kCentre = 0.15f;
-  const double kSettle = 5.0, kAnswer = 2.5, kTooFast = 0.15, kLost = 1.0;
-  cv::Rect2f last = faceBox(matched);
-  auto lastSeen = Clock::now();
+  unsigned char rnd[9];
+  if (getrandom(rnd, sizeof rnd, 0) != (ssize_t)sizeof rnd) return "lost";
+  auto start = Clock::now();
+  HeadTurns turns(matched, rnd, 0,
+                  [&](const cv::Mat& bgr, const Face& f) { return bestScore(gallery, models.feature(bgr, f)); },
+                  threshold, minFace);
   DarkFrameFilter unusedFilter;
   cv::Mat grey, bgr;
-
-  // One frame: 1 = a face to judge, 0 = nothing usable yet, -1 = lost or
-  // swapped, -2 = the client went away, -3 = more than one face in view.
-  auto next = [&](Face& f) -> int {
-    if (clientGone()) return -2;
-    if (secondsSince(lastSeen) > kLost) return -1;
-    if (!cam.grab(grey, 500, &bgr) || unusable(cam, unusedFilter, grey)) return 0;
+  std::string result;
+  while (result.empty()) {
+    if (clientGone()) return "gone";
+    std::string s = turns.poll(secondsSince(start));
+    if (s == "turn-left" || s == "turn-right" || s == "turn-back") {
+      writeStatus(key, s, seq);
+      sendLine("STATUS " + s);
+      continue;
+    }
+    if (!s.empty()) { result = s; break; }
+    bool usable = cam.grab(grey, 500, &bgr) && !unusable(cam, unusedFilter, grey);
+    Face f;
     int count = 0;
-    if (!models.detect(bgr, f, &count) || f.width < minFace * 0.8f) return 0;
-    if (count > 1) return -3;
-    cv::Rect2f b = faceBox(f);
-    float jump = std::hypot(b.x + b.width / 2 - (last.x + last.width / 2), b.y + b.height / 2 - (last.y + last.height / 2));
-    if (jump > 0.35f * last.width) return -1;
-    last = b;
-    lastSeen = Clock::now();
-    return 1;
-  };
-
-  // Places: 0 = facing the camera, +1 = turned left, -1 = turned right
-  // (relative to y0, the person's left is positive).
-  float y0 = headPose(matched).x;
-  auto at = [&](float d, int place) {
-    return place == 0 ? std::fabs(d) <= kCentre : (place > 0 ? d >= kTurn : d <= -kTurn);
-  };
-
-  // Settle: facing the camera for a random pause before the first ask.
-  // Looking away restarts the pause; never settling is no failure.
-  {
-    unsigned char rnd;
-    if (getrandom(&rnd, 1, 0) != 1) return "lost";
-    const double pause = 0.4 + rnd / 255.0 * 0.6;
-    const float yMatched = y0;
-    auto settleStart = Clock::now(), facingSince = Clock::now();
-    float lastYaw = 0;
-    int facing = 0;
-    Face f;
-    while (true) {
-      if (secondsSince(settleStart) > kSettle) {
-        fprintf(stderr, "omaface: head-turn check: not facing the camera (yaw %.2f, expected %.2f)\n", lastYaw, yMatched);
-        return "unsettled";
-      }
-      int r = next(f);
-      if (r == -2) return "gone";
-      if (r == -3) return "crowd";
-      if (r == -1) return "lost";
-      if (r != 1) continue;
-      lastYaw = headPose(f).x;
-      if (std::fabs(lastYaw - yMatched) > kCentre) { facing = 0; continue; }
-      if (facing == 0) facingSince = Clock::now();
-      y0 = facing == 0 ? lastYaw : y0 * 0.8f + lastYaw * 0.2f;
-      if (++facing >= 3 && secondsSince(facingSince) >= pause) break;
-    }
+    bool found = usable && models.detect(bgr, f, &count);
+    result = turns.frame(secondsSince(start), usable, bgr, found, f, count);
   }
-
-  unsigned char rnd[8];
-  if (getrandom(rnd, sizeof rnd, 0) != (ssize_t)sizeof rnd) return "lost";
-  int place = 0;
-  Face home;
-  cv::Mat homeFrame;
-  const int kMoves = 3;
-  for (int step = 0; step <= kMoves; step++) {
-    // The two places it is not, picked at random; the last step is home.
-    int target;
-    if (step == kMoves) target = 0;
-    else if (place == 0) target = (rnd[step] & 1) ? 1 : -1;
-    else target = (rnd[step] & 1) ? -place : 0;
-    if (step == kMoves && place == 0) break;  // already home
-
-    // A short random pause, holding the current place, before asking.
-    const double pause = 0.15 + rnd[4 + step % 4] / 255.0 * 0.3;
-    auto holdSince = Clock::now(), holdStart = Clock::now();
-    Face f;
-    while (secondsSince(holdSince) < pause) {
-      if (secondsSince(holdStart) > kAnswer + pause) return "slow";
-      int r = next(f);
-      if (r == -2) return "gone";
-      if (r == -3) return "crowd";
-      if (r == -1) return "lost";
-      if (r == 1 && !at(headPose(f).x - y0, place)) holdSince = Clock::now();
-    }
-
-    const char* ask = target == 0 ? "turn-back" : (target > 0 ? "turn-left" : "turn-right");
-    writeStatus(key, ask, seq);
-    sendLine(std::string("STATUS ") + ask);
-    auto asked = Clock::now();
-    while (true) {
-      if (secondsSince(asked) > kAnswer) return "slow";
-      int r = next(f);
-      if (r == -2) return "gone";
-      if (r == -3) return "crowd";
-      if (r == -1) return "lost";
-      if (r != 1) continue;
-      float d = headPose(f).x - y0;
-      if (at(d, target)) {
-        if (secondsSince(asked) < kTooFast) return "early";
-        break;
-      }
-      // Somewhere it was not asked to go: from facing the camera, the other
-      // side; on the way home, past it to the other side. (Crossing from one
-      // side to the other starts on the far side, so there it only times out.)
-      int away = place == 0 ? -target : (target == 0 ? -place : 0);
-      if ((away > 0 && d >= kWrong) || (away < 0 && d <= -kWrong)) return "wrong";
-    }
-    place = target;
-    if (place == 0) {
-      home = f;
-      bgr.copyTo(homeFrame);
-    }
-  }
-  // The sequence always ends facing the camera; the face that arrived there
-  // must still be the enrolled one.
-  if (bestScore(gallery, models.feature(homeFrame, home)) < threshold) return "identity";
-  writeStatus(key, "scanning", seq);
-  return "ok";
+  if (result == "unsettled")
+    fprintf(stderr, "omaface: head-turn check: not facing the camera (yaw %.2f, expected %.2f)\n", turns.lastYaw(),
+            turns.expectedYaw());
+  if (result == "ok") writeStatus(key, "scanning", seq);
+  return result;
 }
 
 // ------------------------------------------------------------------ webcam checks
@@ -1246,32 +1136,13 @@ int enroll(const std::string& user, const std::string& name, bool ui) {
   if (!cam.open(info, err)) return fail(err);
   const int minFace = minFaceFor(cfg, cam);
 
-  const int segments = 24;
-  std::vector<int> filled(segments, 0);
-  std::vector<cv::Mat> frontal, angled(segments);
-  bool haveCenter = false;
-  cv::Point2f center(0, 0);
-  std::vector<cv::Point2f> centerSamples;
-  // Where this person's eyes point looking at the screen: the baseline for
-  // the attention check. The straight-ahead samples wait for open eyes;
-  // some glasses hide them in glare, so after a few seconds enrollment goes
-  // on without, and the scan measures from straight ahead instead.
+  // The rules of enrolling are omaface-core's; the camera, the preview and
+  // the gallery file are here. Without the eye models enrollment goes on
+  // without a gaze baseline.
   Attention attention;
   const bool measureEyes = attention.load(kModelDir, err);
-  std::vector<float> gazeYaws, gazePitches;
-  bool frontalSeen = false;
-  auto frontalStart = Clock::now();
-  auto eyesOpenNow = [&](const cv::Mat& colour, const Face& f) {
-    if (!measureEyes) return true;
-    if (!frontalSeen) { frontalSeen = true; frontalStart = Clock::now(); }
-    bool open = attention.eyesOpen(colour, f) >= Attention::eyesOpenAt(cam.ir());
-    if (open) {
-      cv::Point2f g = attention.gaze(colour, f);
-      gazeYaws.push_back(g.x);
-      gazePitches.push_back(g.y);
-    }
-    return open || secondsSince(frontalStart) > 8;
-  };
+  Enrollment enrollment(sensors(models, measureEyes ? &attention : nullptr), cam.ir(), minFace);
+  const int segments = Enrollment::kSegments;
   auto start = Clock::now();
   const double limit = 45.0;
   std::string hint;
@@ -1299,55 +1170,14 @@ int enroll(const std::string& user, const std::string& name, bool ui) {
       cam.searchFace();
     }
 
-    if (!got) hint = "Position your face in front of the camera";
-    else if (count > 1) hint = "Only one face, please";
-    else if (!faceInView(face, grey.size())) hint = "Move into the middle of the view";
-    else if (face.width < minFace + 15) hint = "Move a little closer";
-    else if (face.score < 0.88f) hint = "Hold still";
-    else {
-      cv::Point2f pose = headPose(face);
-      if (!haveCenter && !eyesOpenNow(bgr, face)) {
-        hint = "Open your eyes and look at the screen";
-      } else if (!haveCenter) {
-        centerSamples.push_back(pose);
-        hint = "Look straight at the screen";
-        frontal.push_back(models.feature(bgr, face));
-        if (centerSamples.size() >= 5) {
-          for (auto& c : centerSamples) center += c;
-          center *= 1.0f / centerSamples.size();
-          haveCenter = true;
-        }
-      } else {
-        cv::Point2f d = pose - center;
-        // Pitch moves less than yaw for the same head turn; even them out.
-        d.y *= 1.6f;
-        float mag = std::hypot(d.x, d.y);
-        if (mag < 0.07f) {
-          hint = "Slowly move your head in a circle";
-          if (frontal.size() < 8 && eyesOpenNow(bgr, face)) frontal.push_back(models.feature(bgr, face));
-        } else if (mag > 0.75f) {
-          hint = "Not so far";
-        } else {
-          hint = "Keep going";
-          // 0 = up, clockwise as seen on screen (mirrored, like a selfie).
-          double ang = std::atan2(-d.x, -d.y);
-          int seg = int(std::floor((ang + CV_PI) / (2 * CV_PI) * segments)) % segments;
-          seg = (seg + segments / 2) % segments;
-          if (mag > 0.12f && !filled[seg]) {
-            filled[seg] = 1;
-            angled[seg] = models.feature(bgr, face);
-          }
-        }
-      }
-    }
-
-    int nFilled = std::count(filled.begin(), filled.end(), 1);
+    hint = enrollment.add(bgr, got, face, count, secondsSince(start));
+    int nFilled = enrollment.filledCount();
     if (ui) {
       auto art = brailleFrame(grey, focus, 30, 12);
       std::string json = "{\"type\":\"frame\",\"face\":" + std::string(got ? "true" : "false") +
                          ",\"hint\":\"" + jsonEscape(hint) + "\",\"filled\":[";
-      for (int i = 0; i < segments; i++) json += (i ? "," : "") + std::to_string(filled[i]);
-      json += "],\"frontal\":" + std::to_string(frontal.size()) + ",\"preview\":[";
+      for (int i = 0; i < segments; i++) json += (i ? "," : "") + std::to_string(enrollment.filled()[i]);
+      json += "],\"frontal\":" + std::to_string(enrollment.frontalCount()) + ",\"preview\":[";
       for (size_t i = 0; i < art.size(); i++) json += (i ? ",\"" : "\"") + art[i] + "\"";
       json += "]}";
       emit(json, "");
@@ -1357,34 +1187,18 @@ int enroll(const std::string& user, const std::string& name, bool ui) {
     }
     lastFilled = nFilled;
 
-    if (nFilled >= segments * 3 / 4 && frontal.size() >= 6) break;
+    if (enrollment.complete()) break;
   }
   cam.close();
   if (!ui) printf("\n");
 
-  int nFilled = std::count(filled.begin(), filled.end(), 1);
   if (gStop) return fail("cancelled");
-  if (frontal.size() < 4) return fail("could not see your face clearly, try again in better position");
-  if (nFilled < segments / 2) return fail("not enough head movement captured, try again");
-
   Appearance a;
+  std::string problem = enrollment.result(a);
+  if (!problem.empty()) return fail(problem);
   a.name = cleanName(name);
   if (a.name.empty()) a.name = gallery.empty() ? "Face" : "Appearance " + std::to_string(gallery.size() + 1);
   a.created = nowIso();
-  a.kind = cam.ir() ? "ir" : "rgb";
-  a.headYaw = center.x;
-  a.headPitch = center.y;
-  if (gazeYaws.size() >= 3) {
-    auto median = [](std::vector<float> v) {
-      std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
-      return v[v.size() / 2];
-    };
-    a.gazeYaw = median(gazeYaws);
-    a.gazePitch = median(gazePitches);
-    a.hasGaze = true;
-  }
-  for (auto& f : frontal) a.features.push_back(f);
-  for (auto& f : angled) if (!f.empty()) a.features.push_back(f);
   gallery.push_back(a);
   if (!saveGallery(user, gallery, err)) return fail(err);
   // A fresh enrollment clears any lockout from earlier failed scans.
