@@ -10,6 +10,7 @@
 #include <opencv2/dnn.hpp>
 #include <opencv2/objdetect/face.hpp>
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -177,6 +178,106 @@ class Verifier {
   bool sawFace_ = false;
   double strangerAt_ = -1e9, crowdAt_ = -1e9;
   cv::Rect2f runBox_, strangerBox_;
+};
+
+// ------------------------------------------------------------------ enrollment
+
+// How enrollment and the head-turn check measure a face. sensors() gives the
+// real ones; tests give their own.
+struct Sensors {
+  std::function<cv::Mat(const cv::Mat& bgr, const Face& f)> feature;
+  // Empty when the eye models are missing: eyes then count as open and no
+  // gaze baseline is recorded.
+  std::function<float(const cv::Mat& bgr, const Face& f)> eyesOpen;
+  std::function<cv::Point2f(const cv::Mat& bgr, const Face& f)> gaze;
+};
+Sensors sensors(FaceModels& models, Attention* attention);
+
+// One new appearance: a few straight-ahead samples, then the head moving in
+// a circle to fill 24 segments of angles. The platform owns the camera and
+// the screen; it passes every usable frame with what the detector found.
+class Enrollment {
+ public:
+  static const int kSegments = 24;
+
+  Enrollment(const Sensors& sensors, bool ir, int minFace);
+  // Returns the hint to show for this frame.
+  std::string add(const cv::Mat& bgr, bool found, const Face& face, int count, double t);
+  bool complete() const;
+  int filledCount() const;
+  const std::vector<int>& filled() const { return filled_; }
+  size_t frontalCount() const { return frontal_.size(); }
+  // When complete or out of time: "" and the appearance (features, head
+  // pose, gaze, kind; the caller names and dates it), or what went wrong.
+  std::string result(Appearance& out) const;
+
+ private:
+  bool eyesOpenNow(const cv::Mat& bgr, const Face& f, double t);
+
+  Sensors sensors_;
+  bool ir_;
+  int minFace_;
+  std::vector<int> filled_;
+  std::vector<cv::Mat> frontal_, angled_;
+  bool haveCenter_ = false;
+  cv::Point2f center_{0, 0};
+  std::vector<cv::Point2f> centerSamples_;
+  std::vector<float> gazeYaws_, gazePitches_;
+  bool frontalSeen_ = false;
+  double frontalStart_ = 0;
+};
+
+// ------------------------------------------------------------------ head turns
+
+// The webcam's optional head-turn check (head_turns=on), one frame at a
+// time. The platform supplies 9 random bytes, the clock and the frames:
+//
+//   HeadTurns h(matched, random, t, identity);
+//   while (true) {
+//     s = h.poll(now);            // before each frame
+//     if (s is "turn-left", "turn-right" or "turn-back") { show it; continue; }
+//     if (!s.empty()) break;      // the result
+//     grab a frame ...
+//     s = h.frame(now, ...);      // "" or the result
+//   }
+//
+// Results: "ok"; "unsettled" (never faced the camera long enough to be
+// asked) and "crowd" (a second face), which are no strike; "wrong", "slow",
+// "early", "lost" and "identity", which are.
+class HeadTurns {
+ public:
+  // identity: how well a face in a frame matches the enrolled person.
+  HeadTurns(const Face& matched, const unsigned char random[9], double t,
+            std::function<double(const cv::Mat& bgr, const Face& f)> identity, double threshold, int minFace);
+  std::string poll(double t);
+  // usable: false for a frame with nothing to judge (dark, or none at all).
+  std::string frame(double t, bool usable, const cv::Mat& bgr, bool found, const Face& f, int count);
+  // For the log after "unsettled": the yaw last seen and the one expected.
+  float lastYaw() const { return lastYaw_; }
+  float expectedYaw() const { return yMatched_; }
+
+ private:
+  enum class Phase { Settle, Hold, Ask, Done };
+  int accept(double t, bool usable, bool found, const Face& f, int count);
+  bool at(float d, int place) const;
+  std::string nextStep(double t);
+  std::string finishMove(double t, const cv::Mat& bgr, const Face& f);
+
+  std::function<double(const cv::Mat&, const Face&)> identity_;
+  double threshold_;
+  int minFace_;
+  unsigned char rnd_[8];
+  Phase phase_ = Phase::Settle;
+  cv::Rect2f last_;
+  double lastSeen_;
+  float y0_, yMatched_, lastYaw_ = 0;
+  double settleStart_, facingSince_, pause_, holdPause_ = 0;
+  int facing_ = 0;
+  int step_ = 0, place_ = 0, target_ = 0;
+  double holdSince_ = 0, holdStart_ = 0, asked_ = 0;
+  Face home_;
+  cv::Mat homeFrame_;
+  std::string result_;
 };
 
 }  // namespace omaface
