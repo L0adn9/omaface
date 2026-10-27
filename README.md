@@ -175,12 +175,26 @@ one, is always used instead.
 
 ## Security, honestly
 
-* The IR camera ignores phone and monitor screens (they give off no infrared),
-  and attention needs live eyes reflecting the camera's own light. There is
-  still no depth sensor: a good enough infrared-visible replica, or a close
-  relative, might pass. Treat it as convenient, not as strong as your
-  password. `omaface set threshold 0.6` makes matching stricter (default 0.50;
-  `omaface test` shows your scores).
+* Phone screens show no face to the IR camera: photos and videos, held
+  straight or tilted, at full brightness, did not give even a weak detection
+  (measured on one ASUS IR camera). A report of a phone photo unlocking
+  1.2.1 turned out to be the owner's own face, half out of view at the edge
+  of the picture, next to the phone. Since 1.2.2 a face only counts when it
+  is in view up to the mouth (only the chin may leave the picture). Attention needs live eyes reflecting the camera's own
+  light.
+* There is still no depth sensor: a good enough replica lit like skin (a
+  print, a mask), or a close relative, might pass. Treat it as convenient,
+  not as strong as your password. `omaface set threshold 0.6` makes matching
+  stricter (default 0.55, webcam 0.60; `omaface test` shows your scores).
+* How far a stranger gets: 13,000 public photos (LFW, as they are and turned
+  IR-like) scored at most 0.46 against one enrolled IR face, whose own live
+  frames scored 0.58-0.72. Converted photos are not real IR strangers, so
+  treat that as a rough margin, not a guarantee.
+* One face at a time. With a second face in view omaFace does not unlock,
+  nor for a second after, nor for a second after a face that is clearly not
+  yours, for any face somewhere else in the frame. (Before
+  1.2.2 it judged the largest face in view, so a person standing behind
+  someone else at the screen could be the one recognized.)
 * With an IR camera, five scans that see a face that is not yours pause Face
   ID for five minutes. With a webcam, three failed tries pause it until the
   password is used. The password always works.

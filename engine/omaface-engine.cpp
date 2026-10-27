@@ -94,7 +94,7 @@ struct Config {
   bool login = false;
   bool sudo = true;
   bool polkit = true;
-  double threshold = 0.50;
+  double threshold = 0.55;      // IR genuine scores measured 0.58-0.72 (top-5 mean)
   int matchFrames = 2;
   double timeoutSudo = 4.0;
   double timeoutPolkit = 5.0;
@@ -106,7 +106,7 @@ struct Config {
   double timeoutChoose = 30.0;
   bool rgbFallback = true;      // no IR camera: use the regular webcam
   bool headTurns = false;       // webcam: also ask for random head turns (strictest)
-  double thresholdRgb = 0.55;  // webcam genuine scores measured 0.78-0.88
+  double thresholdRgb = 0.60;  // webcam genuine scores measured 0.78-0.88
 };
 
 bool parseBool(const std::string& v, bool fallback) {
@@ -330,8 +330,13 @@ class Camera {
       return false;
     }
     streaming_ = true;
-    // Until a face is found, the middle of the frame, where faces sit.
-    if (ir_) meter(cv::Rect(width_ / 4, height_ / 5, width_ / 2, height_ * 3 / 5));
+    // Until a face is found: where the last one was (the camera keeps the
+    // region between scans), or the first time, the middle of the frame.
+    if (ir_) {
+      cv::Rect last = region();
+      if (last.area() >= 48 * 48 && (last & cv::Rect(0, 0, width_, height_)) == last) meter(last);
+      else meter(cv::Rect(width_ / 4, height_ / 5, width_ / 2, height_ * 3 / 5));
+    }
     return true;
   }
 
@@ -339,8 +344,24 @@ class Camera {
   // mostly covers it is left alone.
   void followFace(const cv::Rect& face) {
     if (!ir_ || !meterable_) return;
+    searching_ = 0;
     cv::Rect overlap = face & metered_;
     if (overlap.area() < 0.6 * face.area() || metered_.area() > 3 * face.area()) meter(face);
+  }
+
+  // No face in a lit frame. A face outside the metered region can be blown
+  // out to white by an exposure set for the room (sitting low, the screen
+  // tilted back: the middle of the frame is then the wall behind), and a
+  // white blob is no face to follow. So after about 1.2 s without one (the
+  // exposure takes about a second to settle), meter somewhere else: the
+  // lower middle, then the middle, in turn. Metering the whole frame does
+  // not help: a bright window brightens nothing.
+  void searchFace() {
+    const int kHold = 18;  // lit frames
+    if (!ir_ || !meterable_ || ++searching_ % kHold != 0) return;
+    const int w = width_, h = height_;
+    const cv::Rect places[] = {cv::Rect(w / 4, h * 2 / 5, w / 2, h * 3 / 5), cv::Rect(w / 4, h / 5, w / 2, h * 3 / 5)};
+    meter(places[(searching_ / kHold - 1) % 2]);
   }
 
   // Returns false on timeout or error. `out` is always greyscale; `colour`,
@@ -421,8 +442,24 @@ class Camera {
     if (!meteringOn_) meteringOn_ = xioctl(fd_, VIDIOC_S_CTRL, &autoCtrl);
   }
 
+  // The region the camera meters now; empty when it has none.
+  cv::Rect region() {
+    v4l2_rect rect{};
+    v4l2_ext_control c{};
+    c.id = V4L2_CID_UVC_REGION_OF_INTEREST_RECT;
+    c.size = sizeof rect;
+    c.p_rect = &rect;
+    v4l2_ext_controls cs{};
+    cs.which = V4L2_CTRL_WHICH_CUR_VAL;
+    cs.count = 1;
+    cs.controls = &c;
+    if (!xioctl(fd_, VIDIOC_G_EXT_CTRLS, &cs)) return {};
+    return cv::Rect(rect.left, rect.top, int(rect.width), int(rect.height));
+  }
+
   bool meterable_ = true, meteringOn_ = false;
   cv::Rect metered_;
+  int searching_ = 0;  // lit frames in a row without a face
 
  public:
 
@@ -504,15 +541,20 @@ class FaceModels {
     return true;
   }
 
-  // Largest detected face, or none.
-  bool detect(const cv::Mat& bgr, Face& out, int* count = nullptr) {
+  // Largest detected face, or none. count: how many faces are at least
+  // countMin pixels wide (all of them by default).
+  bool detect(const cv::Mat& bgr, Face& out, int* count = nullptr, float countMin = 0) {
     if (bgr.size() != inputSize_) {
       inputSize_ = bgr.size();
       detector_->setInputSize(inputSize_);
     }
     cv::Mat faces;
     detector_->detect(bgr, faces);
-    if (count) *count = faces.rows;
+    if (count) {
+      *count = 0;
+      for (int i = 0; i < faces.rows; i++)
+        if (faces.at<float>(i, 2) >= countMin) ++*count;
+    }
     if (faces.rows < 1) return false;
     int best = 0;
     for (int i = 1; i < faces.rows; i++)
@@ -628,14 +670,23 @@ bool saveGallery(const std::string& user, const std::vector<Appearance>& gallery
   return true;
 }
 
+// How well a face matches its closest appearance: the mean of its five best
+// samples there, not the single best one. One lucky sample out of 25 is how
+// a stranger gets close; five at once are not. Against 13,000 public faces
+// (LFW, also turned grey and IR-like) the top-5 mean kept strangers lower
+// for the same genuine scores: the IR-like tail at one in 10,000 fell from
+// 0.53 to 0.48, while the owner's live IR frames lost only about 0.01.
 double bestScore(const std::vector<Appearance>& gallery, const cv::Mat& feat, size_t* which = nullptr) {
+  const int kTop = 5;
   double best = -1;
   for (size_t i = 0; i < gallery.size(); i++) {
     cv::Mat scores = gallery[i].features * feat.t();
-    double mx;
-    cv::minMaxLoc(scores, nullptr, &mx);
-    if (mx > best) {
-      best = mx;
+    std::vector<float> s(scores.begin<float>(), scores.end<float>());
+    size_t k = std::min<size_t>(kTop, s.size());
+    std::partial_sort(s.begin(), s.begin() + k, s.end(), std::greater<float>());
+    double mean = std::accumulate(s.begin(), s.begin() + k, 0.0) / k;
+    if (mean > best) {
+      best = mean;
       if (which) *which = i;
     }
   }
@@ -654,8 +705,12 @@ cv::Point2f headPose(const Face& f);
 // Gaze is relative to the gaze measured at enrollment. On a laptop webcam,
 // looking at the screen stayed within about 16 degrees down (its bottom edge)
 // and 10 up (the camera); a phone read 18-61 degrees down depending on how it
-// was held, and a monitor above the laptop 20-32 up. Hence 20 down and 14 up:
+// was held, and a monitor above the laptop 20-32 up. Hence 20 down and 18 up:
 // a phone held right under the screen's edge is, to any camera, the screen.
+// (Up was 14, but sitting lower than at enrollment read 15-18 on the screen
+// with the IR camera.) Sideways the model jitters: reading the screen moved
+// between 2 and 31 from one frame to the next, so 30 to the side, and a
+// frame looking away only does not count; it does not restart the run.
 //
 // Eyelids, as height over width of the eye contour: on the webcam 0.05-0.17
 // closed and 0.28-0.34 on the screen, so 0.18. On the IR camera (grey,
@@ -668,7 +723,7 @@ cv::Point2f headPose(const Face& f);
 class Attention {
  public:
   static constexpr float kEyesOpenWebcam = 0.18f, kEyesOpenIr = 0.22f;
-  static constexpr float kGazeDown = 20, kGazeUp = 14, kGazeSide = 25;
+  static constexpr float kGazeDown = 20, kGazeUp = 18, kGazeSide = 30;
 
   bool load(std::string& err) {
     try {
@@ -893,6 +948,23 @@ int finish(const std::string& result) {
 cv::Rect2f faceBox(const Face& f) {
   const float* p = f.row.ptr<float>();
   return {p[0], p[1], p[2], p[3]};
+}
+
+// The face inside the picture, with a little room. A face cut by the edge
+// is not judged: holding a phone in front of the IR camera, the owner's own
+// face peeked past it at the side, half of it out of view, and that half
+// matched while the phone took the blame (the IR camera saw no face on the
+// phone at all, even at 0.3 detector confidence). Only the chin may leave
+// the picture, at the bottom, as long as the mouth is in it: the camera sits
+// above the screen, and leaning in pushed the owner's chin up to 39 pixels
+// past the bottom edge of a 400-pixel frame.
+bool faceInView(const Face& f, const cv::Size& frame) {
+  const float kMargin = 8;
+  const float* p = f.row.ptr<float>();
+  cv::Rect2f b = faceBox(f);
+  float mouth = std::max(p[11], p[13]);
+  return b.x >= kMargin && b.y >= kMargin && b.x + b.width <= frame.width - kMargin &&
+         mouth <= frame.height - kMargin;
 }
 
 // A regular webcam cannot tell a face from a photo or a video of it, so the
@@ -1270,7 +1342,7 @@ int serve() {
   sendLine("STATUS scanning");
 
   auto start = Clock::now();
-  int matches = 0, rejected = 0, inattentive = 0, notLive = 0;
+  int matches = 0, rejected = 0, inattentive = 0, notLive = 0, crowded = 0;
   // IR: a few matching frames in a row (three when attention is on, about
   // 0.4 s, so one eyelid reading near the line cannot open it). Webcam: a
   // run of eight, since a photo or a screen can pass the anti-spoofing
@@ -1278,6 +1350,22 @@ int serve() {
   const int needed = rgb ? 8 : cfg.attention ? std::max(cfg.matchFrames, 3) : cfg.matchFrames;
   bool sawFace = false;
   std::string lastStatus = "scanning";
+  // One person at a time. The engine judges the largest face, so with two in
+  // view, any frame that misses the one in front (turned, half out of frame)
+  // would judge whoever stands behind. A second face big enough to match
+  // stops the run for a second; so does a face that was clearly not yours
+  // (strangers measured below 0.40, LFW 99.9%), for any face somewhere else
+  // in the frame: a stranger at the screen whose face flickers out of the
+  // detector, with the owner behind. Not for a face in the same place: the
+  // owner's own first frames, while the exposure settles, also score 0.25-0.40.
+  // The run must also stay on one face: a jump of more than a third of its
+  // width between frames starts it again.
+  const double kStranger = 0.40, kStrangerHold = 1.0;
+  auto strangerAt = Clock::now() - std::chrono::seconds(10), crowdAt = strangerAt;
+  cv::Rect2f runBox, strangerBox;
+  auto moved = [](const cv::Rect2f& a, const cv::Rect2f& b) {
+    return std::hypot(a.x + a.width / 2 - (b.x + b.width / 2), a.y + a.height / 2 - (b.y + b.height / 2)) > b.width / 3;
+  };
   cv::Mat grey, bgr;
   DarkFrameFilter darkFilter;
   while (secondsSince(start) < timeout) {
@@ -1298,14 +1386,27 @@ int serve() {
     if (!cam.grab(grey, 500, &bgr)) continue;
     if (unusable(cam, darkFilter, grey)) continue;
     Face face;
-    bool found = models.detect(bgr, face);
+    int faces = 0;
+    bool found = models.detect(bgr, face, &faces, minFace);
     if (found) cam.followFace(cv::Rect(faceBox(face)));
-    if (!found || face.width < minFace) {
+    else cam.searchFace();
+    if (!found || face.width < minFace || !faceInView(face, grey.size())) {
       matches = 0;
       if (lastStatus != "noface") { sendLine("STATUS noface"); lastStatus = "noface"; }
       continue;
     }
     sawFace = true;
+    if (faces > 1) {
+      // Not a strike: you with someone looking over your shoulder.
+      matches = 0;
+      crowded++;
+      crowdAt = Clock::now();
+      if (lastStatus != "nomatch") { sendLine("STATUS nomatch"); lastStatus = "nomatch"; }
+      continue;
+    }
+    cv::Rect2f box = faceBox(face);
+    if (matches > 0 && moved(box, runBox)) matches = 0;
+    runBox = box;
     if (gallery.empty()) {
       if (lastStatus != "face") { sendLine("STATUS face"); lastStatus = "face"; }
       cam.close();
@@ -1332,11 +1433,21 @@ int serve() {
     if (score < threshold) {
       matches = 0;
       rejected++;
+      if (score < kStranger) {
+        strangerAt = Clock::now();
+        strangerBox = box;
+      }
+      if (lastStatus != "nomatch") { sendLine("STATUS nomatch"); lastStatus = "nomatch"; }
+    } else if (secondsSince(crowdAt) < kStrangerHold ||
+               (secondsSince(strangerAt) < kStrangerHold && moved(box, strangerBox))) {
+      matches = 0;
       if (lastStatus != "nomatch") { sendLine("STATUS nomatch"); lastStatus = "nomatch"; }
     } else if (attentive != "off" && attentive != "ok") {
       // Your face, but asleep or looking elsewhere: not a match, and not a
-      // stranger either, so it never counts toward the lockout.
-      matches = 0;
+      // stranger either, so it never counts toward the lockout. Closed eyes
+      // or a turned head start the run again; a glance away just does not
+      // count (gaze jitters from frame to frame).
+      if (attentive != "away") matches = 0;
       inattentive++;
       if (lastStatus != "attention") { sendLine("STATUS attention"); lastStatus = "attention"; }
     } else if (rgb && live < Liveness::kLive) {
@@ -1403,6 +1514,7 @@ int serve() {
     return finish("fail");
   }
   writeStatus(key, "timeout", seq);
+  if (crowded > 0) return finish("timeout crowd");
   if (gallery.empty()) return finish("unavailable not-enrolled no-face-seen");
   return finish("timeout");
 }
@@ -1616,10 +1728,13 @@ int enroll(const std::string& user, const std::string& name, bool ui) {
       const float* p = face.row.ptr<float>();
       float cx = p[0] + p[2] / 2, cy = p[1] + p[3] / 2, s = std::max(p[2], p[3]) * 1.9f;
       focus = cv::Rect(int(cx - s / 2), int(cy - s * 0.42f * 1.25f), int(s), int(s * 0.62f * 1.25f));
+    } else {
+      cam.searchFace();
     }
 
     if (!got) hint = "Position your face in front of the camera";
     else if (count > 1) hint = "Only one face, please";
+    else if (!faceInView(face, grey.size())) hint = "Move into the middle of the view";
     else if (face.width < minFace + 15) hint = "Move a little closer";
     else if (face.score < 0.88f) hint = "Hold still";
     else {

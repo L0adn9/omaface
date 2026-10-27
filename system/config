@@ -19,8 +19,8 @@ timeout_choose=30
 attention=on
 
 # Matching. Higher threshold = stricter. A match needs this many lit IR
-# frames in a row above the threshold.
-threshold=0.50
+# frames in a row above the threshold, with no other face in view.
+threshold=0.55
 match_frames=2
 min_face_width=70
 
@@ -37,7 +37,7 @@ timeout_login=6
 # one. head_turns=on adds a few random head turns on the webcam (strictest).
 rgb_fallback=on
 head_turns=off
-threshold_rgb=0.55
+threshold_rgb=0.60
 
 # IR camera: auto picks the greyscale camera named "IR".
 device=auto

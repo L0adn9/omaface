@@ -32,6 +32,7 @@ install -Dm0755 "$BUILD/omaface-pam" "$LIB/omaface-pam"
 fill 0755 "$REPO/bin/omaface" "$DEST$PREFIX/bin/omaface"
 fill 0755 "$REPO/system/setup-root.sh" "$LIB/setup-root"
 fill 0755 "$REPO/system/teardown-root.sh" "$LIB/teardown"
+install -Dm0755 "$REPO/system/migrate-config.sh" "$LIB/migrate-config"
 install -Dm0644 "$REPO/system/pam.sh" "$LIB/pam.sh"
 
 echo "  models"

@@ -33,6 +33,8 @@ fi
 
 bash "$REPO/system/install-files.sh" "$REPO" "$BUILD" "$MODELS" "" "$PREFIX" /etc/systemd/system /etc/tmpfiles.d
 install -m0755 "$REPO/system/uninstall-root.sh" "$LIB/uninstall"
+# Settings still at a default that has since changed move to the new one.
+"$LIB/migrate-config"
 # From before setup kept this hash in /var/lib/omaface.
 rm -f "$PREFIX/share/omaface/sddm-upstream.sha256"
 

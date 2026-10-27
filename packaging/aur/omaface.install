@@ -9,6 +9,8 @@ MSG
 }
 
 post_upgrade() {
+  # Settings still at a default that has since changed move to the new one.
+  /usr/lib/omaface/migrate-config || true
   if grep -q omaface-pam /etc/pam.d/sudo 2>/dev/null; then
     echo "==> omaFace updated. Rebuild the shell plugin as your user: omaface sync"
   fi
