@@ -5,6 +5,9 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+
+#include <unistd.h>
 
 using namespace omaface;
 
@@ -89,6 +92,43 @@ void matching() {
   size_t which = 9;
   bestScore({lucky, a}, probe, &which);
   expect(which == 1, "best appearance is reported");
+}
+
+void galleryFile() {
+  Appearance a;
+  a.name = "Face";
+  a.created = "2026-10-27T12:00:00";
+  a.kind = "rgb";
+  a.headYaw = -0.06f;
+  a.headPitch = 0.55f;
+  a.gazeYaw = 3.5f;
+  a.gazePitch = -7.25f;
+  a.hasGaze = true;
+  for (int i = 0; i < 25; i++) a.features.push_back(unit(1, float(i)));
+  Appearance b = a;
+  b.name = "Appearance 2";
+  b.kind = "ir";
+  b.features = a.features.rowRange(0, 10).clone();
+  Appearance broken;  // wrong feature size: skipped on reading
+  broken.name = "broken";
+  broken.features = cv::Mat::ones(5, 64, CV_32F);
+
+  char path[] = "/tmp/omaface-core-test-XXXXXX";
+  int fd = mkstemp(path);
+  expect(fd >= 0, "temp file");
+  close(fd);
+  std::string err;
+  expect(writeGallery(path, {a, b, broken}, err), "gallery written");
+  std::vector<Appearance> back = readGallery(path);
+  unlink(path);
+  expect(back.size() == 2, "two good appearances read back, the broken one skipped");
+  if (back.size() != 2) return;
+  expect(back[0].name == "Face" && back[0].created == a.created && back[0].kind == "rgb", "names and kind survive");
+  expect(back[1].name == "Appearance 2" && back[1].kind == "ir", "second appearance survives");
+  expect(back[0].headYaw == a.headYaw && back[0].headPitch == a.headPitch, "head pose survives");
+  expect(back[0].hasGaze && back[0].gazeYaw == a.gazeYaw && back[0].gazePitch == a.gazePitch, "gaze survives");
+  expect(back[0].features.rows == 25 && cv::norm(back[0].features, a.features) == 0, "features survive exactly");
+  expect(readGallery("/nonexistent/faces.yml").empty(), "a missing file reads as empty");
 }
 
 struct Run {
@@ -233,6 +273,7 @@ void rules() {
 int main() {
   geometry();
   matching();
+  galleryFile();
   rules();
   if (failures) {
     printf("%d failed\n", failures);
