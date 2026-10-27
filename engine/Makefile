@@ -13,9 +13,12 @@ OPENCV_LIBS = -lopencv_objdetect -lopencv_dnn -lopencv_imgcodecs -lopencv_imgpro
 
 all: omaface-engine omaface-pam
 
-omaface-engine: omaface-engine.cpp
+# The recognition engine shared with Nod (macOS), vendored with git subtree.
+CORE_SOURCES = $(wildcard core/src/*.cpp)
+
+omaface-engine: omaface-engine.cpp $(CORE_SOURCES) core/include/omaface/core.hpp
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(HARDEN) -std=c++17 -DOMAFACE_MODEL_DIR='"$(PREFIX)/share/omaface/models"' \
-		$(OPENCV_CFLAGS) -o $@ $< $(LDFLAGS) $(LDHARDEN) $(OPENCV_LIBS)
+		-Icore/include $(OPENCV_CFLAGS) -o $@ omaface-engine.cpp $(CORE_SOURCES) $(LDFLAGS) $(LDHARDEN) $(OPENCV_LIBS)
 
 omaface-pam: omaface-pam.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(HARDEN) -std=c11 -o $@ $< $(LDFLAGS) $(LDHARDEN)

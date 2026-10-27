@@ -18,6 +18,8 @@
 #include <opencv2/imgproc.hpp>
 #include <opencv2/objdetect/face.hpp>
 
+#include "omaface/core.hpp"
+
 #include <linux/uvcvideo.h>
 #include <linux/videodev2.h>
 #include <systemd/sd-login.h>
@@ -50,6 +52,8 @@
 
 namespace {
 
+using namespace omaface;
+
 #ifndef OMAFACE_CONFIG
 #define OMAFACE_CONFIG "/etc/omaface/config"
 #endif
@@ -66,19 +70,12 @@ const char* kRunDir = OMAFACE_RUN_DIR;
 #ifndef OMAFACE_MODEL_DIR
 #define OMAFACE_MODEL_DIR "/usr/local/share/omaface/models"
 #endif
-const char* kDetectorModel = OMAFACE_MODEL_DIR "/face_detection_yunet_2023mar.onnx";
-const char* kRecognizerModel = OMAFACE_MODEL_DIR "/face_recognition_sface_2021dec.onnx";
-// Regular webcams only: two anti-spoofing models and an eye landmark model.
-const char* kSpoofModelA = OMAFACE_MODEL_DIR "/MiniFASNetV2.onnx";
-const char* kSpoofModelB = OMAFACE_MODEL_DIR "/MiniFASNetV1SE.onnx";
-const char* kIrisModel = OMAFACE_MODEL_DIR "/iris_landmark.tflite";
-const char* kGazeModel = OMAFACE_MODEL_DIR "/mobileone_s0_gaze.onnx";
+const char* kModelDir = OMAFACE_MODEL_DIR;
 
 const int kMaxAppearances = 3;
 const int kLockoutFailures = 5;
 const int kLockoutFailuresRgb = 3;  // a webcam is easier to fool; fewer tries
 const int kLockoutSeconds = 300;
-const int kFeatureSize = 128;
 
 using Clock = std::chrono::steady_clock;
 
@@ -519,116 +516,14 @@ bool unusable(const Camera& cam, DarkFrameFilter& filter, const cv::Mat& grey) {
   return cv::mean(grey)[0] < 12.0;
 }
 
-// ------------------------------------------------------------------ models
-
-struct Face {
-  cv::Mat row;          // 1x15 YuNet output
-  float width = 0;
-  float score = 0;
-};
-
-class FaceModels {
- public:
-  bool load(std::string& err) {
-    try {
-      detector_ = cv::FaceDetectorYN::create(kDetectorModel, "", cv::Size(320, 320), 0.80f, 0.3f, 5);
-      recognizer_ = cv::FaceRecognizerSF::create(kRecognizerModel, "");
-    } catch (const cv::Exception& e) {
-      err = std::string("model load failed: ") + e.what();
-      return false;
-    }
-    if (!detector_ || !recognizer_) { err = "model load failed"; return false; }
-    return true;
-  }
-
-  // Largest detected face, or none. count: how many faces are at least
-  // countMin pixels wide (all of them by default).
-  bool detect(const cv::Mat& bgr, Face& out, int* count = nullptr, float countMin = 0) {
-    if (bgr.size() != inputSize_) {
-      inputSize_ = bgr.size();
-      detector_->setInputSize(inputSize_);
-    }
-    cv::Mat faces;
-    detector_->detect(bgr, faces);
-    if (count) {
-      *count = 0;
-      for (int i = 0; i < faces.rows; i++)
-        if (faces.at<float>(i, 2) >= countMin) ++*count;
-    }
-    if (faces.rows < 1) return false;
-    int best = 0;
-    for (int i = 1; i < faces.rows; i++)
-      if (faces.at<float>(i, 2) > faces.at<float>(best, 2)) best = i;
-    out.row = faces.row(best).clone();
-    out.width = faces.at<float>(best, 2);
-    out.score = faces.at<float>(best, 14);
-    return true;
-  }
-
-  cv::Mat feature(const cv::Mat& bgr, const Face& face) {
-    cv::Mat aligned, feat;
-    recognizer_->alignCrop(bgr, face.row, aligned);
-    recognizer_->feature(aligned, feat);
-    feat = feat.reshape(1, 1).clone();
-    feat.convertTo(feat, CV_32F);
-    double n = cv::norm(feat);
-    if (n > 0) feat /= n;
-    return feat;
-  }
-
- private:
-  cv::Ptr<cv::FaceDetectorYN> detector_;
-  cv::Ptr<cv::FaceRecognizerSF> recognizer_;
-  cv::Size inputSize_;
-};
-
 // ------------------------------------------------------------------ gallery
-
-struct Appearance {
-  std::string name;
-  std::string created;
-  cv::Mat features;  // N x 128, rows L2-normalised
-  float headYaw = 0;  // head pose while looking straight at the screen
-  float headPitch = 0;
-  std::string kind = "ir";  // the camera it was enrolled with: "ir" or "rgb"
-  float gazeYaw = 0;        // gaze while looking at the screen, degrees
-  float gazePitch = 0;
-  bool hasGaze = false;
-};
 
 std::string userDir(const std::string& user) { return std::string(kDataDir) + "/" + user; }
 std::string galleryPath(const std::string& user) { return userDir(user) + "/faces.yml"; }
 
 std::vector<Appearance> loadGallery(const std::string& user) {
-  std::vector<Appearance> out;
-  if (access(galleryPath(user).c_str(), R_OK) != 0) return out;
-  try {
-    cv::FileStorage fs(galleryPath(user), cv::FileStorage::READ);
-    if (!fs.isOpened()) return out;
-    cv::FileNode list = fs["appearances"];
-    for (auto it = list.begin(); it != list.end(); ++it) {
-      Appearance a;
-      (*it)["name"] >> a.name;
-      (*it)["created"] >> a.created;
-      (*it)["features"] >> a.features;
-      (*it)["head_yaw"] >> a.headYaw;
-      (*it)["head_pitch"] >> a.headPitch;
-      cv::FileNode gaze = (*it)["gaze"];
-      if (gaze.isSeq() && gaze.size() == 2) {
-        a.gazeYaw = (float)gaze[0];
-        a.gazePitch = (float)gaze[1];
-        a.hasGaze = true;
-      }
-      std::string kind;
-      (*it)["kind"] >> kind;
-      if (kind == "rgb") a.kind = kind;
-      if (a.features.empty() || a.features.cols != kFeatureSize || a.features.type() != CV_32F) continue;
-      out.push_back(a);
-    }
-  } catch (const cv::Exception&) {
-    out.clear();
-  }
-  return out;
+  if (access(galleryPath(user).c_str(), R_OK) != 0) return {};
+  return readGallery(galleryPath(user));
 }
 
 bool saveGallery(const std::string& user, const std::vector<Appearance>& gallery, std::string& err) {
@@ -646,21 +541,7 @@ bool saveGallery(const std::string& user, const std::vector<Appearance>& gallery
     return false;
   }
   std::string tmp = galleryPath(user) + ".tmp";
-  try {
-    cv::FileStorage fs(tmp, cv::FileStorage::WRITE);
-    if (!fs.isOpened()) { err = "cannot write gallery"; return false; }
-    fs << "version" << 1;
-    fs << "appearances" << "[";
-    for (auto& a : gallery)
-      fs << "{" << "name" << a.name << "created" << a.created << "kind" << a.kind << "head_yaw" << a.headYaw << "head_pitch" << a.headPitch
-         << "gaze" << "[" << a.gazeYaw << a.gazePitch << "]"
-         << "features" << a.features << "}";
-    fs << "]";
-    fs.release();
-  } catch (const cv::Exception& e) {
-    err = e.what();
-    return false;
-  }
+  if (!writeGallery(tmp, gallery, err)) return false;
   if ((geteuid() == 0 && chown(tmp.c_str(), 0, pw->pw_gid) != 0) || chmod(tmp.c_str(), 0640) != 0 ||
       rename(tmp.c_str(), galleryPath(user).c_str()) != 0) {
     unlink(tmp.c_str());
@@ -669,154 +550,6 @@ bool saveGallery(const std::string& user, const std::vector<Appearance>& gallery
   }
   return true;
 }
-
-// How well a face matches its closest appearance: the mean of its five best
-// samples there, not the single best one. One lucky sample out of 25 is how
-// a stranger gets close; five at once are not. Against 13,000 public faces
-// (LFW, also turned grey and IR-like) the top-5 mean kept strangers lower
-// for the same genuine scores: the IR-like tail at one in 10,000 fell from
-// 0.53 to 0.48, while the owner's live IR frames lost only about 0.01.
-double bestScore(const std::vector<Appearance>& gallery, const cv::Mat& feat, size_t* which = nullptr) {
-  const int kTop = 5;
-  double best = -1;
-  for (size_t i = 0; i < gallery.size(); i++) {
-    cv::Mat scores = gallery[i].features * feat.t();
-    std::vector<float> s(scores.begin<float>(), scores.end<float>());
-    size_t k = std::min<size_t>(kTop, s.size());
-    std::partial_sort(s.begin(), s.begin() + k, s.end(), std::greater<float>());
-    double mean = std::accumulate(s.begin(), s.begin() + k, 0.0) / k;
-    if (mean > best) {
-      best = mean;
-      if (which) *which = i;
-    }
-  }
-  return best;
-}
-
-// ------------------------------------------------------------------ attention
-
-cv::Point2f headPose(const Face& f);
-
-// omaFace should not open for a face that is asleep or looking elsewhere. Two
-// models judge every matching frame, on the IR camera and the webcam alike:
-// MediaPipe's eye landmarks (are both eyelids open) and a Gaze360 gaze model
-// (where the eyes point), with the head turned toward the screen.
-//
-// Gaze is relative to the gaze measured at enrollment. On a laptop webcam,
-// looking at the screen stayed within about 16 degrees down (its bottom edge)
-// and 10 up (the camera); a phone read 18-61 degrees down depending on how it
-// was held, and a monitor above the laptop 20-32 up. Hence 20 down and 18 up:
-// a phone held right under the screen's edge is, to any camera, the screen.
-// (Up was 14, but sitting lower than at enrollment read 15-18 on the screen
-// with the IR camera.) Sideways the model jitters: reading the screen moved
-// between 2 and 31 from one frame to the next, so 30 to the side, and a
-// frame looking away only does not count; it does not restart the run.
-//
-// Eyelids, as height over width of the eye contour: on the webcam 0.05-0.17
-// closed and 0.28-0.34 on the screen, so 0.18. On the IR camera (grey,
-// lit from beside the lens) 0.11-0.20 closed or looking down at a phone and
-// 0.26-0.37 on the screen, so 0.22. Blinks dip lower and only restart the run.
-//
-// (Before, the IR camera looked for the pupil glowing in its light, which
-// only shows looking almost straight into the lens and fades in daylight: it
-// asked for a glance at the camera, not the screen.)
-class Attention {
- public:
-  static constexpr float kEyesOpenWebcam = 0.18f, kEyesOpenIr = 0.22f;
-  static constexpr float kGazeDown = 20, kGazeUp = 18, kGazeSide = 30;
-
-  bool load(std::string& err) {
-    try {
-      iris_ = cv::dnn::readNet(kIrisModel);
-      gaze_ = cv::dnn::readNet(kGazeModel);
-    } catch (const cv::Exception& e) {
-      err = std::string("attention models: ") + e.what();
-      return false;
-    }
-    if (iris_.empty() || gaze_.empty()) { err = "attention models missing"; return false; }
-    return true;
-  }
-
-  static float eyesOpenAt(bool ir) { return ir ? kEyesOpenIr : kEyesOpenWebcam; }
-
-  // "ok", "head" (turned away), "eyes" (closed) or "away" (eyes on
-  // something other than the screen: a phone, a lap, another room).
-  std::string check(const cv::Mat& bgr, const Face& f, const Appearance& a, bool ir) {
-    float facing = a.headPitch > 0 ? a.headYaw : 0.f;
-    if (std::fabs(headPose(f).x - facing) > 0.2f) return "head";
-    lastEyes = eyesOpen(bgr, f);
-    if (lastEyes < eyesOpenAt(ir)) return "eyes";
-    cv::Point2f g = gaze(bgr, f);
-    float dy = g.x - (a.hasGaze ? a.gazeYaw : 0.f), dp = g.y - (a.hasGaze ? a.gazePitch : 0.f);
-    lastGaze = {dy, dp};
-    return (dp < -kGazeDown || dp > kGazeUp || std::fabs(dy) > kGazeSide) ? "away" : "ok";
-  }
-
-  // Gaze in degrees (yaw, pitch; pitch up is positive) from the face crop,
-  // as the model was trained: RGB 448x448, ImageNet normalisation, 90 bins
-  // of 4 degrees from -180, read as the expected value.
-  cv::Point2f gaze(const cv::Mat& bgr, const Face& f) {
-    const float* p = f.row.ptr<float>();
-    cv::Rect box = cv::Rect(int(p[0]), int(p[1]), int(p[2]), int(p[3])) & cv::Rect(0, 0, bgr.cols, bgr.rows);
-    if (box.width < 8 || box.height < 8) return {0, 0};
-    cv::Mat rgb;
-    cv::cvtColor(bgr(box), rgb, cv::COLOR_BGR2RGB);
-    cv::resize(rgb, rgb, cv::Size(448, 448));
-    rgb.convertTo(rgb, CV_32F, 1 / 255.0);
-    cv::subtract(rgb, cv::Scalar(0.485, 0.456, 0.406), rgb);
-    cv::divide(rgb, cv::Scalar(0.229, 0.224, 0.225), rgb);
-    gaze_.setInput(cv::dnn::blobFromImage(rgb));
-    std::vector<cv::Mat> outs;
-    gaze_.forward(outs, std::vector<cv::String>{"yaw", "pitch"});
-    float angles[2];
-    for (int k = 0; k < 2; k++) {
-      cv::Mat logits = outs[k].reshape(1, 1), e;
-      double top;
-      cv::minMaxLoc(logits, nullptr, &top);
-      cv::exp(logits - top, e);
-      double sum = cv::sum(e)[0], expected = 0;
-      for (int i = 0; i < e.cols; i++) expected += e.at<float>(0, i) * i;
-      angles[k] = float(expected / sum * 4 - 180);
-    }
-    return {angles[0], angles[1]};
-  }
-
-  // The less open eye: eyelid height over width, from the eye contour.
-  float eyesOpen(const cv::Mat& bgr, const Face& f) {
-    const float* p = f.row.ptr<float>();
-    cv::Point2f re(p[4], p[5]), le(p[6], p[7]), d = le - re;
-    double iod = std::max(1.0f, std::hypot(d.x, d.y)), angle = std::atan2(d.y, d.x);
-    return std::min(eyeOpen(bgr, re, angle, iod, false), eyeOpen(bgr, le, angle, iod, true));
-  }
-
-  // The last frame judged, gaze relative to enrollment (degrees), for the
-  // self-test.
-  cv::Point2f lastGaze{0, 0};
-  float lastEyes = 0;
-
- private:
-  // A square eye crop about one eye-spacing wide, eye line level, the left
-  // eye mirrored (the model sees every eye the same way round), RGB 0-1.
-  float eyeOpen(const cv::Mat& bgr, cv::Point2f eye, double angle, double iod, bool mirror) {
-    double s = 64.0 / iod, al = s * std::cos(angle), be = s * std::sin(angle);
-    cv::Matx23d M(al, be, (1 - al) * eye.x - be * eye.y + 32 - eye.x,
-                  -be, al, be * eye.x + (1 - al) * eye.y + 32 - eye.y);
-    cv::Mat patch;
-    cv::warpAffine(bgr, patch, M, cv::Size(64, 64), cv::INTER_LINEAR, cv::BORDER_REPLICATE);
-    if (mirror) cv::flip(patch, patch, 1);
-    iris_.setInput(cv::dnn::blobFromImage(patch, 1 / 255.0, cv::Size(64, 64), cv::Scalar(), true));
-    cv::Mat contour = iris_.forward("output_eyes_contours_and_brows").reshape(1, 71);
-    float minX = 1e9f, maxX = -1e9f, minY = 1e9f, maxY = -1e9f;
-    for (int k = 0; k < 16; k++) {  // the first 16 points outline the eyelids
-      float x = contour.at<float>(k, 0), y = contour.at<float>(k, 1);
-      minX = std::min(minX, x); maxX = std::max(maxX, x);
-      minY = std::min(minY, y); maxY = std::max(maxY, y);
-    }
-    return (maxY - minY) / std::max(1e-3f, maxX - minX);
-  }
-
-  cv::dnn::Net iris_, gaze_;
-};
 
 // ------------------------------------------------------------------ system checks
 
@@ -944,28 +677,6 @@ int finish(const std::string& result) {
 }
 
 // ------------------------------------------------------------------ webcam liveness
-
-cv::Rect2f faceBox(const Face& f) {
-  const float* p = f.row.ptr<float>();
-  return {p[0], p[1], p[2], p[3]};
-}
-
-// The face inside the picture, with a little room. A face cut by the edge
-// is not judged: holding a phone in front of the IR camera, the owner's own
-// face peeked past it at the side, half of it out of view, and that half
-// matched while the phone took the blame (the IR camera saw no face on the
-// phone at all, even at 0.3 detector confidence). Only the chin may leave
-// the picture, at the bottom, as long as the mouth is in it: the camera sits
-// above the screen, and leaning in pushed the owner's chin up to 39 pixels
-// past the bottom edge of a 400-pixel frame.
-bool faceInView(const Face& f, const cv::Size& frame) {
-  const float kMargin = 8;
-  const float* p = f.row.ptr<float>();
-  cv::Rect2f b = faceBox(f);
-  float mouth = std::max(p[11], p[13]);
-  return b.x >= kMargin && b.y >= kMargin && b.x + b.width <= frame.width - kMargin &&
-         mouth <= frame.height - kMargin;
-}
 
 // A regular webcam cannot tell a face from a photo or a video of it, so the
 // webcam mode asks the head to follow a random sequence: three moves, each
@@ -1115,63 +826,6 @@ std::string headTurnChallenge(Camera& cam, FaceModels& models, const std::vector
 }
 
 // ------------------------------------------------------------------ webcam checks
-
-// A regular webcam sees what eyes see, so a photo or a phone screen showing
-// the face looks like the face. Two anti-spoofing models (Silent-Face
-// MiniFASNet V2 and V1SE, trained to tell live faces from prints and
-// screens), averaged, run on the same frames as recognition, with nothing
-// for the person to do. (An IR camera needs none: a print or a screen does
-// not look like skin in its light.)
-// Measured on a laptop webcam: live faces scored 0.99-1.00 on V1SE and
-// 0.78-0.98 on V2; a photo and a video on a phone swung between 0 and 0.98
-// from frame to frame, so a run of good frames is required.
-class Liveness {
- public:
-  static constexpr float kLive = 0.85f;
-
-  bool load(std::string& err) {
-    try {
-      spoofA_ = cv::dnn::readNet(kSpoofModelA);
-      spoofB_ = cv::dnn::readNet(kSpoofModelB);
-    } catch (const cv::Exception& e) {
-      err = std::string("webcam models: ") + e.what();
-      return false;
-    }
-    if (spoofA_.empty() || spoofB_.empty()) { err = "webcam models missing"; return false; }
-    return true;
-  }
-
-  // 0-1: how sure the anti-spoofing models are that this is a live face.
-  float live(const cv::Mat& bgr, const Face& f) {
-    return 0.5f * (liveScore(spoofA_, crop(bgr, f, 2.7)) + liveScore(spoofB_, crop(bgr, f, 4.0)));
-  }
-
- private:
-  // The face box, enlarged as the models were trained (2.7x and 4x), 80x80.
-  static cv::Mat crop(const cv::Mat& bgr, const Face& f, double scale) {
-    const float* p = f.row.ptr<float>();
-    double x = p[0], y = p[1], w = std::max(1.0f, p[2]), h = std::max(1.0f, p[3]);
-    scale = std::min({(bgr.rows - 1) / h, (bgr.cols - 1) / w, scale});
-    double cx = x + w / 2, cy = y + h / 2;
-    int x1 = std::max(0, int(cx - w * scale / 2)), y1 = std::max(0, int(cy - h * scale / 2));
-    int x2 = std::min(bgr.cols - 1, int(cx + w * scale / 2)), y2 = std::min(bgr.rows - 1, int(cy + h * scale / 2));
-    cv::Mat out;
-    cv::resize(bgr(cv::Rect(x1, y1, std::max(1, x2 - x1 + 1), std::max(1, y2 - y1 + 1))), out, cv::Size(80, 80));
-    return out;
-  }
-
-  // BGR 0-255 in, three logits out; class 1 is "live".
-  static float liveScore(cv::dnn::Net& net, const cv::Mat& face) {
-    net.setInput(cv::dnn::blobFromImage(face, 1.0, cv::Size(80, 80), cv::Scalar(), false));
-    cv::Mat logits = net.forward().reshape(1, 1), e;
-    double top;
-    cv::minMaxLoc(logits, nullptr, &top);
-    cv::exp(logits - top, e);
-    return float(e.at<float>(0, 1) / cv::sum(e)[0]);
-  }
-
-  cv::dnn::Net spoofA_, spoofB_;
-};
 
 std::string choicePath(uid_t uid) { return std::string(kRunDir) + "/choice-" + std::to_string(uid); }
 
@@ -1323,7 +977,7 @@ int serve() {
 
   FaceModels models;
   std::string err;
-  if (!models.load(err)) { fprintf(stderr, "%s\n", err.c_str()); return finish("error models"); }
+  if (!models.load(kModelDir, err)) { fprintf(stderr, "%s\n", err.c_str()); return finish("error models"); }
 
   Camera cam;
   if (!cam.open(info, err)) {
@@ -1334,37 +988,32 @@ int serve() {
   const int minFace = minFaceFor(cfg, cam);
   // Fail closed: without its models a check would quietly pass everything.
   Attention attention;
-  if (cfg.attention && !attention.load(err)) { fprintf(stderr, "%s\n", err.c_str()); return finish("error models"); }
+  if (cfg.attention && !attention.load(kModelDir, err)) { fprintf(stderr, "%s\n", err.c_str()); return finish("error models"); }
   Liveness liveness;
-  if (rgb && !liveness.load(err)) { fprintf(stderr, "%s\n", err.c_str()); return finish("error models"); }
+  if (rgb && !liveness.load(kModelDir, err)) { fprintf(stderr, "%s\n", err.c_str()); return finish("error models"); }
 
   writeStatus(key, "scanning", seq);
   sendLine("STATUS scanning");
 
   auto start = Clock::now();
-  int matches = 0, rejected = 0, inattentive = 0, notLive = 0, crowded = 0;
   // IR: a few matching frames in a row (three when attention is on, about
   // 0.4 s, so one eyelid reading near the line cannot open it). Webcam: a
   // run of eight, since a photo or a screen can pass the anti-spoofing
   // models on a lucky frame.
-  const int needed = rgb ? 8 : cfg.attention ? std::max(cfg.matchFrames, 3) : cfg.matchFrames;
-  bool sawFace = false;
+  VerifyRules rules;
+  rules.webcam = rgb;
+  rules.threshold = threshold;
+  rules.needed = rgb ? 8 : cfg.attention ? std::max(cfg.matchFrames, 3) : cfg.matchFrames;
+  rules.minFace = minFace;
+  rules.attention = cfg.attention;
+  rules.test = test;
+  Verifier verifier(rules, gallery, models, &attention, rgb ? &liveness : nullptr);
   std::string lastStatus = "scanning";
-  // One person at a time. The engine judges the largest face, so with two in
-  // view, any frame that misses the one in front (turned, half out of frame)
-  // would judge whoever stands behind. A second face big enough to match
-  // stops the run for a second; so does a face that was clearly not yours
-  // (strangers measured below 0.40, LFW 99.9%), for any face somewhere else
-  // in the frame: a stranger at the screen whose face flickers out of the
-  // detector, with the owner behind. Not for a face in the same place: the
-  // owner's own first frames, while the exposure settles, also score 0.25-0.40.
-  // The run must also stay on one face: a jump of more than a third of its
-  // width between frames starts it again.
-  const double kStranger = 0.40, kStrangerHold = 1.0;
-  auto strangerAt = Clock::now() - std::chrono::seconds(10), crowdAt = strangerAt;
-  cv::Rect2f runBox, strangerBox;
-  auto moved = [](const cv::Rect2f& a, const cv::Rect2f& b) {
-    return std::hypot(a.x + a.width / 2 - (b.x + b.width / 2), a.y + a.height / 2 - (b.y + b.height / 2)) > b.width / 3;
+  auto show = [&](const std::string& status) {
+    if (status != lastStatus) {
+      sendLine("STATUS " + status);
+      lastStatus = status;
+    }
   };
   cv::Mat grey, bgr;
   DarkFrameFilter darkFilter;
@@ -1385,138 +1034,72 @@ int serve() {
     }
     if (!cam.grab(grey, 500, &bgr)) continue;
     if (unusable(cam, darkFilter, grey)) continue;
-    Face face;
-    int faces = 0;
-    bool found = models.detect(bgr, face, &faces, minFace);
-    if (found) cam.followFace(cv::Rect(faceBox(face)));
+    std::string status = verifier.verify(bgr, secondsSince(start));
+    const Observation& seen = verifier.last();
+    if (seen.found) cam.followFace(cv::Rect(faceBox(seen.face)));
     else cam.searchFace();
-    if (!found || face.width < minFace || !faceInView(face, grey.size())) {
-      matches = 0;
-      if (lastStatus != "noface") { sendLine("STATUS noface"); lastStatus = "noface"; }
-      continue;
+    if (test && seen.scored) {
+      char b[160];
+      snprintf(b, sizeof b, "SCORE %.3f width %.0f attention %s live %.2f gaze %.0f %.0f eyes %.2f", seen.score,
+               seen.face.width, seen.attentive.c_str(), seen.live, attention.lastGaze.x, attention.lastGaze.y,
+               attention.lastEyes);
+      sendLine(b);
     }
-    sawFace = true;
-    if (faces > 1) {
-      // Not a strike: you with someone looking over your shoulder.
-      matches = 0;
-      crowded++;
-      crowdAt = Clock::now();
-      if (lastStatus != "nomatch") { sendLine("STATUS nomatch"); lastStatus = "nomatch"; }
-      continue;
-    }
-    cv::Rect2f box = faceBox(face);
-    if (matches > 0 && moved(box, runBox)) matches = 0;
-    runBox = box;
-    if (gallery.empty()) {
-      if (lastStatus != "face") { sendLine("STATUS face"); lastStatus = "face"; }
+    if (status == "notenrolled") {
+      show("face");
       cam.close();
       writeStatus(key, "idle", seq);
       return finish("unavailable not-enrolled");
     }
-    size_t which = 0;
-    double score = bestScore(gallery, models.feature(bgr, face), &which);
-    // Attention and liveness only matter for a face that matched (and are
-    // always shown by the self-test).
-    std::string attentive = "off";
-    float live = -1;
-    if (score >= threshold || test) {
-      if (cfg.attention) attentive = attention.check(bgr, face, gallery[which], !rgb);
-      if (rgb) live = liveness.live(bgr, face);
+    if (status != "match") {
+      show(status);
+      continue;
     }
-    if (test) {
-      char b[160];
-      snprintf(b, sizeof b, "SCORE %.3f width %.0f attention %s live %.2f gaze %.0f %.0f eyes %.2f", score, face.width,
-               attentive.c_str(), live, attention.lastGaze.x, attention.lastGaze.y, attention.lastEyes);
-      sendLine(b);
-    }
-
-    if (score < threshold) {
-      matches = 0;
-      rejected++;
-      if (score < kStranger) {
-        strangerAt = Clock::now();
-        strangerBox = box;
+    if (rgb && cfg.headTurns) {
+      std::string turns = headTurnChallenge(cam, models, gallery, threshold, minFace, key, seq, seen.face);
+      if (turns == "gone") { writeStatus(key, "idle", seq); return 1; }
+      if (turns == "unsettled" || turns == "crowd") {
+        // Never faced the camera long enough to be asked, or someone
+        // else came into view: no strike, just no unlock.
+        cam.close();
+        writeStatus(key, "timeout", seq);
+        return finish("timeout " + turns);
       }
-      if (lastStatus != "nomatch") { sendLine("STATUS nomatch"); lastStatus = "nomatch"; }
-    } else if (secondsSince(crowdAt) < kStrangerHold ||
-               (secondsSince(strangerAt) < kStrangerHold && moved(box, strangerBox))) {
-      matches = 0;
-      if (lastStatus != "nomatch") { sendLine("STATUS nomatch"); lastStatus = "nomatch"; }
-    } else if (attentive != "off" && attentive != "ok") {
-      // Your face, but asleep or looking elsewhere: not a match, and not a
-      // stranger either, so it never counts toward the lockout. Closed eyes
-      // or a turned head start the run again; a glance away just does not
-      // count (gaze jitters from frame to frame).
-      if (attentive != "away") matches = 0;
-      inattentive++;
-      if (lastStatus != "attention") { sendLine("STATUS attention"); lastStatus = "attention"; }
-    } else if (rgb && live < Liveness::kLive) {
-      matches = 0;
-      notLive++;
-      if (lastStatus != "notlive") { sendLine("STATUS notlive"); lastStatus = "notlive"; }
-    } else if (++matches >= needed) {
-      if (rgb && cfg.headTurns) {
-        std::string turns = headTurnChallenge(cam, models, gallery, threshold, minFace, key, seq, face);
-        if (turns == "gone") { writeStatus(key, "idle", seq); return 1; }
-        if (turns == "unsettled" || turns == "crowd") {
-          // Never faced the camera long enough to be asked, or someone
-          // else came into view: no strike, just no unlock.
-          cam.close();
-          writeStatus(key, "timeout", seq);
-          return finish("timeout " + turns);
+      if (turns != "ok") {
+        cam.close();
+        writeStatus(key, "failure", seq);
+        if (!test) {
+          fails.count++;
+          fails.last = time(nullptr);
+          fails.sticky = true;
+          writeFailures(uid, fails);
         }
-        if (turns != "ok") {
-          cam.close();
-          writeStatus(key, "failure", seq);
-          if (!test) {
-            fails.count++;
-            fails.last = time(nullptr);
-            fails.sticky = true;
-            writeFailures(uid, fails);
-          }
-          return finish("fail liveness " + turns);
-        }
+        return finish("fail liveness " + turns);
       }
-      cam.close();
-      writeStatus(key, "success", seq);
-      if (!test) writeFailures(uid, Failures{});
-      return finish("ok");
-    } else if (lastStatus != "face") {
-      sendLine("STATUS face");
-      lastStatus = "face";
     }
+    cam.close();
+    writeStatus(key, "success", seq);
+    if (!test) writeFailures(uid, Failures{});
+    return finish("ok");
   }
   cam.close();
-  if (rgb && notLive >= needed && notLive > inattentive) {
+  Verifier::Outcome out = verifier.outcome();
+  if (out.strike) {
     writeStatus(key, "failure", seq);
     if (!test) {
       fails.count++;
       fails.last = time(nullptr);
-      fails.sticky = true;
+      fails.sticky = fails.sticky || out.sticky;
       writeFailures(uid, fails);
     }
-    return finish("fail liveness spoof");
+    return finish(out.result);
   }
-  if (inattentive > 0) {
+  if (out.result == "attention") {
     writeStatus(key, "attention", seq);
     return finish("attention");
   }
-  // Only a face that was seen and rejected counts toward the lockout; nobody
-  // in front of the camera is just a timeout.
-  if (sawFace && rejected > 0) {
-    writeStatus(key, "failure", seq);
-    if (!test) {
-      fails.count++;
-      fails.last = time(nullptr);
-      fails.sticky = fails.sticky || rgb;
-      writeFailures(uid, fails);
-    }
-    return finish("fail");
-  }
   writeStatus(key, "timeout", seq);
-  if (crowded > 0) return finish("timeout crowd");
-  if (gallery.empty()) return finish("unavailable not-enrolled no-face-seen");
-  return finish("timeout");
+  return finish(out.result);
 }
 
 // ------------------------------------------------------------------ enroll + test
@@ -1583,22 +1166,6 @@ std::string jsonEscape(const std::string& s) {
     else o += c;
   }
   return o;
-}
-
-// Head pose from the five YuNet landmarks: yaw from the nose against the eye
-// midpoint, pitch from where the nose sits between the eyes and the mouth.
-cv::Point2f headPose(const Face& f) {
-  const float* p = f.row.ptr<float>();
-  float rex = p[4], rey = p[5], lex = p[6], ley = p[7], nx = p[8], ny = p[9];
-  float rmx = p[10], rmy = p[11], lmx = p[12], lmy = p[13];
-  float eyeMidX = (rex + lex) / 2, eyeMidY = (rey + ley) / 2;
-  float mouthMidY = (rmy + lmy) / 2;
-  float eyeDist = std::max(1.0f, std::hypot(lex - rex, ley - rey));
-  float yaw = (nx - eyeMidX) / eyeDist;
-  float span = std::max(1.0f, mouthMidY - eyeMidY);
-  float pitch = (ny - eyeMidY) / span;
-  (void)rmx; (void)lmx;
-  return {yaw, pitch};
 }
 
 std::string nowIso() {
@@ -1669,7 +1236,7 @@ int enroll(const std::string& user, const std::string& name, bool ui) {
   if (!findCamera(cfg, info)) return fail("no IR camera found");
   FaceModels models;
   std::string err;
-  if (!models.load(err)) return fail(err);
+  if (!models.load(kModelDir, err)) return fail(err);
 
   mkdir(kRunDir, 0755);
   int lockFd = ::open((std::string(kRunDir) + "/camera.lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
@@ -1690,7 +1257,7 @@ int enroll(const std::string& user, const std::string& name, bool ui) {
   // some glasses hide them in glare, so after a few seconds enrollment goes
   // on without, and the scan measures from straight ahead instead.
   Attention attention;
-  const bool measureEyes = attention.load(err);
+  const bool measureEyes = attention.load(kModelDir, err);
   std::vector<float> gazeYaws, gazePitches;
   bool frontalSeen = false;
   auto frontalStart = Clock::now();
@@ -1838,7 +1405,7 @@ int calib(double seconds) {
   if (!findCamera(cfg, info)) { printf("no camera\n"); return 1; }
   FaceModels models;
   std::string err;
-  if (!models.load(err)) { printf("%s\n", err.c_str()); return 1; }
+  if (!models.load(kModelDir, err)) { printf("%s\n", err.c_str()); return 1; }
   Camera cam;
   auto t0 = Clock::now();
   if (!cam.open(info, err)) { printf("%s\n", err.c_str()); return 1; }
@@ -1942,7 +1509,7 @@ int renameAppearance(const std::string& user, const std::string& which, const st
 int selftest() {
   FaceModels models;
   std::string err;
-  if (!models.load(err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
+  if (!models.load(kModelDir, err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
   cv::Mat bgr(400, 640, CV_8UC3, cv::Scalar(40, 40, 40));
   cv::circle(bgr, cv::Point(320, 200), 90, cv::Scalar(160, 160, 160), cv::FILLED);
   Face face;
@@ -1957,7 +1524,7 @@ int selftest() {
   // leave checks that quietly do nothing (a scan refuses to run without them).
   Attention attention;
   Liveness liveness;
-  if (!attention.load(err) || !liveness.load(err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
+  if (!attention.load(kModelDir, err) || !liveness.load(kModelDir, err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
   float live = liveness.live(bgr, face), open = attention.eyesOpen(bgr, face);
   cv::Point2f g = attention.gaze(bgr, face);
   if (!(live >= 0 && live <= 1) || !(open >= 0 && open < 10) || !(std::fabs(g.x) <= 180 && std::fabs(g.y) <= 180)) {

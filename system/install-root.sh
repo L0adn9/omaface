@@ -44,6 +44,9 @@ echo "  OpenCV rebuild hook"
 rm -rf "$SRC/engine"
 install -d -m0755 "$SRC/engine" /etc/pacman.d/hooks
 install -m0644 "$REPO/engine/omaface-engine.cpp" "$REPO/engine/omaface-pam.c" "$REPO/engine/Makefile" "$SRC/engine/"
+install -d -m0755 "$SRC/engine/core/include/omaface" "$SRC/engine/core/src"
+install -m0644 "$REPO/engine/core/include/omaface/core.hpp" "$SRC/engine/core/include/omaface/"
+install -m0644 "$REPO"/engine/core/src/*.cpp "$SRC/engine/core/src/"
 sed "s|@PREFIX@|$PREFIX|g" "$REPO/system/rebuild" >"$LIB/rebuild"
 chmod 0755 "$LIB/rebuild"
 sed "s|@PREFIX@|$PREFIX|g" "$REPO/system/omaface.hook" >/etc/pacman.d/hooks/omaface.hook
