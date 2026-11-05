@@ -5,9 +5,10 @@ appear exactly once, otherwise the build stops and the installed plugin is
 left alone (see build-plugin.py). Keep snippets small so upstream changes
 elsewhere in the files never conflict.
 
-Omarchy 4.5 changed three anchors in lock/Service.qml and added two files that
-the lock service imports. LOCK_SERVICE_45 carries those variants; build-plugin
-picks the file set that matches the installed Omarchy.
+Omarchy 4.5 changed three anchors in lock/Service.qml and added
+lock/FingerprintModel.js, which the lock service imports. LOCK_SERVICE_45
+carries those variants; build-plugin picks the file set that matches the
+installed Omarchy.
 """
 
 
@@ -661,12 +662,11 @@ FILES_40 = [
     ("polkit/PolkitModel.js", "PolkitModel.js", []),
 ]
 
-# Omarchy 4.5's lock service imports these; they do not exist on 4.0.
+# Omarchy 4.5's lock service imports FingerprintModel.js; 4.0 has no such file.
 FILES_45 = [
     ("lock/Service.qml", "Service.qml", LOCK_SERVICE_45),
     ("lock/LockView.qml", "LockView.qml", LOCK_VIEW),
     ("lock/FingerprintModel.js", "FingerprintModel.js", []),
-    ("lock/LockFeedSurface.qml", "LockFeedSurface.qml", []),
     ("polkit/PolkitAgent.qml", "Polkit.qml", POLKIT),
     ("polkit/PolkitModel.js", "PolkitModel.js", []),
 ]
