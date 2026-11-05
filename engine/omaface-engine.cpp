@@ -741,14 +741,20 @@ class Attention {
 
   // "ok", "head" (turned away), "eyes" (closed) or "away" (eyes on
   // something other than the screen: a phone, a lap, another room).
+  // "models" when a reading is not a number: NaN fails every comparison
+  // below, so it would otherwise come out "ok".
   std::string check(const cv::Mat& bgr, const Face& f, const Appearance& a, bool ir) {
     float facing = a.headPitch > 0 ? a.headYaw : 0.f;
-    if (std::fabs(headPose(f).x - facing) > 0.2f) return "head";
+    float turn = headPose(f).x - facing;
+    if (!std::isfinite(turn)) return "models";
+    if (std::fabs(turn) > 0.2f) return "head";
     lastEyes = eyesOpen(bgr, f);
+    if (!std::isfinite(lastEyes)) return "models";
     if (lastEyes < eyesOpenAt(ir)) return "eyes";
     cv::Point2f g = gaze(bgr, f);
     float dy = g.x - (a.hasGaze ? a.gazeYaw : 0.f), dp = g.y - (a.hasGaze ? a.gazePitch : 0.f);
     lastGaze = {dy, dp};
+    if (!std::isfinite(dy) || !std::isfinite(dp)) return "models";
     return (dp < -kGazeDown || dp > kGazeUp || std::fabs(dy) > kGazeSide) ? "away" : "ok";
   }
 
@@ -1341,6 +1347,16 @@ int serve() {
   writeStatus(key, "scanning", seq);
   sendLine("STATUS scanning");
 
+  // Every check in the loop compares against a limit, and NaN fails every
+  // comparison, so a NaN liveness score would count as live. A model that
+  // gives something other than a number stops the scan instead.
+  auto modelsFailed = [&] {
+    fprintf(stderr, "omaface: a model gave a result that is not a number\n");
+    cam.close();
+    writeStatus(key, "unavailable", seq);
+    return finish("error models");
+  };
+
   auto start = Clock::now();
   int matches = 0, rejected = 0, inattentive = 0, notLive = 0, crowded = 0;
   // IR: a few matching frames in a row (three when attention is on, about
@@ -1422,6 +1438,7 @@ int serve() {
     if (score >= threshold || test) {
       if (cfg.attention) attentive = attention.check(bgr, face, gallery[which], !rgb);
       if (rgb) live = liveness.live(bgr, face);
+      if (attentive == "models" || (rgb && !(live >= 0 && live <= 1))) return modelsFailed();
     }
     if (test) {
       char b[160];
@@ -2075,7 +2092,16 @@ int main(int argc, char** argv) {
   signal(SIGPIPE, SIG_IGN);
 
   std::string mode = argc > 1 ? argv[1] : "";
-  if (mode == "serve") return serve();
+  if (mode == "serve") {
+    // OpenCV throws when a model cannot run on its input. Answer, so PAM
+    // gets a result at once, instead of aborting and dumping core.
+    try {
+      return serve();
+    } catch (const cv::Exception& e) {
+      fprintf(stderr, "omaface: %s\n", e.what());
+      return finish("error models");
+    }
+  }
   if (mode == "probe") return probe(argc > 2 && std::string(argv[2]) == "webcam");
   if (mode == "selftest") return selftest();
   if (mode == "list" && argc > 2) return listAppearances(argv[2]);
