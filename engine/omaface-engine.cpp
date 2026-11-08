@@ -334,6 +334,7 @@ class Camera {
     // region between scans), or the first time, the middle of the frame.
     if (ir_) {
       cv::Rect last = region();
+      whole_ = last == cv::Rect(0, 0, width_, height_);
       if (last.area() >= 48 * 48 && (last & cv::Rect(0, 0, width_, height_)) == last) meter(last);
       else meter(cv::Rect(width_ / 4, height_ / 5, width_ / 2, height_ * 3 / 5));
     }
@@ -342,9 +343,12 @@ class Camera {
 
   // Keep the exposure metered on the face as it moves; a region that still
   // mostly covers it is left alone.
-  void followFace(const cv::Rect& face) {
+  void followFace(const cv::Rect& face, const cv::Mat& grey) {
     if (!ir_ || !meterable_) return;
     searching_ = 0;
+    cv::Rect seen = face & cv::Rect(0, 0, grey.cols, grey.rows);
+    faceLevel_ = seen.empty() ? 0 : cv::mean(grey(seen))[0];
+    if (whole_) return;
     cv::Rect overlap = face & metered_;
     if (overlap.area() < 0.6 * face.area() || metered_.area() > 3 * face.area()) meter(face);
   }
@@ -356,9 +360,30 @@ class Camera {
   // exposure takes about a second to settle), meter somewhere else: the
   // lower middle, then the middle, in turn. Metering the whole frame does
   // not help: a bright window brightens nothing.
+  //
+  // Some cameras do the opposite (a ThinkPad E14 Gen 4, #10): metered on the
+  // face, they expose it to white within a second and it is lost. A face
+  // that was close to white when it went is looked for with the whole frame
+  // metered, and the camera stays metered that way (it keeps the region, so
+  // later scans start there too) until a scan goes without a face for a
+  // while. A brief bright frame alone is no sign: other cameras show one
+  // while the exposure settles, and keep the face.
   void searchFace() {
-    const int kHold = 18;  // lit frames
-    if (!ir_ || !meterable_ || ++searching_ % kHold != 0) return;
+    const int kHold = 18;    // lit frames
+    const int kGone = 4;     // lit frames without the face
+    const double kWhite = 200;  // mean face brightness, out of 255
+    if (!ir_ || !meterable_) return;
+    ++searching_;
+    if (!whole_ && searching_ == kGone && faceLevel_ >= kWhite) {
+      whole_ = true;
+      meter(cv::Rect(0, 0, width_, height_));
+      return;
+    }
+    if (searching_ % kHold != 0) return;
+    if (whole_) {
+      if (searching_ < 2 * kHold) return;
+      whole_ = false;
+    }
     const int w = width_, h = height_;
     const cv::Rect places[] = {cv::Rect(w / 4, h * 2 / 5, w / 2, h * 3 / 5), cv::Rect(w / 4, h / 5, w / 2, h * 3 / 5)};
     meter(places[(searching_ / kHold - 1) % 2]);
@@ -458,8 +483,10 @@ class Camera {
   }
 
   bool meterable_ = true, meteringOn_ = false;
+  bool whole_ = false;  // metering the whole frame: the face went white metered on it
   cv::Rect metered_;
   int searching_ = 0;  // lit frames in a row without a face
+  double faceLevel_ = 0;  // mean brightness of the last face seen
 
  public:
 
@@ -1404,7 +1431,7 @@ int serve() {
     Face face;
     int faces = 0;
     bool found = models.detect(bgr, face, &faces, minFace);
-    if (found) cam.followFace(cv::Rect(faceBox(face)));
+    if (found) cam.followFace(cv::Rect(faceBox(face)), grey);
     else cam.searchFace();
     if (!found || face.width < minFace || !faceInView(face, grey.size())) {
       matches = 0;
@@ -1741,7 +1768,7 @@ int enroll(const std::string& user, const std::string& name, bool ui) {
     bool got = models.detect(bgr, face, &count);
     cv::Rect focus(0, 0, grey.cols, grey.rows);
     if (got) {
-      cam.followFace(cv::Rect(faceBox(face)));
+      cam.followFace(cv::Rect(faceBox(face)), grey);
       const float* p = face.row.ptr<float>();
       float cx = p[0] + p[2] / 2, cy = p[1] + p[3] / 2, s = std::max(p[2], p[3]) * 1.9f;
       focus = cv::Rect(int(cx - s / 2), int(cy - s * 0.42f * 1.25f), int(s), int(s * 0.62f * 1.25f));
