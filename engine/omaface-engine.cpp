@@ -219,9 +219,9 @@ void pickSize(int fd, uint32_t fourcc, uint32_t& w, uint32_t& h) {
 // IR cameras deliver greyscale (GREY, or Y16 on some). A few deliver YUYV,
 // like ordinary colour webcams; those only count when the name says IR,
 // because a colour camera can be fooled by a photo. `colour` also accepts a
-// regular webcam (YUYV or MJPG) as a non-IR camera: the rgb_fallback, which
-// adds a head-turn check against photos. `forced` (device= in the config)
-// accepts any capture device.
+// regular webcam (YUYV or MJPG, else NV12) as a non-IR camera: the
+// rgb_fallback, which adds a head-turn check against photos. `forced`
+// (device= in the config) accepts any capture device.
 bool inspectDevice(const std::string& path, CameraInfo& out, bool forced = false, bool colour = false) {
   int fd = ::open(path.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
   if (fd < 0) return false;
@@ -276,10 +276,19 @@ bool findCamera(const Config& cfg, CameraInfo& out) {
   }
   if (any || !cfg.rgbFallback) return any;
   // No IR camera, and the person chose the regular webcam: the first one
-  // (the built-in camera comes first on laptops).
-  for (int i = 0; i < 64; i++)
-    if (inspectDevice("/dev/video" + std::to_string(i), out, false, true)) return true;
-  return false;
+  // (the built-in camera comes first on laptops). A node that offers only
+  // NV12 comes after every YUYV or MJPEG one, so a camera that worked before
+  // NV12 was accepted is still the one used.
+  CameraInfo nv12;
+  bool haveNv12 = false;
+  for (int i = 0; i < 64; i++) {
+    CameraInfo info;
+    if (!inspectDevice("/dev/video" + std::to_string(i), info, false, true)) continue;
+    if (info.fourcc != V4L2_PIX_FMT_NV12) { out = info; return true; }
+    if (!haveNv12) { nv12 = info; haveNv12 = true; }
+  }
+  if (haveNv12) out = nv12;
+  return haveNv12;
 }
 
 class Camera {
@@ -304,6 +313,11 @@ class Camera {
     ir_ = info.ir;
     width_ = fmt.fmt.pix.width;
     height_ = fmt.fmt.pix.height;
+    // NV12 halves the colour both ways, so it only decodes at an even size.
+    if (fourcc_ == V4L2_PIX_FMT_NV12 && (width_ % 2 || height_ % 2)) {
+      err = "camera gave an odd NV12 size";
+      return false;
+    }
     // Bytes per pixel on the first plane: the Y plane of NV12 is one byte per
     // pixel, its rows are the stride.
     uint32_t bpp = (fourcc_ == V4L2_PIX_FMT_GREY || fourcc_ == V4L2_PIX_FMT_NV12) ? 1 : 2;
@@ -409,8 +423,10 @@ class Camera {
     // pixel, its rows are the stride.
     uint32_t bpp = (fourcc_ == V4L2_PIX_FMT_GREY || fourcc_ == V4L2_PIX_FMT_NV12) ? 1 : 2;
     bool ok = fourcc_ == V4L2_PIX_FMT_MJPEG ? buf.bytesused > 0
-            : fourcc_ == V4L2_PIX_FMT_NV12 ? buf.bytesused >= stride_ * (height_ * 3 / 2)
+            : fourcc_ == V4L2_PIX_FMT_NV12 ? buf.bytesused >= stride_ * (height_ * 3 / 2 - 1) + width_
             : buf.bytesused >= stride_ * (height_ - 1) + width_ * bpp;
+    // Never read past the mapped buffer, whatever the driver says it filled.
+    ok = ok && buf.index < buffers_.size() && buf.bytesused <= buffers_[buf.index].second;
     if (ok) {
       void* data = buffers_[buf.index].first;
       if (!ir_ && fourcc_ == V4L2_PIX_FMT_MJPEG) {
