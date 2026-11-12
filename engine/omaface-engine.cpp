@@ -230,7 +230,7 @@ bool inspectDevice(const std::string& path, CameraInfo& out, bool forced = false
   if (xioctl(fd, VIDIOC_QUERYCAP, &cap)) {
     uint32_t caps = (cap.capabilities & V4L2_CAP_DEVICE_CAPS) ? cap.device_caps : cap.capabilities;
     if ((caps & V4L2_CAP_VIDEO_CAPTURE) && (caps & V4L2_CAP_STREAMING)) {
-      bool grey = false, y16 = false, yuyv = false, mjpg = false;
+      bool grey = false, y16 = false, yuyv = false, mjpg = false, nv12 = false;
       v4l2_fmtdesc fmt{};
       fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
       for (fmt.index = 0; xioctl(fd, VIDIOC_ENUM_FMT, &fmt); fmt.index++) {
@@ -238,6 +238,7 @@ bool inspectDevice(const std::string& path, CameraInfo& out, bool forced = false
         else if (fmt.pixelformat == V4L2_PIX_FMT_Y16) y16 = true;
         else if (fmt.pixelformat == V4L2_PIX_FMT_YUYV) yuyv = true;
         else if (fmt.pixelformat == V4L2_PIX_FMT_MJPEG) mjpg = true;
+        else if (fmt.pixelformat == V4L2_PIX_FMT_NV12) nv12 = true;
       }
       std::string card = reinterpret_cast<const char*>(cap.card);
       // uvcvideo names nodes "<product>: <stream>"; the stream part is the
@@ -249,7 +250,8 @@ bool inspectDevice(const std::string& path, CameraInfo& out, bool forced = false
       out.fourcc = grey ? V4L2_PIX_FMT_GREY
                  : y16 ? V4L2_PIX_FMT_Y16
                  : (yuyv && out.ir) ? V4L2_PIX_FMT_YUYV
-                 : (forced || colour) ? (yuyv ? V4L2_PIX_FMT_YUYV : mjpg ? V4L2_PIX_FMT_MJPEG : 0) : 0;
+                 : (forced || colour) ? (yuyv ? V4L2_PIX_FMT_YUYV : mjpg ? V4L2_PIX_FMT_MJPEG
+                                          : nv12 ? V4L2_PIX_FMT_NV12 : 0) : 0;
       if (out.fourcc) {
         out.path = path;
         out.card = card;
@@ -302,7 +304,9 @@ class Camera {
     ir_ = info.ir;
     width_ = fmt.fmt.pix.width;
     height_ = fmt.fmt.pix.height;
-    uint32_t bpp = fourcc_ == V4L2_PIX_FMT_GREY ? 1 : 2;
+    // Bytes per pixel on the first plane: the Y plane of NV12 is one byte per
+    // pixel, its rows are the stride.
+    uint32_t bpp = (fourcc_ == V4L2_PIX_FMT_GREY || fourcc_ == V4L2_PIX_FMT_NV12) ? 1 : 2;
     stride_ = fmt.fmt.pix.bytesperline ? fmt.fmt.pix.bytesperline : width_ * bpp;
 
     v4l2_requestbuffers req{};
@@ -401,8 +405,12 @@ class Camera {
     buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     buf.memory = V4L2_MEMORY_MMAP;
     if (!xioctl(fd_, VIDIOC_DQBUF, &buf)) return false;
-    uint32_t bpp = fourcc_ == V4L2_PIX_FMT_GREY ? 1 : 2;
-    bool ok = fourcc_ == V4L2_PIX_FMT_MJPEG ? buf.bytesused > 0 : buf.bytesused >= stride_ * (height_ - 1) + width_ * bpp;
+    // Bytes per pixel on the first plane: the Y plane of NV12 is one byte per
+    // pixel, its rows are the stride.
+    uint32_t bpp = (fourcc_ == V4L2_PIX_FMT_GREY || fourcc_ == V4L2_PIX_FMT_NV12) ? 1 : 2;
+    bool ok = fourcc_ == V4L2_PIX_FMT_MJPEG ? buf.bytesused > 0
+            : fourcc_ == V4L2_PIX_FMT_NV12 ? buf.bytesused >= stride_ * (height_ * 3 / 2)
+            : buf.bytesused >= stride_ * (height_ - 1) + width_ * bpp;
     if (ok) {
       void* data = buffers_[buf.index].first;
       if (!ir_ && fourcc_ == V4L2_PIX_FMT_MJPEG) {
@@ -414,7 +422,13 @@ class Camera {
         }
       } else if (!ir_) {
         cv::Mat bgr;
-        cv::cvtColor(cv::Mat(height_, width_, CV_8UC2, data, stride_), bgr, cv::COLOR_YUV2BGR_YUYV);
+        if (fourcc_ == V4L2_PIX_FMT_NV12) {
+          // A Y plane, then interleaved U and V: height * 3 / 2 rows of stride.
+          cv::cvtColor(cv::Mat(height_ * 3 / 2, width_, CV_8UC1, data, stride_),
+                       bgr, cv::COLOR_YUV2BGR_NV12);
+        } else {
+          cv::cvtColor(cv::Mat(height_, width_, CV_8UC2, data, stride_), bgr, cv::COLOR_YUV2BGR_YUYV);
+        }
         cv::cvtColor(bgr, out, cv::COLOR_BGR2GRAY);
         if (colour) *colour = bgr;
       } else if (fourcc_ == V4L2_PIX_FMT_GREY) {
