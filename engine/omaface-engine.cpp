@@ -106,6 +106,7 @@ struct Config {
   double timeoutChoose = 30.0;
   bool rgbFallback = true;      // no IR camera: use the regular webcam
   bool headTurns = false;       // webcam: also ask for random head turns (strictest)
+  bool irEnhance = false;       // IR: average lit frames + local contrast before detection
   double thresholdRgb = 0.60;  // webcam genuine scores measured 0.78-0.88
 };
 
@@ -141,6 +142,7 @@ Config loadConfig() {
       else if (k == "confirm") c.confirm = parseBool(v, true);
       else if (k == "rgb_fallback") c.rgbFallback = parseBool(v, true);
       else if (k == "head_turns") c.headTurns = parseBool(v, false);
+      else if (k == "ir_enhance") c.irEnhance = parseBool(v, false);
       else if (k == "threshold_rgb") c.thresholdRgb = std::clamp(std::stod(v), 0.30, 0.95);
       else if (k == "timeout_choose") c.timeoutChoose = std::clamp(std::stod(v), 5.0, 120.0);
       else if (k == "match_frames") c.matchFrames = std::clamp(std::stoi(v), 1, 5);
@@ -575,6 +577,36 @@ bool unusable(const Camera& cam, DarkFrameFilter& filter, const cv::Mat& grey) {
   if (cam.ir()) return filter.isDark(grey);
   return cv::mean(grey)[0] < 12.0;
 }
+
+// Some IR cameras are noisy, and some emitters clip skin to white. Local
+// contrast (CLAHE) gives the detector a steadier picture, and a short
+// temporal average removes sensor noise without blurring across a head turn:
+// 0.7 current + 0.3 previous is about 66 ms of motion at 15 lit frames/s.
+// The identity is taken from the current frame with the same local contrast,
+// so SFace keeps the sharp texture it matches on.
+class IrEnhance {
+ public:
+  cv::Mat detect(const cv::Mat& raw) {
+    cv::Mat avg;
+    if (!prev_.empty() && prev_.size() == raw.size())
+      cv::addWeighted(raw, 0.7, prev_, 0.3, 0, avg);
+    else
+      raw.copyTo(avg);
+    raw.copyTo(prev_);
+    return localContrast(avg);
+  }
+  cv::Mat feature(const cv::Mat& raw) { return localContrast(raw); }
+
+ private:
+  cv::Mat localContrast(const cv::Mat& grey) {
+    if (!clahe_) clahe_ = cv::createCLAHE(2.0, cv::Size(8, 8));
+    cv::Mat out;
+    clahe_->apply(grey, out);
+    return out;
+  }
+  cv::Mat prev_;
+  cv::Ptr<cv::CLAHE> clahe_;
+};
 
 // ------------------------------------------------------------------ models
 
@@ -1441,6 +1473,7 @@ int serve() {
   };
   cv::Mat grey, bgr;
   DarkFrameFilter darkFilter;
+  IrEnhance enhance;
   while (secondsSince(start) < timeout) {
     if (clientGone()) { writeStatus(key, "idle", seq); return 1; }
     // The dialog was dismissed, or the person started typing the password:
@@ -1458,9 +1491,15 @@ int serve() {
     }
     if (!cam.grab(grey, 500, &bgr)) continue;
     if (unusable(cam, darkFilter, grey)) continue;
+    cv::Mat detBgr = bgr, featureBgr = bgr;
+    if (!rgb && cfg.irEnhance) {
+      cv::Mat d = enhance.detect(grey), f = enhance.feature(grey);
+      cv::cvtColor(d, detBgr, cv::COLOR_GRAY2BGR);
+      cv::cvtColor(f, featureBgr, cv::COLOR_GRAY2BGR);
+    }
     Face face;
     int faces = 0;
-    bool found = models.detect(bgr, face, &faces, minFace);
+    bool found = models.detect(detBgr, face, &faces, minFace);
     if (found) cam.followFace(cv::Rect(faceBox(face)), grey);
     else cam.searchFace();
     if (!found || face.width < minFace || !faceInView(face, grey.size())) {
@@ -1487,7 +1526,7 @@ int serve() {
       return finish("unavailable not-enrolled");
     }
     size_t which = 0;
-    double score = bestScore(gallery, models.feature(bgr, face), &which);
+    double score = bestScore(gallery, models.feature(featureBgr, face), &which);
     // Attention and liveness only matter for a face that matched (and are
     // always shown by the self-test).
     std::string attentive = "off";
@@ -1785,6 +1824,7 @@ int enroll(const std::string& user, const std::string& name, bool ui) {
   int lastFilled = -1;
   cv::Mat grey, bgr;
   DarkFrameFilter darkFilter;
+  IrEnhance enhance;
 
   emit("{\"type\":\"start\",\"segments\":" + std::to_string(segments) + "}",
        "omaFace: look at the screen, then slowly move your head in a circle.");
@@ -1793,9 +1833,15 @@ int enroll(const std::string& user, const std::string& name, bool ui) {
     if (ui && uiCallerGone()) { gStop = 1; break; }
     if (!cam.grab(grey, 500, &bgr)) continue;
     if (unusable(cam, darkFilter, grey)) continue;
+    cv::Mat detBgr = bgr, featureBgr = bgr;
+    if (cam.ir() && cfg.irEnhance) {
+      cv::Mat d = enhance.detect(grey), f = enhance.feature(grey);
+      cv::cvtColor(d, detBgr, cv::COLOR_GRAY2BGR);
+      cv::cvtColor(f, featureBgr, cv::COLOR_GRAY2BGR);
+    }
     Face face;
     int count = 0;
-    bool got = models.detect(bgr, face, &count);
+    bool got = models.detect(detBgr, face, &count);
     cv::Rect focus(0, 0, grey.cols, grey.rows);
     if (got) {
       cam.followFace(cv::Rect(faceBox(face)), grey);
@@ -1818,7 +1864,7 @@ int enroll(const std::string& user, const std::string& name, bool ui) {
       } else if (!haveCenter) {
         centerSamples.push_back(pose);
         hint = "Look straight at the screen";
-        frontal.push_back(models.feature(bgr, face));
+        frontal.push_back(models.feature(featureBgr, face));
         if (centerSamples.size() >= 5) {
           for (auto& c : centerSamples) center += c;
           center *= 1.0f / centerSamples.size();
@@ -1831,7 +1877,7 @@ int enroll(const std::string& user, const std::string& name, bool ui) {
         float mag = std::hypot(d.x, d.y);
         if (mag < 0.07f) {
           hint = "Slowly move your head in a circle";
-          if (frontal.size() < 8 && eyesOpenNow(bgr, face)) frontal.push_back(models.feature(bgr, face));
+          if (frontal.size() < 8 && eyesOpenNow(bgr, face)) frontal.push_back(models.feature(featureBgr, face));
         } else if (mag > 0.75f) {
           hint = "Not so far";
         } else {
@@ -1842,7 +1888,7 @@ int enroll(const std::string& user, const std::string& name, bool ui) {
           seg = (seg + segments / 2) % segments;
           if (mag > 0.12f && !filled[seg]) {
             filled[seg] = 1;
-            angled[seg] = models.feature(bgr, face);
+            angled[seg] = models.feature(featureBgr, face);
           }
         }
       }
@@ -1920,6 +1966,7 @@ int calib(double seconds) {
   Appearance a;
   cv::Mat grey, bgr;
   DarkFrameFilter darkFilter;
+  IrEnhance enhance;
   int lit = 0, dark = 0, detected = 0;
   double firstFace = -1;
   std::vector<double> scores;
@@ -1927,14 +1974,20 @@ int calib(double seconds) {
     if (!cam.grab(grey, 500, &bgr)) continue;
     if (unusable(cam, darkFilter, grey)) { dark++; continue; }
     lit++;
+    cv::Mat detBgr = bgr, featureBgr = bgr;
+    if (cam.ir() && cfg.irEnhance) {
+      cv::Mat d = enhance.detect(grey), f = enhance.feature(grey);
+      cv::cvtColor(d, detBgr, cv::COLOR_GRAY2BGR);
+      cv::cvtColor(f, featureBgr, cv::COLOR_GRAY2BGR);
+    }
     auto td = Clock::now();
     Face f;
-    if (!models.detect(bgr, f)) continue;
+    if (!models.detect(detBgr, f)) continue;
     double tdet = secondsSince(td);
     detected++;
     if (firstFace < 0) firstFace = secondsSince(t0);
     auto tf = Clock::now();
-    cv::Mat feat = models.feature(bgr, f);
+    cv::Mat feat = models.feature(featureBgr, f);
     double tfe = secondsSince(tf);
     if (a.features.rows < 6) { a.features.push_back(feat); continue; }
     std::vector<Appearance> g{a};
