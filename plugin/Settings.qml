@@ -510,6 +510,35 @@ Item {
             }
           }
 
+          PanelSeparator { visible: !root.webcam; foreground: root.foreground }
+
+          Column {
+            visible: !root.webcam
+            width: parent.width
+            spacing: Style.space(12)
+
+            PanelSectionHeader {
+              width: parent.width
+              text: "IR CAMERA"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            SettingRow {
+              width: parent.width
+              title: "Improve noisy cameras"
+              detail: "Average two lit frames and add local contrast; helps grainy or blown-out IR pictures"
+              checked: root.status.irEnhance === true
+              busy: actionProc.running
+              interactive: root.status.installed === true && !actionProc.running
+              foreground: root.foreground
+              accent: root.accent
+              fontFamily: root.fontFamily
+              onToggled: root.run(["set", "ir_enhance", checked ? "off" : "on"],
+                "Improve noisy cameras " + (checked ? "off" : "on"))
+            }
+          }
+
           PanelSeparator { foreground: root.foreground }
 
           Column {

@@ -39,5 +39,11 @@ rgb_fallback=on
 head_turns=off
 threshold_rgb=0.60
 
+# Improve detection for noisy cameras: average the last two lit IR frames and
+# apply local contrast (CLAHE) before looking for a face. Helps cameras whose
+# emitter blows skin out to white, or whose frames are grainy. The identity
+# is still read from the current frame, so matching stays sharp.
+ir_enhance=off
+
 # IR camera: auto picks the greyscale camera named "IR".
 device=auto

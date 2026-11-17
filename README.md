@@ -221,6 +221,7 @@ omaface enable|disable lock login sudo polkit
 omaface set attention on|off
 omaface set confirm on|off  ask first for sudo and system prompts
 omaface set rgb_fallback on|off
+omaface set ir_enhance on|off  average lit frames and add contrast (noisy IR cameras)
 omaface cameras             cameras on this machine and which one is used
 omaface emitter             check that the IR light comes on
 omaface doctor              check every part
@@ -232,6 +233,8 @@ omaface uninstall           put everything back the way Omarchy had it
 
 * **No camera found**: `omaface cameras`. If your IR camera is listed but not
   picked: `omaface set device /dev/videoN`.
+* **The IR picture is grainy or the face is blown out to white, and it finds you only now and then**: turn on **Improve noisy cameras** in Settings, or `omaface set ir_enhance on`. It averages the last two lit frames and adds local contrast before detection; the identity is still read from the current frame. It helped an IR camera whose emitter clipped skin to white: detection went from 58% to 95% of lit frames, and the median match from 0.58 to 0.67.
+
 * **"No face found" all the time with an IR camera**: `omaface emitter`. Many
   Lenovo, Dell and HP laptops keep the IR light off until it is switched on
   once: `omarchy pkg aur add linux-enable-ir-emitter`, then
