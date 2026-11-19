@@ -174,7 +174,10 @@ FocusScope {
     var reasons = {
       "noface": "No face in view",
       "small": "Move closer",
+      "edge": "Move into the middle of the view",
+      "crowd": "Only one face, please",
       "nomatch": "Identity below requirement",
+      "held": "Someone else was just in view",
       "attention": "Eyes closed or not on the screen",
       "notlive": "Liveness below requirement",
       "models": "Models unavailable",

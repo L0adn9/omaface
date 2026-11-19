@@ -258,8 +258,8 @@ change rejects Apply rather than overwriting another change.
 
 | Requirement | Default | Range |
 |-------------|---------|-------|
-| IR identity similarity | 0.50 | 0.30–0.95 |
-| Webcam identity similarity | 0.55 | 0.30–0.95 |
+| IR identity similarity | 0.55 | 0.30–0.95 |
+| Webcam identity similarity | 0.60 | 0.30–0.95 |
 | IR consecutive passing frames | 2 | 1–5; at least 3 with attention on |
 | Webcam consecutive passing frames | 8 | 3–30 |
 | Webcam liveness | 0.85 | 0.50–0.99 |
