@@ -671,5 +671,104 @@ FILES_45 = [
     ("polkit/PolkitModel.js", "PolkitModel.js", []),
 ]
 
+# The quattro dev branch after 4.5 (omacom/omarchy#19970) settles each
+# password attempt once, so the success branch is a block.
+LOCK_SERVICE_DEV = _replace(
+    LOCK_SERVICE_45,
+    (
+        "      if (result === PamResult.Success) root.finishUnlock()\n      else root.handlePasswordFailure()\n",
+        (
+            "      if (result === PamResult.Success) {\n        root.authenticatingPassword = false\n"
+            "        root.pendingPassword = \"\"\n        root.finishUnlock()\n",
+            """      if (result === PamResult.Success) {
+        root.authenticatingPassword = false
+        root.pendingPassword = ""
+        if (!faceResetProc.running) faceResetProc.running = true
+        root.finishUnlock()
+""",
+        ),
+    ),
+)
+
+# On the quattro dev branch (omacom/omarchy#19884, #20099, #20141) the polkit
+# dialog has no closing delay: dismissPolkit() hides it at once on success or
+# cancel, and the card also asks for encrypted drives. omaFace keeps the card
+# up for the check mark only when the face is what got you in.
+POLKIT_DEV = _replace(
+    POLKIT,
+    (
+        "  function beginFlow() {\n    closeTimer.stop()\n    closing = false\n",
+        (
+            "  function beginFlow() {\n",
+            """  property bool faceClosing: false
+
+  Timer {
+    id: faceCloseTimer
+    interval: 520
+    repeat: false
+    onTriggered: {
+      root.faceClosing = false
+      root.dismissPolkit()
+    }
+  }
+
+  function beginFlow() {
+    faceCloseTimer.stop()
+    faceClosing = false
+    flowStartedAt = Date.now()
+    faceState = "idle"
+    pendingPassword = ""
+    refreshFace()
+""",
+        ),
+    ),
+    (
+        "    function onAuthenticationSucceeded() {\n      root.closing = true\n      closeTimer.restart()\n",
+        (
+            "    function onAuthenticationSucceeded() {\n      root.dismissPolkit()\n    }\n",
+            """    function onAuthenticationSucceeded() {
+      // Let the check mark draw when the face is what got you in.
+      if (root.faceState === "success") {
+        root.faceClosing = true
+        faceCloseTimer.restart()
+      } else root.dismissPolkit()
+    }
+""",
+        ),
+    ),
+    (
+        "  function cancelRequest() {\n    var flow = polkitAgent.flow\n    passwordInput.text = \"\"\n",
+        (
+            "  function cancelRequest() {\n    var flow = polkitAgent.flow\n",
+            "  function cancelRequest() {\n    var flow = polkitAgent.flow\n    pendingPassword = \"\"\n    // Polkit's helper only learns of the cancel after PAM returns; tell the\n    // engine now so the wait (or the camera) ends at once.\n    if (faceState === \"choose\" || faceState === \"scanning\") chooseFace(\"password\")\n",
+        ),
+    ),
+    (
+        "    function onAuthenticationRequestCancelled() {\n      root.closing = true\n      closeTimer.restart()\n    }\n",
+        (
+            "    function onAuthenticationRequestCancelled() {\n      root.dismissPolkit()\n    }\n",
+            """    function onAuthenticationRequestCancelled() {
+      root.dismissPolkit()
+      // Cancelled by polkit (the asking program went away): end omaFace too.
+      if (root.faceState === "choose" || root.faceState === "scanning") root.chooseFace("password")
+    }
+""",
+        ),
+    ),
+) + [
+    (
+        "  readonly property bool dialogVisible: (polkitAgent.isActive && !dismissed) || driveDevice !== \"\"\n",
+        "  readonly property bool dialogVisible: (polkitAgent.isActive && !dismissed) || driveDevice !== \"\" || faceClosing\n",
+    ),
+]
+
+FILES_DEV = [
+    ("lock/Service.qml", "Service.qml", LOCK_SERVICE_DEV),
+    ("lock/LockView.qml", "LockView.qml", LOCK_VIEW),
+    ("lock/FingerprintModel.js", "FingerprintModel.js", []),
+    ("polkit/PolkitAgent.qml", "Polkit.qml", POLKIT_DEV),
+    ("polkit/PolkitModel.js", "PolkitModel.js", []),
+]
+
 # build-plugin.py tries each set and uses the first whose anchors all match.
-FILE_SETS = [("4.5", FILES_45), ("4.0", FILES_40)]
+FILE_SETS = [("dev", FILES_DEV), ("4.5", FILES_45), ("4.0", FILES_40)]
