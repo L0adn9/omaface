@@ -43,8 +43,8 @@ choose **Set up omaFace**.
 
 ## What you need
 
-* **Omarchy 4** or newer (the Quickshell lock screen). Both the 4.0 and 4.5
-  shell plugin APIs are supported.
+* **Omarchy 4** or newer (the Quickshell lock screen). The 4.0 and 4.5
+  shell plugin APIs are supported, and so is the quattro dev branch after 4.5.
 * **A camera.** omaFace looks for an infrared (Windows Hello) camera first and
   uses it when there is one. A laptop without one uses its regular webcam, for
   everything, with liveness and attention checks on every scan (see

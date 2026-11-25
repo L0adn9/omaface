@@ -7,10 +7,11 @@ and polkit dialog plus the omaFace patches.
 <prefix> is where omaFace is installed (/usr for the package, /usr/local
 for the git install); the plugin calls <prefix>/bin/omaface.
 
-Omarchy 4.0 and 4.5 need different anchors; the file set whose anchors all
-match the installed Omarchy is used. Fails without writing <out-dir> when no
-set matches or a patch anchor is missing or ambiguous, so an Omarchy update
-can never leave a half-patched lock screen.
+Omarchy 4.0, 4.5 and the quattro dev branch need different anchors; the
+file set whose anchors all match the installed Omarchy is used. Fails
+without writing <out-dir> when no set matches or a patch anchor is missing
+or ambiguous, so an Omarchy update can never leave a half-patched lock
+screen.
 """
 
 import hashlib
