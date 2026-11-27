@@ -219,7 +219,7 @@ void pickSize(int fd, uint32_t fourcc, uint32_t& w, uint32_t& h) {
 // IR cameras deliver greyscale (GREY, or Y16 on some). A few deliver YUYV,
 // like ordinary colour webcams; those only count when the name says IR,
 // because a colour camera can be fooled by a photo. `colour` also accepts a
-// regular webcam (YUYV or MJPG, else NV12) as a non-IR camera: the
+// regular webcam (YUYV, MJPG, NV12 or XR24) as a non-IR camera: the
 // rgb_fallback, which adds a head-turn check against photos. `forced`
 // (device= in the config) accepts any capture device.
 bool inspectDevice(const std::string& path, CameraInfo& out, bool forced = false, bool colour = false) {
@@ -230,7 +230,7 @@ bool inspectDevice(const std::string& path, CameraInfo& out, bool forced = false
   if (xioctl(fd, VIDIOC_QUERYCAP, &cap)) {
     uint32_t caps = (cap.capabilities & V4L2_CAP_DEVICE_CAPS) ? cap.device_caps : cap.capabilities;
     if ((caps & V4L2_CAP_VIDEO_CAPTURE) && (caps & V4L2_CAP_STREAMING)) {
-      bool grey = false, y16 = false, yuyv = false, mjpg = false, nv12 = false;
+      bool grey = false, y16 = false, yuyv = false, mjpg = false, nv12 = false, xr24 = false;
       v4l2_fmtdesc fmt{};
       fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
       for (fmt.index = 0; xioctl(fd, VIDIOC_ENUM_FMT, &fmt); fmt.index++) {
@@ -239,6 +239,7 @@ bool inspectDevice(const std::string& path, CameraInfo& out, bool forced = false
         else if (fmt.pixelformat == V4L2_PIX_FMT_YUYV) yuyv = true;
         else if (fmt.pixelformat == V4L2_PIX_FMT_MJPEG) mjpg = true;
         else if (fmt.pixelformat == V4L2_PIX_FMT_NV12) nv12 = true;
+        else if (fmt.pixelformat == V4L2_PIX_FMT_XBGR32) xr24 = true;
       }
       std::string card = reinterpret_cast<const char*>(cap.card);
       // uvcvideo names nodes "<product>: <stream>"; the stream part is the
@@ -251,7 +252,7 @@ bool inspectDevice(const std::string& path, CameraInfo& out, bool forced = false
                  : y16 ? V4L2_PIX_FMT_Y16
                  : (yuyv && out.ir) ? V4L2_PIX_FMT_YUYV
                  : (forced || colour) ? (yuyv ? V4L2_PIX_FMT_YUYV : mjpg ? V4L2_PIX_FMT_MJPEG
-                                          : nv12 ? V4L2_PIX_FMT_NV12 : 0) : 0;
+                                          : nv12 ? V4L2_PIX_FMT_NV12 : xr24 ? V4L2_PIX_FMT_XBGR32 : 0) : 0;
       if (out.fourcc) {
         out.path = path;
         out.card = card;
@@ -275,20 +276,23 @@ bool findCamera(const Config& cfg, CameraInfo& out) {
     any = true;
   }
   if (any || !cfg.rgbFallback) return any;
-  // No IR camera, and the person chose the regular webcam: the first one
-  // (the built-in camera comes first on laptops). A node that offers only
-  // NV12 comes after every YUYV or MJPEG one, so a camera that worked before
-  // NV12 was accepted is still the one used.
-  CameraInfo nv12;
-  bool haveNv12 = false;
+  // Preserve the preference for YUYV/MJPEG, then NV12. Use XR24 as a
+  // last resort for colour cameras exposed by libcamera's V4L2 adapter.
+  CameraInfo fallback;
   for (int i = 0; i < 64; i++) {
     CameraInfo info;
     if (!inspectDevice("/dev/video" + std::to_string(i), info, false, true)) continue;
-    if (info.fourcc != V4L2_PIX_FMT_NV12) { out = info; return true; }
-    if (!haveNv12) { nv12 = info; haveNv12 = true; }
+    if (info.fourcc == V4L2_PIX_FMT_YUYV || info.fourcc == V4L2_PIX_FMT_MJPEG) {
+      out = info;
+      return true;
+    }
+    if (fallback.path.empty() ||
+        (fallback.fourcc == V4L2_PIX_FMT_XBGR32 && info.fourcc == V4L2_PIX_FMT_NV12))
+      fallback = info;
   }
-  if (haveNv12) out = nv12;
-  return haveNv12;
+  if (fallback.path.empty()) return false;
+  out = fallback;
+  return true;
 }
 
 class Camera {
@@ -318,10 +322,15 @@ class Camera {
       err = "camera gave an odd NV12 size";
       return false;
     }
-    // Bytes per pixel on the first plane: the Y plane of NV12 is one byte per
-    // pixel, its rows are the stride.
-    uint32_t bpp = (fourcc_ == V4L2_PIX_FMT_GREY || fourcc_ == V4L2_PIX_FMT_NV12) ? 1 : 2;
-    stride_ = fmt.fmt.pix.bytesperline ? fmt.fmt.pix.bytesperline : width_ * bpp;
+    // For NV12, stride describes the one-byte samples on the Y plane.
+    bytesPerPixel_ = (fourcc_ == V4L2_PIX_FMT_GREY || fourcc_ == V4L2_PIX_FMT_NV12) ? 1
+                   : fourcc_ == V4L2_PIX_FMT_XBGR32 ? 4 : 2;
+    const size_t rowBytes = size_t(width_) * bytesPerPixel_;
+    stride_ = fmt.fmt.pix.bytesperline ? fmt.fmt.pix.bytesperline : rowBytes;
+    if (!width_ || !height_ || (fourcc_ != V4L2_PIX_FMT_MJPEG && stride_ < rowBytes)) {
+      err = "camera returned invalid frame dimensions or stride";
+      return false;
+    }
 
     v4l2_requestbuffers req{};
     req.count = 4;
@@ -419,12 +428,9 @@ class Camera {
     buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     buf.memory = V4L2_MEMORY_MMAP;
     if (!xioctl(fd_, VIDIOC_DQBUF, &buf)) return false;
-    // Bytes per pixel on the first plane: the Y plane of NV12 is one byte per
-    // pixel, its rows are the stride.
-    uint32_t bpp = (fourcc_ == V4L2_PIX_FMT_GREY || fourcc_ == V4L2_PIX_FMT_NV12) ? 1 : 2;
     bool ok = fourcc_ == V4L2_PIX_FMT_MJPEG ? buf.bytesused > 0
-            : fourcc_ == V4L2_PIX_FMT_NV12 ? buf.bytesused >= stride_ * (height_ * 3 / 2 - 1) + width_
-            : buf.bytesused >= stride_ * (height_ - 1) + width_ * bpp;
+            : fourcc_ == V4L2_PIX_FMT_NV12 ? buf.bytesused >= stride_ * (size_t(height_) * 3 / 2 - 1) + width_
+            : buf.bytesused >= stride_ * (height_ - 1) + size_t(width_) * bytesPerPixel_;
     // Never read past the mapped buffer, whatever the driver says it filled.
     ok = ok && buf.index < buffers_.size() && buf.bytesused <= buffers_[buf.index].second;
     if (ok) {
@@ -438,7 +444,9 @@ class Camera {
         }
       } else if (!ir_) {
         cv::Mat bgr;
-        if (fourcc_ == V4L2_PIX_FMT_NV12) {
+        if (fourcc_ == V4L2_PIX_FMT_XBGR32) {
+          cv::cvtColor(cv::Mat(height_, width_, CV_8UC4, data, stride_), bgr, cv::COLOR_BGRA2BGR);
+        } else if (fourcc_ == V4L2_PIX_FMT_NV12) {
           // A Y plane, then interleaved U and V: height * 3 / 2 rows of stride.
           cv::cvtColor(cv::Mat(height_ * 3 / 2, width_, CV_8UC1, data, stride_),
                        bgr, cv::COLOR_YUV2BGR_NV12);
@@ -539,7 +547,8 @@ class Camera {
   uint32_t fourcc_ = V4L2_PIX_FMT_GREY;
   bool ir_ = true;
   int y16Bits_ = 10;
-  uint32_t width_ = 0, height_ = 0, stride_ = 0;
+  uint32_t width_ = 0, height_ = 0;
+  size_t stride_ = 0, bytesPerPixel_ = 0;
   std::vector<std::pair<void*, size_t>> buffers_;
 };
 

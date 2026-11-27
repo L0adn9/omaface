@@ -150,6 +150,23 @@ does not know); it is off by default because it is slower than typing. The
 switch **Webcam fallback** turns webcam mode off; an IR camera, when there is
 one, is always used instead.
 
+### Snapdragon webcams using libcamera
+
+On the Lenovo Yoga Slim 7x (83ED), the OV02C10 color webcam uses libcamera.
+This branch accepts the XR24 pixel format exported by its V4L2 compatibility
+adapter. To check a source build on the Yoga, run:
+
+```sh
+make -C engine
+libcamerify ./engine/omaface-engine probe webcam
+```
+
+The probe should report `XR24` and `webcam`. Each process that opens this
+camera needs the libcamera adapter, including the enrollment and verification
+engines. Running the probe alone does not configure the system service.
+This path uses the regular webcam checks. The separate infrared sensor is
+outside the scope of this change.
+
 ## How it works
 
 <p align="center">
