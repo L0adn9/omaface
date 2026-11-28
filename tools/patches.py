@@ -694,6 +694,9 @@ LOCK_SERVICE_DEV = _replace(
 # dialog has no closing delay: dismissPolkit() hides it at once on success or
 # cancel, and the card also asks for encrypted drives. omaFace keeps the card
 # up for the check mark only when the face is what got you in.
+_JUSTIFICATION_40 = "    Rectangle {\n      width: Math.min(justificationText.implicitWidth"
+_JUSTIFICATION_DEV = "    Rectangle {\n      // Waits for the agent with the mark when its line names it,"
+
 POLKIT_DEV = _replace(
     POLKIT,
     (
@@ -753,6 +756,17 @@ POLKIT_DEV = _replace(
       if (root.faceState === "choose" || root.faceState === "scanning") root.chooseFace("password")
     }
 """,
+        ),
+    ),
+    # The justification box now opens with a comment instead of its width
+    # line; the hint goes in front of it the same way.
+    (
+        _JUSTIFICATION_40,
+        (
+            _JUSTIFICATION_DEV,
+            next(new for old, new in POLKIT if old == _JUSTIFICATION_40).replace(
+                _JUSTIFICATION_40, _JUSTIFICATION_DEV
+            ),
         ),
     ),
 ) + [
